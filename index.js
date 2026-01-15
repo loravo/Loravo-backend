@@ -8,16 +8,18 @@
  *  - OpenWeather (weather signals)
  *
  * Endpoints:
+ *  - GET  /                  -> service info (fixes "Cannot GET /")
  *  - GET  /health
  *  - POST /lxt1               -> strict LXT1 JSON only
  *  - POST /chat               -> { reply (professional), lxt1 (json), providers meta }
  *
- * NEW (Stay-Ahead Engine):
+ * Stay-Ahead Engine:
  *  - POST /state/location     -> update user location, detect meaningful changes, queue alerts
  *  - POST /state/weather      -> force weather check, detect meaningful changes, queue alerts
+ *  - POST /signals/ingest     -> ingest any external signal (business/market/social/legal/etc) and queue if meaningful
  *  - GET  /poll               -> app polls for queued alerts (Loravo “sends a message”)
  *  - POST /trip/set           -> store active trip context (simple)
- *  - POST /news/ingest        -> optional: ingest a “news event” and queue if meaningful
+ *  - POST /news/ingest        -> ingest a “news event” and queue if meaningful
  *
  * Query params:
  *  - provider=openai | gemini | trinity   (default: trinity)
@@ -80,7 +82,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS alert_queue (
       id SERIAL PRIMARY KEY,
       user_id TEXT NOT NULL,
-      alert_type TEXT NOT NULL,            -- weather | location | trip | news | system
+      alert_type TEXT NOT NULL,            -- weather | location | trip | news | signal | system
       message TEXT NOT NULL,               -- what your app shows
       payload JSONB,                       -- optional extra structured info
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -100,10 +102,34 @@ async function initDb() {
     );
   `);
 
+  // generic external signals (anything that can change position)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_signals (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      source TEXT,                         -- e.g., "manual", "rss", "twitter", "bank", "calendar"
+      domain TEXT,                         -- e.g., "business", "money", "health", "social", "legal", "tech", "market"
+      title TEXT NOT NULL,
+      summary TEXT,
+      region TEXT,
+      severity TEXT NOT NULL DEFAULT 'low', -- low | medium | high | critical
+      action_hint TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   console.log("✅ DB tables ensured");
 }
 
-/* ===================== HEALTH ===================== */
+/* ===================== HEALTH + ROOT ===================== */
+
+app.get("/", (_, res) => {
+  res.json({
+    service: "LORAVO LXT-1 backend",
+    status: "running",
+    endpoints: ["/health", "/chat", "/lxt1", "/poll", "/state/location", "/state/weather", "/signals/ingest", "/news/ingest", "/trip/set"],
+  });
+});
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
@@ -426,6 +452,15 @@ function composeLocationAlert({ prevCity, nowCity, prevCountry, nowCountry }) {
   return null;
 }
 
+function composeGenericSignalAlert({ title, region, summary, actionHint }) {
+  const parts = [];
+  parts.push(`${title}.`);
+  if (region) parts.push(`Area: ${region}.`);
+  if (summary) parts.push(summary);
+  if (actionHint) parts.push(actionHint);
+  return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
 function isMeaningfulTempChange(prevTemp, nowTemp) {
   if (typeof prevTemp !== "number" || typeof nowTemp !== "number") return false;
 
@@ -700,12 +735,11 @@ NO extra text. JSON only.
 }
 
 /**
- * Reply style updated:
+ * Reply style:
  * - professional
  * - simple English
  * - no jokes/emojis/slang
  * - 1–2 short sentences
- * - avoid repeating exact wording (hint only)
  */
 async function callGeminiReply({ userText, lxt1, style, lastReplyHint }) {
   const key = process.env.GEMINI_API_KEY;
@@ -1040,6 +1074,60 @@ app.post("/state/weather", async (req, res) => {
 });
 
 /**
+ * POST /signals/ingest
+ * Body: { user_id, title, summary?, domain?, region?, severity?, action? }
+ * Queues only if severity is medium/high/critical.
+ * This is the “anything else” endpoint: you can feed any signal and Loravo will message when it matters.
+ */
+app.post("/signals/ingest", async (req, res) => {
+  try {
+    const { user_id, title, summary, domain, region, severity, action } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+    if (!title) return res.status(400).json({ error: "Missing title" });
+
+    const sev = String(severity || "low").toLowerCase();
+    const meaningful = ["medium", "high", "critical"].includes(sev);
+
+    await pool.query(
+      `
+      INSERT INTO user_signals (user_id, source, domain, title, summary, region, severity, action_hint)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+    `,
+      [
+        user_id,
+        "manual",
+        domain || "general",
+        title,
+        summary || null,
+        region || null,
+        sev,
+        action || null,
+      ]
+    );
+
+    if (meaningful) {
+      const message = composeGenericSignalAlert({
+        title,
+        region,
+        summary,
+        actionHint: action,
+      });
+
+      await enqueueAlert({
+        userId: user_id,
+        alertType: "signal",
+        message,
+        payload: { title, summary, domain: domain || "general", region, severity: sev, action },
+      });
+    }
+
+    res.json({ ok: true, queued: meaningful });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/**
  * GET /poll?user_id=...&limit=5
  */
 app.get("/poll", async (req, res) => {
@@ -1151,6 +1239,9 @@ initDb()
 
 /* ===================== QUICK TESTS =====================
 
+# 0) Root
+curl -s "http://localhost:3000/" | jq
+
 # 1) Chat (professional reply + JSON)
 curl -s -X POST "http://localhost:3000/chat?provider=trinity&mode=auto" \
   -H "Content-Type: application/json" \
@@ -1216,6 +1307,19 @@ curl -s -X POST "http://localhost:3000/news/ingest" \
     "region":"Edmonton–Calgary",
     "severity":"high",
     "action":"Leave earlier or take an alternate route."
+  }' | jq
+
+# 8) Ingest ANY signal (business / money / social / legal / tech / anything)
+curl -s -X POST "http://localhost:3000/signals/ingest" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id":"test_flight",
+    "domain":"money",
+    "title":"Credit card payment due in 48 hours",
+    "summary":"Your balance is high and interest will start if not paid.",
+    "region":"Canada",
+    "severity":"high",
+    "action":"Pay at least the statement balance today."
   }' | jq
 
 ===================================== */
