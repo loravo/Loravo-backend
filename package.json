@@ -1,24 +1,20 @@
 {
   "name": "loravo-backend",
   "version": "1.0.0",
-  "description": "LORAVO LXT-1 backend service",
+  "private": true,
+  "description": "LORAVO backend (LXT-1 Trinity)",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node index.js",
-    "test": "echo \"ok\""
+    "start": "node index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": "18.x"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
-    "express": "^4.19.2",
+    "express": "^4.21.2",
     "node-cron": "^4.2.1",
     "node-fetch": "^2.7.0",
     "pg": "^8.16.3",
