@@ -4,22 +4,21 @@
  *  - Node + Express
  *  - OpenAI (Responses API; strict JSON schema when supported)
  *  - Gemini (OpenAI-compat; JSON fallback + reply)
- *  - PostgreSQL (user memory + user state + alert queue)
+ *  - PostgreSQL (optional; user memory + user state + alert queue)
  *  - OpenWeather (weather signals)
  *
  * Endpoints:
- *  - GET  /                  -> service info (fixes "Cannot GET /")
+ *  - GET  /                -> basic root
  *  - GET  /health
- *  - POST /lxt1               -> strict LXT1 JSON only
- *  - POST /chat               -> { reply (professional), lxt1 (json), providers meta }
+ *  - POST /lxt1            -> strict LXT1 JSON only
+ *  - POST /chat            -> { reply (professional), lxt1 (json), providers meta }
  *
  * Stay-Ahead Engine:
- *  - POST /state/location     -> update user location, detect meaningful changes, queue alerts
- *  - POST /state/weather      -> force weather check, detect meaningful changes, queue alerts
- *  - POST /signals/ingest     -> ingest any external signal (business/market/social/legal/etc) and queue if meaningful
- *  - GET  /poll               -> app polls for queued alerts (Loravo “sends a message”)
- *  - POST /trip/set           -> store active trip context (simple)
- *  - POST /news/ingest        -> ingest a “news event” and queue if meaningful
+ *  - POST /state/location  -> update user location, detect meaningful changes, queue alerts
+ *  - POST /state/weather   -> force weather check, detect meaningful changes, queue alerts
+ *  - GET  /poll            -> app polls for queued alerts (Loravo “sends a message”)
+ *  - POST /trip/set        -> store active trip context (simple)
+ *  - POST /news/ingest     -> ingest your own “news event” and queue if meaningful
  *
  * Query params:
  *  - provider=openai | gemini | trinity   (default: trinity)
@@ -38,15 +37,58 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(cors({ origin: "*" }));
 
-/* ===================== POSTGRES ===================== */
+/* ===================== CONFIG ===================== */
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+const TOKEN_LIMITS = { instant: 400, auto: 1000, thinking: 1800 };
 
-pool.on("connect", () => console.log("✅ Postgres connected"));
+function getMode(req) {
+  const m = String(req.query.mode || "auto").toLowerCase();
+  return ["instant", "auto", "thinking"].includes(m) ? m : "auto";
+}
+
+function getProvider(req) {
+  const p = String(req.query.provider || "trinity").toLowerCase();
+  return ["openai", "gemini", "trinity"].includes(p) ? p : "trinity";
+}
+
+/* ===================== DB (OPTIONAL) ===================== */
+/**
+ * This fixes BOTH issues:
+ * - Local Postgres often has NO SSL -> do NOT force SSL locally.
+ * - Render Postgres requires SSL -> do SSL in production / non-local URLs.
+ */
+
+function isLocalDbUrl(url) {
+  if (!url) return true;
+  const u = String(url);
+  return (
+    u.includes("localhost") ||
+    u.includes("127.0.0.1") ||
+    u.includes("::1") ||
+    u.startsWith("postgres://localhost") ||
+    u.startsWith("postgresql://localhost")
+  );
+}
+
+const DATABASE_URL = process.env.DATABASE_URL || "";
+const DB_ENABLED = Boolean(DATABASE_URL);
+
+const pool = DB_ENABLED
+  ? new Pool({
+      connectionString: DATABASE_URL,
+      ssl: isLocalDbUrl(DATABASE_URL) ? false : { rejectUnauthorized: false },
+    })
+  : null;
+
+let dbReady = false;
 
 async function initDb() {
+  if (!pool) {
+    console.log("ℹ️ No DATABASE_URL set — DB disabled (server still runs).");
+    dbReady = false;
+    return;
+  }
+
   // user_memory
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_memory (
@@ -82,7 +124,7 @@ async function initDb() {
     CREATE TABLE IF NOT EXISTS alert_queue (
       id SERIAL PRIMARY KEY,
       user_id TEXT NOT NULL,
-      alert_type TEXT NOT NULL,            -- weather | location | trip | news | signal | system
+      alert_type TEXT NOT NULL,            -- weather | location | trip | news | system
       message TEXT NOT NULL,               -- what your app shows
       payload JSONB,                       -- optional extra structured info
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -102,22 +144,7 @@ async function initDb() {
     );
   `);
 
-  // generic external signals (anything that can change position)
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_signals (
-      id SERIAL PRIMARY KEY,
-      user_id TEXT NOT NULL,
-      source TEXT,                         -- e.g., "manual", "rss", "twitter", "bank", "calendar"
-      domain TEXT,                         -- e.g., "business", "money", "health", "social", "legal", "tech", "market"
-      title TEXT NOT NULL,
-      summary TEXT,
-      region TEXT,
-      severity TEXT NOT NULL DEFAULT 'low', -- low | medium | high | critical
-      action_hint TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
+  dbReady = true;
   console.log("✅ DB tables ensured");
 }
 
@@ -125,27 +152,13 @@ async function initDb() {
 
 app.get("/", (_, res) => {
   res.json({
-    service: "LORAVO LXT-1 backend",
+    service: "Loravo LXT-1 backend",
     status: "running",
-    endpoints: ["/health", "/chat", "/lxt1", "/poll", "/state/location", "/state/weather", "/signals/ingest", "/news/ingest", "/trip/set"],
+    endpoints: ["/health", "/chat", "/lxt1", "/state/location", "/state/weather", "/poll", "/trip/set", "/news/ingest"],
   });
 });
 
-app.get("/health", (_, res) => res.json({ ok: true }));
-
-/* ===================== MODES & TOKEN LIMITS ===================== */
-
-const TOKEN_LIMITS = { instant: 400, auto: 1000, thinking: 1800 };
-
-function getMode(req) {
-  const m = String(req.query.mode || "auto").toLowerCase();
-  return ["instant", "auto", "thinking"].includes(m) ? m : "auto";
-}
-
-function getProvider(req) {
-  const p = String(req.query.provider || "trinity").toLowerCase();
-  return ["openai", "gemini", "trinity"].includes(p) ? p : "trinity";
-}
+app.get("/health", (_, res) => res.json({ ok: true, db: dbReady }));
 
 /* ===================== LXT-1 JSON SCHEMA ===================== */
 
@@ -210,7 +223,7 @@ function safeFallbackResult(reason = "Temporary disruption—retry shortly.") {
     one_liner: reason,
     signals: [],
     actions: [{ now: "Retry in 30–60 seconds", time: "today", effort: "low" }],
-    watchouts: ["Provider quota"],
+    watchouts: ["Provider quota / temporary outage"],
     next_check: safeNowPlus(60 * 60 * 1000),
   };
 }
@@ -228,9 +241,6 @@ function sanitizeToSchema(o) {
   };
 }
 
-/**
- * Pull JSON object from OpenAI Responses API (preferred)
- */
 function extractOpenAIParsedObject(data) {
   if (data?.output_parsed) return data.output_parsed;
 
@@ -242,16 +252,11 @@ function extractOpenAIParsedObject(data) {
   return null;
 }
 
-/**
- * If a provider returns text containing JSON, extract the first {...} block safely.
- */
 function extractFirstJSONObject(text) {
   if (!text || typeof text !== "string") return null;
-
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) return null;
-
   const candidate = text.slice(start, end + 1);
   try {
     return JSON.parse(candidate);
@@ -286,7 +291,7 @@ function weatherToSignals(w) {
       name: "Heavy cloud cover",
       direction: "down",
       weight: 0.15,
-      why: "Overcast conditions correlate with travel delays",
+      why: "Overcast conditions can correlate with travel delays.",
     });
   }
 
@@ -295,18 +300,25 @@ function weatherToSignals(w) {
       name: "Low temperature",
       direction: "down",
       weight: 0.2,
-      why: `It's cold (${temp.toFixed(1)}°C) — plan layers`,
+      why: `It's cold (${temp.toFixed(1)}°C) — plan layers.`,
     });
   }
 
   return signals;
 }
 
+/* ===================== DB SAFE WRAPPERS ===================== */
+
+async function dbQuery(sql, params) {
+  if (!pool || !dbReady) return { rows: [] };
+  return pool.query(sql, params);
+}
+
 /* ===================== USER MEMORY ===================== */
 
 async function loadUserMemory(userId) {
   if (!userId) return "";
-  const { rows } = await pool.query(
+  const { rows } = await dbQuery(
     `SELECT content FROM user_memory WHERE user_id=$1 ORDER BY created_at DESC LIMIT 20`,
     [userId]
   );
@@ -315,7 +327,7 @@ async function loadUserMemory(userId) {
 
 async function saveUserMemory(userId, text) {
   if (userId && text) {
-    await pool.query(`INSERT INTO user_memory (user_id, content) VALUES ($1,$2)`, [userId, text]);
+    await dbQuery(`INSERT INTO user_memory (user_id, content) VALUES ($1,$2)`, [userId, text]);
   }
 }
 
@@ -323,23 +335,21 @@ async function saveUserMemory(userId, text) {
 
 async function loadUserState(userId) {
   if (!userId) return null;
-  const { rows } = await pool.query(`SELECT * FROM user_state WHERE user_id=$1 LIMIT 1`, [userId]);
+  const { rows } = await dbQuery(`SELECT * FROM user_state WHERE user_id=$1 LIMIT 1`, [userId]);
   return rows[0] || null;
 }
 
 async function upsertUserState(userId, patch) {
-  if (!userId) return;
+  if (!userId || !patch || !Object.keys(patch).length) return;
 
-  const fields = Object.keys(patch || {});
-  if (!fields.length) return;
-
+  const fields = Object.keys(patch);
   const cols = ["user_id", ...fields];
   const vals = [userId, ...fields.map((k) => patch[k])];
   const params = cols.map((_, i) => `$${i + 1}`);
 
   const updates = fields.map((k) => `${k}=EXCLUDED.${k}`).concat(["updated_at=NOW()"]).join(", ");
 
-  await pool.query(
+  await dbQuery(
     `
     INSERT INTO user_state (${cols.join(", ")})
     VALUES (${params.join(", ")})
@@ -355,6 +365,7 @@ const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 
 async function enqueueAlert({ userId, alertType, message, payload }) {
   if (!userId || !message) return;
+  if (!dbReady) return; // if DB is off, skip queue
 
   const state = await loadUserState(userId);
   const now = Date.now();
@@ -366,7 +377,7 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
 
   if (sameAsLast && inCooldown) return;
 
-  await pool.query(
+  await dbQuery(
     `INSERT INTO alert_queue (user_id, alert_type, message, payload) VALUES ($1,$2,$3,$4)`,
     [userId, alertType, message, payload ? JSON.stringify(payload) : null]
   );
@@ -378,7 +389,9 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
 }
 
 async function pollAlerts(userId, limit = 5) {
-  const { rows } = await pool.query(
+  if (!dbReady) return []; // if DB off, no queue
+
+  const { rows } = await dbQuery(
     `
     SELECT id, alert_type, message, payload, created_at
     FROM alert_queue
@@ -392,7 +405,7 @@ async function pollAlerts(userId, limit = 5) {
   if (!rows.length) return [];
 
   const ids = rows.map((r) => r.id);
-  await pool.query(`UPDATE alert_queue SET delivered_at=NOW() WHERE id = ANY($1::int[])`, [ids]);
+  await dbQuery(`UPDATE alert_queue SET delivered_at=NOW() WHERE id = ANY($1::int[])`, [ids]);
 
   return rows.map((r) => ({
     type: r.alert_type,
@@ -402,7 +415,7 @@ async function pollAlerts(userId, limit = 5) {
   }));
 }
 
-/* ===================== PROFESSIONAL ALERT COMPOSER ===================== */
+/* ===================== ALERT COMPOSERS ===================== */
 
 function formatC(n) {
   if (typeof n !== "number") return null;
@@ -444,32 +457,18 @@ function composeLocationAlert({ prevCity, nowCity, prevCountry, nowCountry }) {
   if (from && to && from !== to) {
     return `Location changed to ${to} (was ${from}). Loravo will adjust updates to your new area.`;
   }
-
   if (to && !from) {
     return `Location set to ${to}. Loravo will use this for local updates.`;
   }
-
   return null;
-}
-
-function composeGenericSignalAlert({ title, region, summary, actionHint }) {
-  const parts = [];
-  parts.push(`${title}.`);
-  if (region) parts.push(`Area: ${region}.`);
-  if (summary) parts.push(summary);
-  if (actionHint) parts.push(actionHint);
-  return parts.join(" ").replace(/\s+/g, " ").trim();
 }
 
 function isMeaningfulTempChange(prevTemp, nowTemp) {
   if (typeof prevTemp !== "number" || typeof nowTemp !== "number") return false;
-
   const delta = Math.abs(nowTemp - prevTemp);
-
   const crossedHot = prevTemp < 28 && nowTemp >= 28;
   const crossedCold = prevTemp > 5 && nowTemp <= 5;
   const crossedWarm = prevTemp < 20 && nowTemp >= 20;
-
   return delta >= 8 || crossedHot || crossedCold || crossedWarm;
 }
 
@@ -562,14 +561,7 @@ async function updateWeatherAndMaybeAlert({ userId, lat, lon }) {
         userId,
         alertType: "weather",
         message: msg,
-        payload: {
-          prevTemp,
-          nowTemp,
-          prevCloud,
-          nowCloud,
-          main: nowMain,
-          desc: nowDesc,
-        },
+        payload: { prevTemp, nowTemp, prevCloud, nowCloud, main: nowMain, desc: nowDesc },
       });
     }
   }
@@ -734,13 +726,6 @@ NO extra text. JSON only.
   return sanitizeToSchema(obj);
 }
 
-/**
- * Reply style:
- * - professional
- * - simple English
- * - no jokes/emojis/slang
- * - 1–2 short sentences
- */
 async function callGeminiReply({ userText, lxt1, style, lastReplyHint }) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("Missing GEMINI_API_KEY");
@@ -911,10 +896,6 @@ async function getHumanReply({ provider, decisionProvider, userText, lxt1, style
       tried.push("gemini");
       const reply = await callGeminiReply({ userText, lxt1, style, lastReplyHint });
       return { reply, replyProvider: "gemini", tried };
-    } else if (decisionProvider === "gemini") {
-      tried.push("openai");
-      const reply = await callOpenAIReply({ userText, lxt1, style, lastReplyHint });
-      return { reply, replyProvider: "openai", tried };
     } else {
       tried.push("openai");
       const reply = await callOpenAIReply({ userText, lxt1, style, lastReplyHint });
@@ -950,26 +931,18 @@ async function runLXT({ req }) {
   const memory = await loadUserMemory(user_id);
   const state = await loadUserState(user_id);
 
-  const weather =
-    typeof lat === "number" && typeof lon === "number"
-      ? await getWeather(lat, lon)
-      : null;
-
+  const weather = typeof lat === "number" && typeof lon === "number" ? await getWeather(lat, lon) : null;
   const weatherSignals = weatherToSignals(weather);
 
-  // Decision JSON
   const decision = await getDecision({ provider, text, memory, maxTokens });
   let lxt1 = decision.lxt1;
 
-  // Merge weather signals into result.signals
   lxt1.signals = [...weatherSignals, ...(lxt1.signals || [])];
 
-  // Save memory (user’s message)
   await saveUserMemory(user_id, text);
 
   const lastReplyHint = state?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "";
 
-  // Human reply (for chat UI)
   const voice = await getHumanReply({
     provider,
     decisionProvider: decision.decisionProvider,
@@ -1008,10 +981,6 @@ app.post("/lxt1", async (req, res) => {
       ...result.lxt1,
       _provider: result.providers.decision,
       _providers: result.providers,
-      _model_hint: {
-        openai_decision: process.env.OPENAI_MODEL_DECISION || process.env.OPENAI_MODEL || "gpt-4o-mini",
-        gemini_decision: process.env.GEMINI_MODEL || "gemini-3-flash-preview",
-      },
       ...(result._errors?.openai || result._errors?.gemini ? { _errors: result._errors } : {}),
     });
   } catch (e) {
@@ -1049,7 +1018,7 @@ app.post("/state/location", async (req, res) => {
     await updateLocationAndMaybeAlert({ userId: user_id, lat, lon, city, country, timezone });
     await updateWeatherAndMaybeAlert({ userId: user_id, lat, lon });
 
-    res.json({ ok: true });
+    res.json({ ok: true, db: dbReady });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1067,61 +1036,7 @@ app.post("/state/weather", async (req, res) => {
       return res.status(400).json({ error: "Missing lat/lon (numbers)" });
 
     await updateWeatherAndMaybeAlert({ userId: user_id, lat, lon });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
-  }
-});
-
-/**
- * POST /signals/ingest
- * Body: { user_id, title, summary?, domain?, region?, severity?, action? }
- * Queues only if severity is medium/high/critical.
- * This is the “anything else” endpoint: you can feed any signal and Loravo will message when it matters.
- */
-app.post("/signals/ingest", async (req, res) => {
-  try {
-    const { user_id, title, summary, domain, region, severity, action } = req.body || {};
-    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
-    if (!title) return res.status(400).json({ error: "Missing title" });
-
-    const sev = String(severity || "low").toLowerCase();
-    const meaningful = ["medium", "high", "critical"].includes(sev);
-
-    await pool.query(
-      `
-      INSERT INTO user_signals (user_id, source, domain, title, summary, region, severity, action_hint)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-    `,
-      [
-        user_id,
-        "manual",
-        domain || "general",
-        title,
-        summary || null,
-        region || null,
-        sev,
-        action || null,
-      ]
-    );
-
-    if (meaningful) {
-      const message = composeGenericSignalAlert({
-        title,
-        region,
-        summary,
-        actionHint: action,
-      });
-
-      await enqueueAlert({
-        userId: user_id,
-        alertType: "signal",
-        message,
-        payload: { title, summary, domain: domain || "general", region, severity: sev, action },
-      });
-    }
-
-    res.json({ ok: true, queued: meaningful });
+    res.json({ ok: true, db: dbReady });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1137,7 +1052,7 @@ app.get("/poll", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
 
     const alerts = await pollAlerts(userId, clamp(limit, 1, 20));
-    res.json({ ok: true, alerts });
+    res.json({ ok: true, db: dbReady, alerts });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1151,8 +1066,9 @@ app.post("/trip/set", async (req, res) => {
   try {
     const { user_id, active, destination, depart_at, notes } = req.body || {};
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — trip not stored." });
 
-    await pool.query(
+    await dbQuery(
       `
       INSERT INTO user_trip (user_id, active, destination, depart_at, notes)
       VALUES ($1,$2,$3,$4,$5)
@@ -1181,7 +1097,7 @@ app.post("/trip/set", async (req, res) => {
       });
     }
 
-    res.json({ ok: true });
+    res.json({ ok: true, db: dbReady });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1191,6 +1107,7 @@ app.post("/trip/set", async (req, res) => {
  * POST /news/ingest
  * Body: { user_id, title, summary, region?, severity?, action? }
  * Queues only if severity is medium/high/critical.
+ * (This endpoint is for YOUR pipeline. Later we will wire a real news API.)
  */
 app.post("/news/ingest", async (req, res) => {
   try {
@@ -1201,7 +1118,7 @@ app.post("/news/ingest", async (req, res) => {
     const sev = String(severity || "low").toLowerCase();
     const meaningful = ["medium", "high", "critical"].includes(sev);
 
-    if (meaningful) {
+    if (meaningful && dbReady) {
       const parts = [];
       parts.push(`${title}.`);
       if (region) parts.push(`Area: ${region}.`);
@@ -1218,7 +1135,7 @@ app.post("/news/ingest", async (req, res) => {
       });
     }
 
-    res.json({ ok: true, queued: meaningful });
+    res.json({ ok: true, db: dbReady, queued: meaningful && dbReady });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
@@ -1228,98 +1145,17 @@ app.post("/news/ingest", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-initDb()
-  .then(() => {
-    app.listen(PORT, () => console.log(`✅ LORAVO running on ${PORT}`));
-  })
-  .catch((e) => {
-    console.error("❌ DB init failed:", e);
-    process.exit(1);
+(async () => {
+  try {
+    await initDb();
+  } catch (e) {
+    // IMPORTANT: do NOT crash the server if DB fails.
+    // We keep Loravo running and just disable DB features.
+    console.error("⚠️ DB init failed (DB disabled):", e?.message || e);
+    dbReady = false;
+  }
+
+  app.listen(PORT, () => {
+    console.log(`✅ LORAVO running on ${PORT} (dbReady=${dbReady})`);
   });
-
-/* ===================== QUICK TESTS =====================
-
-# 0) Root
-curl -s "http://localhost:3000/" | jq
-
-# 1) Chat (professional reply + JSON)
-curl -s -X POST "http://localhost:3000/chat?provider=trinity&mode=auto" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text":"I have a flight tomorrow. How should I prepare?",
-    "user_id":"test_flight",
-    "lat":53.5461,
-    "lon":-113.4938,
-    "style":"imessage"
-  }' | jq
-
-# 2) Decision JSON only
-curl -s -X POST "http://localhost:3000/lxt1?provider=trinity&mode=auto" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text":"I have a flight tomorrow. How should I prepare?",
-    "user_id":"test_flight",
-    "lat":53.5461,
-    "lon":-113.4938
-  }' | jq
-
-# 3) Update location (queues location + weather alert if meaningful)
-curl -s -X POST "http://localhost:3000/state/location" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id":"test_flight",
-    "lat":53.5461,
-    "lon":-113.4938,
-    "city":"Edmonton",
-    "country":"Canada"
-  }' | jq
-
-# 4) Force weather check (queues alert if temperature changed meaningfully)
-curl -s -X POST "http://localhost:3000/state/weather" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id":"test_flight",
-    "lat":53.5461,
-    "lon":-113.4938
-  }' | jq
-
-# 5) Poll alerts (Loravo “sends messages”)
-curl -s "http://localhost:3000/poll?user_id=test_flight&limit=5" | jq
-
-# 6) Trip set
-curl -s -X POST "http://localhost:3000/trip/set" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id":"test_flight",
-    "active": true,
-    "destination":"New York",
-    "depart_at":"2026-01-20T18:00:00Z",
-    "notes":"Carry-on only"
-  }' | jq
-
-# 7) Ingest a news event (queues only if medium/high/critical)
-curl -s -X POST "http://localhost:3000/news/ingest" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id":"test_flight",
-    "title":"Major delay expected on Highway 2",
-    "summary":"Traffic is slowing near construction zones.",
-    "region":"Edmonton–Calgary",
-    "severity":"high",
-    "action":"Leave earlier or take an alternate route."
-  }' | jq
-
-# 8) Ingest ANY signal (business / money / social / legal / tech / anything)
-curl -s -X POST "http://localhost:3000/signals/ingest" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "user_id":"test_flight",
-    "domain":"money",
-    "title":"Credit card payment due in 48 hours",
-    "summary":"Your balance is high and interest will start if not paid.",
-    "region":"Canada",
-    "severity":"high",
-    "action":"Pay at least the statement balance today."
-  }' | jq
-
-===================================== */
+})();
