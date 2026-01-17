@@ -1244,30 +1244,38 @@ app.post("/news/ingest", async (req, res) => {
  * Body: { user_id, device_token, environment? }
  * Stores the APNs device token for later push sending.
  */
-app.post("/push/register", async (req, res) => {
+app.post("/push/send-test", async (req, res) => {
   try {
-    const { user_id, device_token, environment } = req.body || {};
-    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
-    if (!device_token) return res.status(400).json({ error: "Missing device_token" });
-    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — token not stored." });
+    const { user_id, title, body, payload = {}, environment = "sandbox" } = req.body;
 
-    const env = String(environment || "production").toLowerCase();
-    const safeEnv = env === "sandbox" ? "sandbox" : "production";
+    if (!user_id || !body) {
+      return res.status(400).json({ error: "missing user_id or body" });
+    }
 
-    await dbQuery(
-  `
-  INSERT INTO push_devices (user_id, device_token, environment, platform)
-  VALUES ($1,$2,$3,'ios')
-  ON CONFLICT (user_id, environment) DO UPDATE SET
-    device_token=EXCLUDED.device_token,
-    updated_at=NOW()
-`,
-  [user_id, String(device_token).trim(), safeEnv]
-);
+    const { rows } = await dbQuery(
+      `SELECT device_token FROM push_devices
+       WHERE user_id=$1 AND environment=$2
+       LIMIT 1`,
+      [user_id, environment]
+    );
 
-    res.json({ ok: true, db: dbReady });
-  } catch (e) {
-    res.status(500).json({ error: String(e) });
+    if (!rows.length) {
+      return res.status(404).json({ error: "no device registered" });
+    }
+
+    const token = rows[0].device_token;
+
+    await apnsProvider.send({
+      token,
+      title: title || "Loravo",
+      body,
+      payload
+    });
+
+    res.json({ ok: true, sent: true });
+  } catch (err) {
+    console.error("push/send-test error:", err);
+    res.status(500).json({ error: "push failed" });
   }
 });
 
