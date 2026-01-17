@@ -1246,36 +1246,36 @@ app.post("/news/ingest", async (req, res) => {
  */
 app.post("/push/send-test", async (req, res) => {
   try {
-    const { user_id, title, body, payload = {}, environment = "sandbox" } = req.body;
+    const { user_id, title, body, payload, force } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+    if (!body) return res.status(400).json({ error: "Missing body" });
 
-    if (!user_id || !body) {
-      return res.status(400).json({ error: "missing user_id or body" });
+    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — cannot send test push." });
+
+    const devices = await getUserDevices(user_id);
+    if (!devices.length) return res.status(400).json({ error: "No device registered for this user_id" });
+
+    const prefs = await getPrefs(user_id);
+    if (!force && isInQuietHours(prefs)) {
+      return res.json({ ok: true, db: true, skipped: true, reason: "quiet_hours" });
     }
 
-    const { rows } = await dbQuery(
-      `SELECT device_token FROM push_devices
-       WHERE user_id=$1 AND environment=$2
-       LIMIT 1`,
-      [user_id, environment]
-    );
-
-    if (!rows.length) {
-      return res.status(404).json({ error: "no device registered" });
+    const results = [];
+    for (const d of devices) {
+      const r = await apnsSendStrict({
+        deviceToken: d.device_token,
+        title: title || "Loravo",
+        body: body || "Test push from Loravo.",
+        payload: payload || { test: true },
+        environment: d.environment,
+      });
+      results.push({ env: d.environment, status: r.status, ok: r.ok, body: r.body });
     }
 
-    const token = rows[0].device_token;
-
-    await apnsProvider.send({
-      token,
-      title: title || "Loravo",
-      body,
-      payload
-    });
-
-    res.json({ ok: true, sent: true });
-  } catch (err) {
-    console.error("push/send-test error:", err);
-    res.status(500).json({ error: "push failed" });
+    res.json({ ok: true, db: true, results });
+  } catch (e) {
+    // IMPORTANT: show the real error so we can fix it fast
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
