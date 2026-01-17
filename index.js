@@ -1,11 +1,3 @@
-index.js 
-
-
-
-
-
-
-
 /*************************************************
  * LORAVO – LXT-1 Backend (Trinity + Professional Reply + Stay-Ahead Alerts + Push Registration + Quiet Hours + Fixed next_check)
  * Stack:
@@ -420,7 +412,7 @@ async function upsertUserState(userId, patch) {
     `
     INSERT INTO user_state (${cols.join(", ")})
     VALUES (${params.join(", ")})
-    ON CONFLICT (user_id) DO UPDATE SET ${updates}
+ ON CONFLICT (user_id, environment) DO UPDATE SET ${updates}
   `,
     vals
   );
@@ -1263,16 +1255,15 @@ app.post("/push/register", async (req, res) => {
     const safeEnv = env === "sandbox" ? "sandbox" : "production";
 
     await dbQuery(
-      `
-      INSERT INTO push_devices (user_id, device_token, environment, platform)
-      VALUES ($1,$2,$3,'ios')
-      ON CONFLICT (user_id) DO UPDATE SET
-        device_token=EXCLUDED.device_token,
-        environment=EXCLUDED.environment,
-        updated_at=NOW()
-    `,
-      [user_id, String(device_token).trim(), safeEnv]
-    );
+  `
+  INSERT INTO push_devices (user_id, device_token, environment, platform)
+  VALUES ($1,$2,$3,'ios')
+  ON CONFLICT (user_id, environment) DO UPDATE SET
+    device_token=EXCLUDED.device_token,
+    updated_at=NOW()
+`,
+  [user_id, String(device_token).trim(), safeEnv]
+);
 
     res.json({ ok: true, db: dbReady });
   } catch (e) {
