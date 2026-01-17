@@ -1,10 +1,10 @@
 /*************************************************
- * LORAVO – LXT-1 Backend (Trinity + Professional Reply + Stay-Ahead Alerts)
+ * LORAVO – LXT-1 Backend (Trinity + Professional Reply + Stay-Ahead Alerts + Push Registration + Quiet Hours + Fixed next_check)
  * Stack:
  *  - Node + Express
  *  - OpenAI (Responses API; strict JSON schema when supported)
  *  - Gemini (OpenAI-compat; JSON fallback + reply)
- *  - PostgreSQL (optional; user memory + user state + alert queue)
+ *  - PostgreSQL (optional; user memory + user state + alert queue + device tokens + preferences)
  *  - OpenWeather (weather signals)
  *
  * Endpoints:
@@ -19,6 +19,11 @@
  *  - GET  /poll            -> app polls for queued alerts (Loravo “sends a message”)
  *  - POST /trip/set        -> store active trip context (simple)
  *  - POST /news/ingest     -> ingest your own “news event” and queue if meaningful
+ *
+ * Soft Features (v1):
+ *  - POST /push/register        -> store iOS APNs device token
+ *  - POST /prefs/quiet-hours    -> user quiet hours (for later push rules; also can mute queue)
+ *  - GET  /prefs                -> fetch prefs
  *
  * Query params:
  *  - provider=openai | gemini | trinity   (default: trinity)
@@ -53,9 +58,8 @@ function getProvider(req) {
 
 /* ===================== DB (OPTIONAL) ===================== */
 /**
- * This fixes BOTH issues:
- * - Local Postgres often has NO SSL -> do NOT force SSL locally.
- * - Render Postgres requires SSL -> do SSL in production / non-local URLs.
+ * Local Postgres often has NO SSL -> do NOT force SSL locally.
+ * Render Postgres requires SSL -> do SSL in production / non-local URLs.
  */
 
 function isLocalDbUrl(url) {
@@ -144,6 +148,29 @@ async function initDb() {
     );
   `);
 
+  // push devices (device tokens)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS push_devices (
+      user_id TEXT PRIMARY KEY,
+      device_token TEXT NOT NULL,
+      environment TEXT NOT NULL DEFAULT 'production', -- sandbox | production
+      platform TEXT NOT NULL DEFAULT 'ios',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
+  // user prefs (quiet hours, etc.)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_prefs (
+      user_id TEXT PRIMARY KEY,
+      quiet_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+      quiet_start TEXT,     -- "23:00"
+      quiet_end TEXT,       -- "07:00"
+      timezone TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+
   dbReady = true;
   console.log("✅ DB tables ensured");
 }
@@ -154,7 +181,19 @@ app.get("/", (_, res) => {
   res.json({
     service: "Loravo LXT-1 backend",
     status: "running",
-    endpoints: ["/health", "/chat", "/lxt1", "/state/location", "/state/weather", "/poll", "/trip/set", "/news/ingest"],
+    endpoints: [
+      "/health",
+      "/chat",
+      "/lxt1",
+      "/state/location",
+      "/state/weather",
+      "/poll",
+      "/trip/set",
+      "/news/ingest",
+      "/push/register",
+      "/prefs/quiet-hours",
+      "/prefs",
+    ],
   });
 });
 
@@ -228,6 +267,7 @@ function safeFallbackResult(reason = "Temporary disruption—retry shortly.") {
   };
 }
 
+// FIX: force next_check to be future (model often returns old dates)
 function sanitizeToSchema(o) {
   const conf = typeof o?.confidence === "number" ? o.confidence : 0.5;
   return {
@@ -235,9 +275,11 @@ function sanitizeToSchema(o) {
     confidence: clamp(Math.round(conf * 100) / 100, 0, 1),
     one_liner: String(o?.one_liner || "OK"),
     signals: Array.isArray(o?.signals) ? o.signals : [],
-    actions: Array.isArray(o?.actions) ? o.actions : [{ now: "Retry later", time: "today", effort: "low" }],
+    actions: Array.isArray(o?.actions)
+      ? o.actions
+      : [{ now: "Retry later", time: "today", effort: "low" }],
     watchouts: Array.isArray(o?.watchouts) ? o.watchouts : [],
-    next_check: String(o?.next_check || safeNowPlus(60 * 60 * 1000)),
+    next_check: safeNowPlus(6 * 60 * 60 * 1000), // 6 hours from now
   };
 }
 
@@ -263,6 +305,23 @@ function extractFirstJSONObject(text) {
   } catch {
     return null;
   }
+}
+
+function normalizeTimeHHMM(t) {
+  if (!t) return null;
+  const s = String(t).trim();
+  // Accept "7:00" -> "07:00"
+  const m = s.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const hh = String(clamp(parseInt(m[1], 10), 0, 23)).padStart(2, "0");
+  const mm = String(clamp(parseInt(m[2], 10), 0, 59)).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function minutesFromHHMM(hhmm) {
+  const m = String(hhmm || "").match(/^(\d{2}):(\d{2})$/);
+  if (!m) return null;
+  return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
 }
 
 /* ===================== WEATHER ===================== */
@@ -359,6 +418,36 @@ async function upsertUserState(userId, patch) {
   );
 }
 
+/* ===================== PREFS ===================== */
+
+async function loadUserPrefs(userId) {
+  if (!userId || !dbReady) return null;
+  const { rows } = await dbQuery(`SELECT * FROM user_prefs WHERE user_id=$1 LIMIT 1`, [userId]);
+  return rows[0] || null;
+}
+
+function isNowInQuietHours(prefs) {
+  if (!prefs?.quiet_enabled) return false;
+
+  const start = normalizeTimeHHMM(prefs.quiet_start);
+  const end = normalizeTimeHHMM(prefs.quiet_end);
+  if (!start || !end) return false;
+
+  const startMin = minutesFromHHMM(start);
+  const endMin = minutesFromHHMM(end);
+  if (startMin == null || endMin == null) return false;
+
+  // NOTE: uses server time. For v1 this is fine; later we can convert using timezone.
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+
+  // If quiet hours wrap past midnight (e.g., 23:00 -> 07:00)
+  if (startMin > endMin) {
+    return nowMin >= startMin || nowMin < endMin;
+  }
+  return nowMin >= startMin && nowMin < endMin;
+}
+
 /* ===================== ALERT QUEUE ===================== */
 
 const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
@@ -366,6 +455,10 @@ const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 async function enqueueAlert({ userId, alertType, message, payload }) {
   if (!userId || !message) return;
   if (!dbReady) return; // if DB is off, skip queue
+
+  // quiet hours (soft feature): if enabled, we still store alerts, but can mark payload
+  const prefs = await loadUserPrefs(userId);
+  const quiet = isNowInQuietHours(prefs);
 
   const state = await loadUserState(userId);
   const now = Date.now();
@@ -377,9 +470,14 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
 
   if (sameAsLast && inCooldown) return;
 
+  const mergedPayload = {
+    ...(payload || {}),
+    quiet_hours_active: Boolean(quiet),
+  };
+
   await dbQuery(
     `INSERT INTO alert_queue (user_id, alert_type, message, payload) VALUES ($1,$2,$3,$4)`,
-    [userId, alertType, message, payload ? JSON.stringify(payload) : null]
+    [userId, alertType, message, JSON.stringify(mergedPayload)]
   );
 
   await upsertUserState(userId, {
@@ -1136,6 +1234,101 @@ app.post("/news/ingest", async (req, res) => {
     }
 
     res.json({ ok: true, db: dbReady, queued: meaningful && dbReady });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/**
+ * POST /push/register
+ * Body: { user_id, device_token, environment? }
+ * Stores the APNs device token for later push sending.
+ */
+app.post("/push/register", async (req, res) => {
+  try {
+    const { user_id, device_token, environment } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+    if (!device_token) return res.status(400).json({ error: "Missing device_token" });
+    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — token not stored." });
+
+    const env = String(environment || "production").toLowerCase();
+    const safeEnv = env === "sandbox" ? "sandbox" : "production";
+
+    await dbQuery(
+      `
+      INSERT INTO push_devices (user_id, device_token, environment, platform)
+      VALUES ($1,$2,$3,'ios')
+      ON CONFLICT (user_id) DO UPDATE SET
+        device_token=EXCLUDED.device_token,
+        environment=EXCLUDED.environment,
+        updated_at=NOW()
+    `,
+      [user_id, String(device_token).trim(), safeEnv]
+    );
+
+    res.json({ ok: true, db: dbReady });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/**
+ * POST /prefs/quiet-hours
+ * Body: { user_id, enabled, start, end, timezone? }
+ */
+app.post("/prefs/quiet-hours", async (req, res) => {
+  try {
+    const { user_id, enabled, start, end, timezone } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — prefs not stored." });
+
+    const s = normalizeTimeHHMM(start);
+    const e = normalizeTimeHHMM(end);
+    if (!s || !e) return res.status(400).json({ error: "start/end must be HH:MM (e.g., 23:00)" });
+
+    await dbQuery(
+      `
+      INSERT INTO user_prefs (user_id, quiet_enabled, quiet_start, quiet_end, timezone)
+      VALUES ($1,$2,$3,$4,$5)
+      ON CONFLICT (user_id) DO UPDATE SET
+        quiet_enabled=EXCLUDED.quiet_enabled,
+        quiet_start=EXCLUDED.quiet_start,
+        quiet_end=EXCLUDED.quiet_end,
+        timezone=EXCLUDED.timezone,
+        updated_at=NOW()
+    `,
+      [user_id, Boolean(enabled), s, e, timezone || null]
+    );
+
+    res.json({ ok: true, db: dbReady });
+  } catch (e) {
+    res.status(500).json({ error: String(e) });
+  }
+});
+
+/**
+ * GET /prefs?user_id=...
+ */
+app.get("/prefs", async (req, res) => {
+  try {
+    const userId = String(req.query.user_id || "");
+    if (!userId) return res.status(400).json({ error: "Missing user_id" });
+    if (!dbReady) return res.status(200).json({ ok: true, db: false, prefs: null });
+
+    const prefs = await loadUserPrefs(userId);
+    res.json({
+      ok: true,
+      db: dbReady,
+      prefs: prefs
+        ? {
+            quiet_enabled: Boolean(prefs.quiet_enabled),
+            quiet_start: prefs.quiet_start || null,
+            quiet_end: prefs.quiet_end || null,
+            timezone: prefs.timezone || null,
+            updated_at: prefs.updated_at,
+          }
+        : null,
+    });
   } catch (e) {
     res.status(500).json({ error: String(e) });
   }
