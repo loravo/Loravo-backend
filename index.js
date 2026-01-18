@@ -1080,92 +1080,85 @@ async function runLXT({ req }) {
 }
 
 /* ===================== PUSH (APNs) ===================== */
-/**
- * Minimal HTTP/2 APNs sender using node-fetch + built-in https2 via fetch isn't enough,
- * so we use a direct https2 client.
- *
- * Requirements:
- * - APNS_KEY_ID
- * - APNS_TEAM_ID
- * - APNS_BUNDLE_ID
- * - APNS_PRIVATE_KEY (the .p8 content, with newlines)
- *
- * Note:
- * - Render env var should contain the FULL .p8 key text.
- * - If you pasted it with \n, we convert it back.
- */
+/* ===================== PUSH (APNs) ===================== */
 
 const http2 = require("http2");
 
-function envMultiline(name) {
-  const v = process.env[name];
-  if (!v) return "";
-  // allow either real newlines or "\n"
-  return String(v).replace(/\\n/g, "\n");
-}
-
-function base64url(input) {
-  return Buffer.from(input)
+function base64urlBuffer(buf) {
+  return Buffer.from(buf)
     .toString("base64")
     .replace(/=/g, "")
     .replace(/\+/g, "-")
     .replace(/\//g, "_");
 }
 
-function signJwtES256({ keyId, teamId, privateKeyPem }) {
-  // JWT header + claims for APNs provider token
-  const header = { alg: "ES256", kid: keyId };
-  const now = Math.floor(Date.now() / 1000);
-  const claims = { iss: teamId, iat: now };
-
-  const headerB64 = base64url(JSON.stringify(header));
-  const claimsB64 = base64url(JSON.stringify(claims));
-  const data = `${headerB64}.${claimsB64}`;
-
-  const sign = crypto.createSign("RSA-SHA256"); // will NOT work for ES256; we must use 'sha256' with ECDSA
-  // We'll use createSign('SHA256') and provide EC key. Node maps it correctly.
-  const signer = crypto.createSign("SHA256");
-  signer.update(data);
-  signer.end();
-
-  // dsaEncoding 'ieee-p1363' gives 64-byte signature expected for JOSE
-  const signature = signer.sign({ key: privateKeyPem, dsaEncoding: "ieee-p1363" });
-  const sigB64 = base64url(signature);
-
-  return `${data}.${sigB64}`;
+function base64urlJson(obj) {
+  return base64urlBuffer(Buffer.from(JSON.stringify(obj)));
 }
 
 function getApnsConfig() {
-  const keyId = process.env.APNS_KEY_ID || "";
-  const teamId = process.env.APNS_TEAM_ID || "";
-  const bundleId = process.env.APNS_BUNDLE_ID || "";
-  const privateKeyPem = envMultiline("APNS_PRIVATE_KEY");
+  const keyId = String(process.env.APNS_KEY_ID || "").trim();
+  const teamId = String(process.env.APNS_TEAM_ID || "").trim();
 
-  const ok = Boolean(keyId && teamId && bundleId && privateKeyPem);
-  return { ok, keyId, teamId, bundleId, privateKeyPem };
+  // Use APNS_TOPIC (bundle id). If you prefer, APNS_BUNDLE_ID also works.
+  const topic = String(process.env.APNS_TOPIC || process.env.APNS_BUNDLE_ID || "").trim();
+
+  // You said you already have APNS_KEY_P8_B64
+  const p8b64 = String(process.env.APNS_KEY_P8_B64 || "").trim();
+
+  if (!keyId || !teamId || !topic || !p8b64) {
+    throw new Error(
+      "Missing APNS env vars (APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC/APNS_BUNDLE_ID, APNS_KEY_P8_B64)"
+    );
+  }
+
+  // Decode base64 -> PEM text
+  let pem = Buffer.from(p8b64, "base64").toString("utf8").trim();
+  pem = pem.replace(/\r\n/g, "\n").trim();
+
+  // If they encoded ONLY the middle part, rebuild the PEM
+  if (!pem.includes("BEGIN PRIVATE KEY") && !pem.includes("BEGIN EC PRIVATE KEY")) {
+    pem = `-----BEGIN PRIVATE KEY-----\n${pem}\n-----END PRIVATE KEY-----`;
+  }
+
+  // Convert PEM to KeyObject (this avoids many OpenSSL decoder issues)
+  let keyObject;
+  try {
+    keyObject = crypto.createPrivateKey({ key: pem, format: "pem" });
+  } catch (e) {
+    throw new Error(`APNS key decode failed: ${e?.message || e}`);
+  }
+
+  return { keyId, teamId, topic, keyObject };
+}
+
+function makeApnsJwt() {
+  const { keyId, teamId, keyObject } = getApnsConfig();
+
+  const header = { alg: "ES256", kid: keyId, typ: "JWT" };
+  const payload = { iss: teamId, iat: Math.floor(Date.now() / 1000) };
+
+  const unsigned = `${base64urlJson(header)}.${base64urlJson(payload)}`;
+
+  let sig;
+  try {
+    // ES256 (ECDSA with SHA-256) signature in JOSE format
+    sig = crypto.sign(null, Buffer.from(unsigned), {
+      key: keyObject,
+      dsaEncoding: "ieee-p1363",
+    });
+  } catch (e) {
+    throw new Error(`JWT sign failed: ${e?.message || e}`);
+  }
+
+  return `${unsigned}.${base64urlBuffer(sig)}`;
 }
 
 async function apnsSendStrict({ deviceToken, title, body, payload, environment }) {
-  const cfg = getApnsConfig();
-  if (!cfg.ok) {
-    return { ok: false, status: 500, body: "Missing APNS env vars (APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID, APNS_PRIVATE_KEY)" };
-  }
-  if (!deviceToken) return { ok: false, status: 400, body: "Missing deviceToken" };
+  const { topic } = getApnsConfig();
+  const jwt = makeApnsJwt();
 
-  const host = environment === "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com";
-
-  let jwt;
-  try {
-    jwt = signJwtES256({
-      keyId: cfg.keyId,
-      teamId: cfg.teamId,
-      privateKeyPem: cfg.privateKeyPem,
-    });
-  } catch (e) {
-    return { ok: false, status: 500, body: `JWT sign failed: ${String(e?.message || e)}` };
-  }
-
-  const client = http2.connect(`https://${host}`);
+  const host = String(environment || "production") === "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com";
 
   const notification = {
     aps: {
@@ -1175,11 +1168,13 @@ async function apnsSendStrict({ deviceToken, title, body, payload, environment }
     ...(payload || {}),
   };
 
+  const client = http2.connect(`https://${host}`);
+
   const headers = {
     ":method": "POST",
     ":path": `/3/device/${deviceToken}`,
     authorization: `bearer ${jwt}`,
-    "apns-topic": cfg.bundleId,
+    "apns-topic": topic,
     "apns-push-type": "alert",
   };
 
@@ -1193,8 +1188,11 @@ async function apnsSendStrict({ deviceToken, title, body, payload, environment }
       req.on("data", (chunk) => (respData += chunk));
       req.on("end", () => {
         client.close();
-        const ok = Number(status) >= 200 && Number(status) < 300;
-        resolve({ ok, status: Number(status), body: respData || "" });
+        resolve({
+          ok: Number(status) >= 200 && Number(status) < 300,
+          status: Number(status),
+          body: respData || "",
+        });
       });
     });
 
