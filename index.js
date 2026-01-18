@@ -1,10 +1,10 @@
 /*************************************************
- * LORAVO – LXT-1 Backend (Trinity + Professional Reply + Stay-Ahead Alerts + Push Registration + Quiet Hours + Fixed next_check)
+ * LORAVO – LXT-1 Backend (Trinity + Professional Reply + Stay-Ahead Alerts + Push + Quiet Hours)
  * Stack:
  *  - Node + Express
  *  - OpenAI (Responses API; strict JSON schema when supported)
  *  - Gemini (OpenAI-compat; JSON fallback + reply)
- *  - PostgreSQL (optional; user memory + user state + alert queue + device tokens + preferences)
+ *  - PostgreSQL (optional; user memory + state + alert queue + device tokens + prefs)
  *  - OpenWeather (weather signals)
  *
  * Endpoints:
@@ -20,10 +20,13 @@
  *  - POST /trip/set        -> store active trip context (simple)
  *  - POST /news/ingest     -> ingest your own “news event” and queue if meaningful
  *
- * Soft Features (v1):
- *  - POST /push/register        -> store iOS APNs device token
- *  - POST /prefs/quiet-hours    -> user quiet hours (for later push rules; also can mute queue)
- *  - GET  /prefs                -> fetch prefs
+ * Push (v1):
+ *  - POST /push/register   -> store iOS APNs device token (sandbox/production)
+ *  - POST /push/send-test  -> send a test push to the stored token(s)
+ *
+ * Prefs:
+ *  - POST /prefs/quiet-hours
+ *  - GET  /prefs
  *
  * Query params:
  *  - provider=openai | gemini | trinity   (default: trinity)
@@ -148,15 +151,25 @@ async function initDb() {
     );
   `);
 
-  // push devices (device tokens)
+  /**
+   * push_devices
+   * NOTE: YOUR DB already has UNIQUE (user_id, environment).
+   * So we model that here (id PK, and unique user_id+environment).
+   * This avoids conflicts with your existing table.
+   */
   await pool.query(`
     CREATE TABLE IF NOT EXISTS push_devices (
-      user_id TEXT PRIMARY KEY,
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
       device_token TEXT NOT NULL,
       environment TEXT NOT NULL DEFAULT 'production', -- sandbox | production
       platform TEXT NOT NULL DEFAULT 'ios',
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS push_devices_user_env_unique
+    ON push_devices (user_id, environment);
   `);
 
   // user prefs (quiet hours, etc.)
@@ -191,6 +204,7 @@ app.get("/", (_, res) => {
       "/trip/set",
       "/news/ingest",
       "/push/register",
+      "/push/send-test",
       "/prefs/quiet-hours",
       "/prefs",
     ],
@@ -310,7 +324,6 @@ function extractFirstJSONObject(text) {
 function normalizeTimeHHMM(t) {
   if (!t) return null;
   const s = String(t).trim();
-  // Accept "7:00" -> "07:00"
   const m = s.match(/^(\d{1,2}):(\d{2})$/);
   if (!m) return null;
   const hh = String(clamp(parseInt(m[1], 10), 0, 23)).padStart(2, "0");
@@ -408,11 +421,12 @@ async function upsertUserState(userId, patch) {
 
   const updates = fields.map((k) => `${k}=EXCLUDED.${k}`).concat(["updated_at=NOW()"]).join(", ");
 
+  // FIXED: user_state has PK (user_id) only (no environment column)
   await dbQuery(
     `
     INSERT INTO user_state (${cols.join(", ")})
     VALUES (${params.join(", ")})
- ON CONFLICT (user_id, environment) DO UPDATE SET ${updates}
+    ON CONFLICT (user_id) DO UPDATE SET ${updates}
   `,
     vals
   );
@@ -437,14 +451,10 @@ function isNowInQuietHours(prefs) {
   const endMin = minutesFromHHMM(end);
   if (startMin == null || endMin == null) return false;
 
-  // NOTE: uses server time. For v1 this is fine; later we can convert using timezone.
   const now = new Date();
   const nowMin = now.getHours() * 60 + now.getMinutes();
 
-  // If quiet hours wrap past midnight (e.g., 23:00 -> 07:00)
-  if (startMin > endMin) {
-    return nowMin >= startMin || nowMin < endMin;
-  }
+  if (startMin > endMin) return nowMin >= startMin || nowMin < endMin;
   return nowMin >= startMin && nowMin < endMin;
 }
 
@@ -454,9 +464,8 @@ const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 
 async function enqueueAlert({ userId, alertType, message, payload }) {
   if (!userId || !message) return;
-  if (!dbReady) return; // if DB is off, skip queue
+  if (!dbReady) return;
 
-  // quiet hours (soft feature): if enabled, we still store alerts, but can mark payload
   const prefs = await loadUserPrefs(userId);
   const quiet = isNowInQuietHours(prefs);
 
@@ -487,7 +496,7 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
 }
 
 async function pollAlerts(userId, limit = 5) {
-  if (!dbReady) return []; // if DB off, no queue
+  if (!dbReady) return [];
 
   const { rows } = await dbQuery(
     `
@@ -1070,6 +1079,182 @@ async function runLXT({ req }) {
   };
 }
 
+/* ===================== PUSH (APNs) ===================== */
+/**
+ * Minimal HTTP/2 APNs sender using node-fetch + built-in https2 via fetch isn't enough,
+ * so we use a direct https2 client.
+ *
+ * Requirements:
+ * - APNS_KEY_ID
+ * - APNS_TEAM_ID
+ * - APNS_BUNDLE_ID
+ * - APNS_PRIVATE_KEY (the .p8 content, with newlines)
+ *
+ * Note:
+ * - Render env var should contain the FULL .p8 key text.
+ * - If you pasted it with \n, we convert it back.
+ */
+
+const http2 = require("http2");
+
+function envMultiline(name) {
+  const v = process.env[name];
+  if (!v) return "";
+  // allow either real newlines or "\n"
+  return String(v).replace(/\\n/g, "\n");
+}
+
+function base64url(input) {
+  return Buffer.from(input)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
+}
+
+function signJwtES256({ keyId, teamId, privateKeyPem }) {
+  // JWT header + claims for APNs provider token
+  const header = { alg: "ES256", kid: keyId };
+  const now = Math.floor(Date.now() / 1000);
+  const claims = { iss: teamId, iat: now };
+
+  const headerB64 = base64url(JSON.stringify(header));
+  const claimsB64 = base64url(JSON.stringify(claims));
+  const data = `${headerB64}.${claimsB64}`;
+
+  const sign = crypto.createSign("RSA-SHA256"); // will NOT work for ES256; we must use 'sha256' with ECDSA
+  // We'll use createSign('SHA256') and provide EC key. Node maps it correctly.
+  const signer = crypto.createSign("SHA256");
+  signer.update(data);
+  signer.end();
+
+  // dsaEncoding 'ieee-p1363' gives 64-byte signature expected for JOSE
+  const signature = signer.sign({ key: privateKeyPem, dsaEncoding: "ieee-p1363" });
+  const sigB64 = base64url(signature);
+
+  return `${data}.${sigB64}`;
+}
+
+function getApnsConfig() {
+  const keyId = process.env.APNS_KEY_ID || "";
+  const teamId = process.env.APNS_TEAM_ID || "";
+  const bundleId = process.env.APNS_BUNDLE_ID || "";
+  const privateKeyPem = envMultiline("APNS_PRIVATE_KEY");
+
+  const ok = Boolean(keyId && teamId && bundleId && privateKeyPem);
+  return { ok, keyId, teamId, bundleId, privateKeyPem };
+}
+
+async function apnsSendStrict({ deviceToken, title, body, payload, environment }) {
+  const cfg = getApnsConfig();
+  if (!cfg.ok) {
+    return { ok: false, status: 500, body: "Missing APNS env vars (APNS_KEY_ID, APNS_TEAM_ID, APNS_BUNDLE_ID, APNS_PRIVATE_KEY)" };
+  }
+  if (!deviceToken) return { ok: false, status: 400, body: "Missing deviceToken" };
+
+  const host = environment === "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com";
+
+  let jwt;
+  try {
+    jwt = signJwtES256({
+      keyId: cfg.keyId,
+      teamId: cfg.teamId,
+      privateKeyPem: cfg.privateKeyPem,
+    });
+  } catch (e) {
+    return { ok: false, status: 500, body: `JWT sign failed: ${String(e?.message || e)}` };
+  }
+
+  const client = http2.connect(`https://${host}`);
+
+  const notification = {
+    aps: {
+      alert: { title: title || "Loravo", body: body || "" },
+      sound: "default",
+    },
+    ...(payload || {}),
+  };
+
+  const headers = {
+    ":method": "POST",
+    ":path": `/3/device/${deviceToken}`,
+    authorization: `bearer ${jwt}`,
+    "apns-topic": cfg.bundleId,
+    "apns-push-type": "alert",
+  };
+
+  return await new Promise((resolve) => {
+    let respData = "";
+    const req = client.request(headers);
+
+    req.setEncoding("utf8");
+    req.on("response", (headers) => {
+      const status = headers[":status"];
+      req.on("data", (chunk) => (respData += chunk));
+      req.on("end", () => {
+        client.close();
+        const ok = Number(status) >= 200 && Number(status) < 300;
+        resolve({ ok, status: Number(status), body: respData || "" });
+      });
+    });
+
+    req.on("error", (err) => {
+      client.close();
+      resolve({ ok: false, status: 500, body: String(err?.message || err) });
+    });
+
+    req.write(JSON.stringify(notification));
+    req.end();
+  });
+}
+
+/* ===================== PUSH DB HELPERS ===================== */
+
+function normalizeEnv(e) {
+  const v = String(e || "production").toLowerCase().trim();
+  return v === "sandbox" ? "sandbox" : "production";
+}
+
+async function getUserDevices(userId) {
+  if (!dbReady) return [];
+  const { rows } = await dbQuery(
+    `SELECT user_id, device_token, environment, platform, updated_at FROM push_devices WHERE user_id=$1 ORDER BY updated_at DESC`,
+    [userId]
+  );
+  return rows || [];
+}
+
+async function registerDevice({ userId, deviceToken, environment, platform = "ios" }) {
+  const env = normalizeEnv(environment);
+  const token = String(deviceToken || "").trim();
+  if (!token) throw new Error("Missing device_token");
+
+  // matches YOUR db constraint: UNIQUE(user_id, environment)
+  await dbQuery(
+    `
+    INSERT INTO push_devices (user_id, device_token, environment, platform)
+    VALUES ($1,$2,$3,$4)
+    ON CONFLICT (user_id, environment) DO UPDATE SET
+      device_token=EXCLUDED.device_token,
+      platform=EXCLUDED.platform,
+      updated_at=NOW()
+  `,
+    [userId, token, env, platform]
+  );
+
+  return { environment: env };
+}
+
+/* ===================== PREFS HELPERS (for push send-test) ===================== */
+
+async function getPrefs(userId) {
+  return (await loadUserPrefs(userId)) || null;
+}
+
+function isInQuietHours(prefs) {
+  return isNowInQuietHours(prefs);
+}
+
 /* ===================== ENDPOINTS ===================== */
 
 app.post("/lxt1", async (req, res) => {
@@ -1082,7 +1267,7 @@ app.post("/lxt1", async (req, res) => {
       ...(result._errors?.openai || result._errors?.gemini ? { _errors: result._errors } : {}),
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -1098,7 +1283,7 @@ app.post("/chat", async (req, res) => {
         : {}),
     });
   } catch (e) {
-    res.status(500).json({ error: "server error", detail: String(e) });
+    res.status(500).json({ error: "server error", detail: String(e?.message || e) });
   }
 });
 
@@ -1118,7 +1303,7 @@ app.post("/state/location", async (req, res) => {
 
     res.json({ ok: true, db: dbReady });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -1136,7 +1321,7 @@ app.post("/state/weather", async (req, res) => {
     await updateWeatherAndMaybeAlert({ userId: user_id, lat, lon });
     res.json({ ok: true, db: dbReady });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -1152,7 +1337,7 @@ app.get("/poll", async (req, res) => {
     const alerts = await pollAlerts(userId, clamp(limit, 1, 20));
     res.json({ ok: true, db: dbReady, alerts });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -1197,15 +1382,13 @@ app.post("/trip/set", async (req, res) => {
 
     res.json({ ok: true, db: dbReady });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
 /**
  * POST /news/ingest
  * Body: { user_id, title, summary, region?, severity?, action? }
- * Queues only if severity is medium/high/critical.
- * (This endpoint is for YOUR pipeline. Later we will wire a real news API.)
  */
 app.post("/news/ingest", async (req, res) => {
   try {
@@ -1235,27 +1418,54 @@ app.post("/news/ingest", async (req, res) => {
 
     res.json({ ok: true, db: dbReady, queued: meaningful && dbReady });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
 /**
  * POST /push/register
  * Body: { user_id, device_token, environment? }
- * Stores the APNs device token for later push sending.
+ */
+app.post("/push/register", async (req, res) => {
+  try {
+    const { user_id, device_token, environment } = req.body || {};
+    if (!user_id) return res.status(400).json({ error: "Missing user_id" });
+    if (!device_token) return res.status(400).json({ error: "Missing device_token" });
+    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — token not stored." });
+
+    const out = await registerDevice({
+      userId: String(user_id),
+      deviceToken: String(device_token),
+      environment: environment || "production",
+      platform: "ios",
+    });
+
+    res.json({ ok: true, db: true, environment: out.environment });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+/**
+ * POST /push/send-test
+ * Body: { user_id, environment?, title?, body, payload?, force? }
  */
 app.post("/push/send-test", async (req, res) => {
   try {
-    const { user_id, title, body, payload, force } = req.body || {};
+    const { user_id, environment, title, body, payload, force } = req.body || {};
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
     if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — cannot send test push." });
 
-    const devices = await getUserDevices(user_id);
-    if (!devices.length) return res.status(400).json({ error: "No device registered for this user_id" });
+    const envWanted = environment ? normalizeEnv(environment) : null;
 
-    const prefs = await getPrefs(user_id);
+    let devices = await getUserDevices(String(user_id));
+    if (envWanted) devices = devices.filter((d) => normalizeEnv(d.environment) === envWanted);
+
+    if (!devices.length) return res.status(400).json({ error: "No device registered for this user_id (and environment)" });
+
+    const prefs = await getPrefs(String(user_id));
     if (!force && isInQuietHours(prefs)) {
       return res.json({ ok: true, db: true, skipped: true, reason: "quiet_hours" });
     }
@@ -1267,14 +1477,13 @@ app.post("/push/send-test", async (req, res) => {
         title: title || "Loravo",
         body: body || "Test push from Loravo.",
         payload: payload || { test: true },
-        environment: d.environment,
+        environment: normalizeEnv(d.environment),
       });
-      results.push({ env: d.environment, status: r.status, ok: r.ok, body: r.body });
+      results.push({ env: normalizeEnv(d.environment), status: r.status, ok: r.ok, body: r.body });
     }
 
     res.json({ ok: true, db: true, results });
   } catch (e) {
-    // IMPORTANT: show the real error so we can fix it fast
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
@@ -1309,7 +1518,7 @@ app.post("/prefs/quiet-hours", async (req, res) => {
 
     res.json({ ok: true, db: dbReady });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -1337,7 +1546,7 @@ app.get("/prefs", async (req, res) => {
         : null,
     });
   } catch (e) {
-    res.status(500).json({ error: String(e) });
+    res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -1349,8 +1558,6 @@ const PORT = process.env.PORT || 3000;
   try {
     await initDb();
   } catch (e) {
-    // IMPORTANT: do NOT crash the server if DB fails.
-    // We keep Loravo running and just disable DB features.
     console.error("⚠️ DB init failed (DB disabled):", e?.message || e);
     dbReady = false;
   }
