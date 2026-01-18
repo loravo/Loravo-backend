@@ -1247,7 +1247,7 @@ function isInQuietHours(prefs) {
 async function maybeSendPushForAlert({ userId, alertType, message, payload }) {
   if (!dbReady) return;
 
-  // Respect quiet hours unless force_push is true
+  // Respect quiet hours unless force_push = true
   const prefs = await getPrefs(userId);
   const force = Boolean(payload?.force_push);
   if (!force && isInQuietHours(prefs)) return;
@@ -1314,6 +1314,26 @@ async function pollAlerts(userId, limit = 5) {
     created_at: a.created_at,
   }));
 }
+
+/* ===================== ALERT HISTORY ===================== */
+
+async function getAlertHistory(userId, limit = 50, offset = 0) {
+  if (!dbReady) return [];
+
+  const { rows } = await dbQuery(
+    `
+    SELECT id, alert_type, message, payload, created_at, delivered_at
+    FROM alert_queue
+    WHERE user_id = $1
+    ORDER BY created_at DESC
+    LIMIT $2 OFFSET $3
+    `,
+    [userId, limit, offset]
+  );
+
+  return rows || [];
+}
+
 /* ===================== ENDPOINTS ===================== */
 
 app.post("/lxt1", async (req, res) => {
@@ -1395,6 +1415,26 @@ app.get("/poll", async (req, res) => {
 
     const alerts = await pollAlerts(userId, clamp(limit, 1, 20));
     res.json({ ok: true, db: dbReady, alerts });
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
+});
+
+/**
+ * GET /history?user_id=...&limit=50&offset=0
+ */
+app.get("/history", async (req, res) => {
+  try {
+    const userId = String(req.query.user_id || "");
+    const limit = Math.min(Number(req.query.limit || 50), 100);
+    const offset = Number(req.query.offset || 0);
+
+    if (!userId) {
+      return res.status(400).json({ error: "Missing user_id" });
+    }
+
+    const history = await getAlertHistory(userId, limit, offset);
+    res.json({ ok: true, db: dbReady, history });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });
   }
