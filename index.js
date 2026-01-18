@@ -469,6 +469,10 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
   const prefs = await loadUserPrefs(userId);
   const quiet = isNowInQuietHours(prefs);
 
+  // Loravo restraint: drop non-urgent alerts entirely during quiet hours
+const NON_URGENT = ["weather", "location", "news"];
+if (quiet && NON_URGENT.includes(alertType)) return;
+
   const state = await loadUserState(userId);
   const now = Date.now();
   const lastAt = state?.last_alert_at ? new Date(state.last_alert_at).getTime() : 0;
