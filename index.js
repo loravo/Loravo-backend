@@ -493,7 +493,7 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
     last_alert_hash: hash,
     last_alert_at: new Date().toISOString(),
   });
-}
+
   // Auto-send push (best effort) — still keeps queue for app polling/history
   try {
     await maybeSendPushForAlert({
@@ -503,35 +503,8 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
       payload: mergedPayload,
     });
   } catch (e) {
-    // Don’t break enqueue if push fails
     console.error("⚠️ auto-push failed:", e?.message || e);
   }
-  
-async function pollAlerts(userId, limit = 5) {
-  if (!dbReady) return [];
-
-  const { rows } = await dbQuery(
-    `
-    SELECT id, alert_type, message, payload, created_at
-    FROM alert_queue
-    WHERE user_id=$1 AND delivered_at IS NULL
-    ORDER BY created_at ASC
-    LIMIT $2
-  `,
-    [userId, limit]
-  );
-
-  if (!rows.length) return [];
-
-  const ids = rows.map((r) => r.id);
-  await dbQuery(`UPDATE alert_queue SET delivered_at=NOW() WHERE id = ANY($1::int[])`, [ids]);
-
-  return rows.map((r) => ({
-    type: r.alert_type,
-    message: r.message,
-    payload: r.payload,
-    created_at: r.created_at,
-  }));
 }
 
 /* ===================== ALERT COMPOSERS ===================== */
@@ -1265,6 +1238,78 @@ function isInQuietHours(prefs) {
   return isNowInQuietHours(prefs);
 }
 
+/* ===================== AUTO PUSH (best-effort) ===================== */
+
+async function maybeSendPushForAlert({ userId, alertType, message, payload }) {
+  if (!dbReady) return;
+
+  // Respect quiet hours unless force_push is true
+  const prefs = await getPrefs(userId);
+  const force = Boolean(payload?.force_push);
+  if (!force && isInQuietHours(prefs)) return;
+
+  const devices = await getUserDevices(userId);
+  if (!devices.length) return;
+
+  const pushPayload = {
+    kind: alertType,
+    user_id: userId,
+    message,
+    ...(payload || {}),
+  };
+
+  for (const d of devices) {
+    const r = await apnsSendStrict({
+      deviceToken: d.device_token,
+      title: "Loravo",
+      body: message,
+      payload: pushPayload,
+      environment: normalizeEnv(d.environment),
+    });
+
+    if (!r.ok) {
+      console.error("⚠️ APNs send failed:", r.status, r.body);
+    }
+  }
+}
+
+/* ===================== ALERT POLLING ===================== */
+
+async function pollAlerts(userId, limit = 5) {
+  if (!dbReady) return [];
+
+  const { rows } = await dbQuery(
+    `
+    SELECT id, alert_type, message, payload, created_at
+    FROM alert_queue
+    WHERE user_id=$1 AND delivered_at IS NULL
+    ORDER BY created_at ASC
+    LIMIT $2
+    `,
+    [userId, limit]
+  );
+
+  const alerts = rows || [];
+  if (!alerts.length) return [];
+
+  const ids = alerts.map((a) => a.id);
+  await dbQuery(
+    `
+    UPDATE alert_queue
+    SET delivered_at = NOW()
+    WHERE id = ANY($1::int[])
+    `,
+    [ids]
+  );
+
+  return alerts.map((a) => ({
+    id: a.id,
+    type: a.alert_type,
+    message: a.message,
+    payload: a.payload,
+    created_at: a.created_at,
+  }));
+}
 /* ===================== ENDPOINTS ===================== */
 
 app.post("/lxt1", async (req, res) => {
