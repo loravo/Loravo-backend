@@ -494,7 +494,19 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
     last_alert_at: new Date().toISOString(),
   });
 }
-
+  // Auto-send push (best effort) — still keeps queue for app polling/history
+  try {
+    await maybeSendPushForAlert({
+      userId,
+      alertType,
+      message,
+      payload: mergedPayload,
+    });
+  } catch (e) {
+    // Don’t break enqueue if push fails
+    console.error("⚠️ auto-push failed:", e?.message || e);
+  }
+  
 async function pollAlerts(userId, limit = 5) {
   if (!dbReady) return [];
 
