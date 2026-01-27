@@ -1528,20 +1528,27 @@ app.post("/news/ingest", async (req, res) => {
 app.post("/push/register", async (req, res) => {
   try {
     const { user_id, device_token, environment } = req.body || {};
+
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (!device_token) return res.status(400).json({ error: "Missing device_token" });
-    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — token not stored." });
+    if (!environment) return res.status(400).json({ error: "Missing environment" });
 
-    const out = await registerDevice({
-      userId: String(user_id),
-      deviceToken: String(device_token),
-      environment: environment || "production",
-      platform: "ios",
-    });
+    await pool.query(
+      `
+      INSERT INTO push_devices (user_id, device_token, environment)
+      VALUES ($1, $2, $3)
+      ON CONFLICT (user_id, environment)
+      DO UPDATE SET
+        device_token = EXCLUDED.device_token,
+        created_at = now()
+      `,
+      [user_id, device_token, environment]
+    );
 
-    res.json({ ok: true, db: true, environment: out.environment });
+    return res.json({ ok: true });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    console.error("❌ /push/register error:", e);
+    return res.status(500).json({ error: "server_error" });
   }
 });
 
