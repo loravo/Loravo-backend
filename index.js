@@ -451,8 +451,25 @@ function isNowInQuietHours(prefs) {
   const endMin = minutesFromHHMM(end);
   if (startMin == null || endMin == null) return false;
 
-  const now = new Date();
-  const nowMin = now.getHours() * 60 + now.getMinutes();
+  // ✅ Use user's timezone if available; fallback to server time
+  const tz = prefs.timezone || null;
+
+  let nowMin;
+  if (tz) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).formatToParts(new Date());
+
+    const hh = Number(parts.find(p => p.type === "hour")?.value ?? "0");
+    const mm = Number(parts.find(p => p.type === "minute")?.value ?? "0");
+    nowMin = hh * 60 + mm;
+  } else {
+    const now = new Date();
+    nowMin = now.getHours() * 60 + now.getMinutes();
+  }
 
   if (startMin > endMin) return nowMin >= startMin || nowMin < endMin;
   return nowMin >= startMin && nowMin < endMin;
@@ -1533,19 +1550,16 @@ app.post("/push/register", async (req, res) => {
     if (!device_token) return res.status(400).json({ error: "Missing device_token" });
     if (!environment) return res.status(400).json({ error: "Missing environment" });
 
-    await pool.query(
-      `
-      INSERT INTO push_devices (user_id, device_token, environment)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (user_id, environment)
-      DO UPDATE SET
-        device_token = EXCLUDED.device_token,
-        created_at = now()
-      `,
-      [user_id, device_token, environment]
-    );
+    if (!dbReady) return res.status(200).json({ ok: true, db: false });
 
-    return res.json({ ok: true });
+    await registerDevice({
+      userId: String(user_id),
+      deviceToken: String(device_token),
+      environment: String(environment),
+      platform: "ios",
+    });
+
+    return res.json({ ok: true, db: true });
   } catch (e) {
     console.error("❌ /push/register error:", e);
     return res.status(500).json({ error: "server_error" });
