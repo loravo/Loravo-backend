@@ -1339,135 +1339,33 @@ async function runLXT({ req }) {
   const { text, user_id, lat, lon, style } = req.body || {};
   if (!text) throw new Error("Missing 'text' in body");
 
-  const intent = classifyIntent(text);
+  // intent router (you already have classifyIntent + pickAutoMode)
+  const intent = typeof classifyIntent === "function" ? classifyIntent(text) : "chat";
 
-  // AUTO mode selection
-  if (mode === "auto") mode = pickAutoMode(text);
-  const maxTokens = TOKEN_LIMITS[mode];
-
-  // =====================================================
-  // NEWS: summarize recent ingested news like a human
-  // =====================================================
-  if (intent === "news") {
-    const memory = await loadUserMemory(user_id);
-    const items = await getRecentNewsForUser(user_id, 6);
-
-    // If none, respond cleanly (no “I’m an AI”)
-    if (!items.length) {
-      return {
-        provider: "loravo_news",
-        mode: "instant",
-        reply: "Nothing important has been ingested yet. If you want, tell me your region and I’ll tailor what to watch.",
-        lxt1: null,
-        providers: { reply: "news_fastpath" },
-      };
-    }
-
-    // Ask model to summarize these items in a calm human way
-    const newsContext = items.map((n, i) => ({
-      i: i + 1,
-      title: n.title,
-      summary: n.summary,
-      region: n.region,
-      severity: n.severity,
-      action: n.action,
-      created_at: n.created_at,
-    }));
-
-    const reply = await callGeminiNewsSummary({
-      userText: text,
-      memory,
-      newsContext,
-    });
-
-    await saveUserMemory(user_id, text);
-
-    return {
-      provider: "gemini",
-      mode: "instant",
-      reply,
-      lxt1: null,
-      providers: { reply: "gemini_news_summary" },
-    };
+  // AUTO chooses instant vs thinking based on message
+  if (mode === "auto" && typeof pickAutoMode === "function") {
+    mode = pickAutoMode(text);
   }
+  const maxTokens = TOKEN_LIMITS[mode] || TOKEN_LIMITS.auto;
 
-  /* =====================================================
-     FAST HUMAN CHAT (Gemini Flash – UNIQUE EVERY TIME)
-     - greetings
-     - casual chat
-     - /chat endpoint
-     ===================================================== */
-  if (intent === "greeting" || intent === "chat" || req.path === "/chat") {
-    const memory = await loadUserMemory(user_id);
-
-    const reply = await callGeminiFastReply({
-      userText: text,
-      memory,
-    });
-
-    await saveUserMemory(user_id, text);
-
+  /* ===================== FAST PATH: greeting ===================== */
+  if (intent === "greeting") {
     return {
-      provider: "gemini",
+      provider: "loravo_fastpath",
       mode: "instant",
-      reply,
+      reply: "Hey — what’s on your mind?",
       lxt1: null,
       providers: {
-        reply: "gemini_flash",
+        decision: "fastpath",
+        reply: "fastpath",
+        triedDecision: ["fastpath"],
+        triedReply: ["fastpath"],
       },
       _errors: {},
     };
   }
-async function callGeminiFastReply({ userText, memory }) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("Missing GEMINI_API_KEY");
 
-  const model = process.env.GEMINI_MODEL_FAST || "gemini-1.5-flash";
-
-  const system = `
-You are having a natural conversation with a human.
-Rules:
-- Sound like a real person, not an assistant.
-- No identity statements.
-- No system explanations.
-- Respond naturally to the user's message.
-- Vary phrasing every time.
-- Use clear, fluent English.
-- 1–3 sentences.
-- If the user is casual, be casual.
-- If the user is serious, be serious.
-Return ONLY the reply text.
-`.trim();
-
-  const r = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
-          { role: "user", content: userText },
-        ],
-        temperature: 0.85,   // 🔥 HUMAN VARIATION
-        max_tokens: 180,
-      }),
-    }
-  );
-
-  if (!r.ok) throw new Error(await r.text());
-
-  const j = await r.json();
-  return (j?.choices?.[0]?.message?.content || "").trim();
-}
-  /* =====================================================
-     LOAD CONTEXT (ONLY FOR REAL TASKS)
-     ===================================================== */
+  /* ===================== LOAD CONTEXT ===================== */
   const memory = await loadUserMemory(user_id);
   const state = await loadUserState(user_id);
 
@@ -1478,27 +1376,53 @@ Return ONLY the reply text.
 
   const weatherSignals = weather ? weatherToSignals(weather) : [];
 
-  /* =====================================================
-     DECISION PATH (LXT-1 = EVERYTHING ENGINE)
-     ===================================================== */
-  const decision = await getDecision({
-    provider,
-    text,
-    memory,
-    maxTokens,
-  });
+  /* ===================== CHAT: human response ===================== */
+  // If you want chat to feel best: keep it SINGLE-PASS (no decision->reply double call)
+  if (intent === "chat" || req.path === "/chat") {
+    // Use the existing reply model, but give it useful live context in lxt1
+    const lxt1ForChat = {
+      verdict: "HOLD",
+      confidence: 0.8,
+      one_liner: "General chat.",
+      signals: weatherSignals,
+      actions: [],
+      watchouts: [],
+      next_check: safeNowPlus(6 * 60 * 60 * 1000),
+    };
 
-  let lxt1 = decision.lxt1;
-// Only inject weather if the user is actually asking about it
-if (/(weather|rain|temperature|forecast|cold|hot)/i.test(text)) {
+    const reply = await callGeminiReply({
+      userText: text,
+      lxt1: lxt1ForChat,
+      style: style || "human",
+      lastReplyHint: state?.last_alert_hash ? "Rephrase; avoid repeating." : "",
+    });
+
+    await saveUserMemory(user_id, text);
+
+    return {
+      provider: "gemini",
+      mode,
+      reply,
+      lxt1: null,
+      providers: {
+        decision: "chat_fast",
+        reply: "gemini",
+        triedDecision: ["chat_fast"],
+        triedReply: ["gemini"],
+      },
+      _errors: {},
+    };
+  }
+
+  /* ===================== DECISION PATH ===================== */
+  const decision = await getDecision({ provider, text, memory, maxTokens });
+  let lxt1 = decision.lxt1 || safeFallbackResult("Temporary issue—retry.");
+
   lxt1.signals = [...weatherSignals, ...(lxt1.signals || [])];
-}
 
   await saveUserMemory(user_id, text);
 
-  const lastReplyHint = state?.last_alert_hash
-    ? "Avoid repeating earlier wording."
-    : "";
+  const lastReplyHint = state?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "";
 
   const voice = await getHumanReply({
     provider,
@@ -1521,8 +1445,10 @@ if (/(weather|rain|temperature|forecast|cold|hot)/i.test(text)) {
       triedReply: voice.tried,
     },
     _errors: {
-      decision: decision._openai_error || decision._gemini_error,
+      openai: decision._openai_error,
+      gemini: decision._gemini_error,
       reply: voice._reply_error,
+      reply2: voice._reply_error2,
     },
   };
 }
