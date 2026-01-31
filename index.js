@@ -269,6 +269,15 @@ const LXT1_SCHEMA = {
   },
 };
 
+const CHAT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["reply", "lxt1"],
+  properties: {
+    reply: { type: "string" },
+    lxt1: LXT1_SCHEMA,
+  },
+};
 /* ===================== HELPERS ===================== */
 
 function clamp(n, a, b) {
@@ -725,8 +734,19 @@ async function callOpenAIDecision(text, memory, maxTokens) {
     },
     body: JSON.stringify({
       model,
-      input: [
-        { role: "system", content: "Return ONLY JSON matching the schema. No extra text." },
+      input: [ 
+       { role: "system", content: `
+You are LXT-1 (Loravo decision engine).
+Return ONLY valid JSON that matches the schema. No extra text.
+
+Grounding rules:
+- Use ONLY the user's message + provided memory. Do NOT invent markets, finance, or breaking news unless the user explicitly asks.
+- If the user says hi/hello/what’s up/small talk: keep it neutral, set verdict=HOLD, signals=[], watchouts=[], and actions should be simple.
+- Prefer calm, realistic outputs. If uncertain, confidence ~0.6 and verdict=HOLD.
+
+Focus:
+- This JSON is used to help generate a human reply. Do not overreact.
+`.trim() },
         ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
         { role: "user", content: text },
       ],
@@ -763,7 +783,14 @@ async function callOpenAIDecision_JSONinText(text, memory, maxTokens) {
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
   const prompt = `
-Return ONLY a single JSON object that matches this schema EXACTLY:
+You are LXT-1 (Loravo decision engine).
+Return ONLY one JSON object matching the schema EXACTLY. JSON only.
+
+Grounding rules:
+- Use ONLY the user's message + provided memory. Do NOT invent markets, finance, or breaking news unless the user explicitly asks.
+- If the user message is a greeting/small talk: verdict=HOLD, confidence ~0.6, signals=[], watchouts=[], actions should be simple.
+
+Schema:
 - verdict: HOLD|PREPARE|MOVE|AVOID
 - confidence: 0..1
 - one_liner: string
@@ -922,6 +949,86 @@ Return ONLY plain text.
 }
 
 /* ===================== OPENAI (Reply) ===================== */
+async function callOpenAIChatOneShot({ userText, memory, weatherSignals, mode }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
+
+  const model = process.env.OPENAI_MODEL_CHAT || process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  // tune reply length by mode
+  const maxOut =
+    mode === "instant" ? 220 :
+    mode === "thinking" ? 520 :
+    320;
+
+  const system = `
+You are LORAVO inside a chat UI. Write like ChatGPT: natural, human, helpful.
+STYLE:
+- Default 2–6 short sentences (not 1–2).
+- Warm, clear, direct. No cringe. No fake “market indicators” unless the user asks about markets.
+- If user says "hi/hello", respond friendly and ask what they want to do today.
+- Ask 1 clarifying question when needed.
+- Do not invent facts. If you don't know, say so.
+LXT-1 JSON RULES:
+- Your lxt1 must be grounded ONLY in: userText, memory, and weatherSignals.
+- If the user message is casual/small-talk, set:
+  verdict="HOLD", confidence ~0.55–0.75, signals=[], actions=[{now:"Ask what they want to do", time:"today", effort:"low"}], watchouts=[], next_check in the future.
+Return STRICT JSON that matches the provided schema. No extra text.
+`.trim();
+
+  const payload = {
+    userText,
+    memory: memory || "",
+    weatherSignals: Array.isArray(weatherSignals) ? weatherSignals : [],
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify(payload) },
+      ],
+      text: {
+        format: {
+          type: "json_schema",
+          name: "loravo_chat",
+          strict: true,
+          schema: CHAT_SCHEMA,
+        },
+      },
+      max_output_tokens: maxOut,
+    }),
+  });
+
+  if (!resp.ok) {
+    const t = await resp.text();
+    throw new Error(t);
+  }
+
+  const data = await resp.json();
+  const obj = extractOpenAIParsedObject(data);
+
+  if (!obj?.reply || !obj?.lxt1) {
+    // fallback parse (rare)
+    const outText =
+      data?.output?.flatMap((o) => o?.content || [])
+        ?.map((p) => p?.text)
+        ?.filter(Boolean)
+        ?.join("\n") || "";
+    const parsed = extractFirstJSONObject(outText);
+    if (!parsed?.reply || !parsed?.lxt1) throw new Error("OpenAI returned invalid chat JSON");
+    return { reply: String(parsed.reply).trim(), lxt1: sanitizeToSchema(parsed.lxt1) };
+  }
+
+  return { reply: String(obj.reply).trim(), lxt1: sanitizeToSchema(obj.lxt1) };
+}
+
 
 async function callOpenAIReply({ userText, lxt1, style, lastReplyHint }) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -1107,6 +1214,33 @@ if (isGreeting(text)) {
 
   const weather = typeof lat === "number" && typeof lon === "number" ? await getWeather(lat, lon) : null;
   const weatherSignals = weatherToSignals(weather);
+
+// FAST PATH: /chat uses single model call (reply + lxt1) for speed + human tone
+if (req.path === "/chat") {
+  // For now: force OpenAI for best “ChatGPT feel”
+  const oneShot = await callOpenAIChatOneShot({
+    userText: text,
+    memory,
+    weatherSignals,
+    mode,
+  });
+
+  await saveUserMemory(user_id, text);
+
+  return {
+    provider: "openai",
+    mode,
+    lxt1: oneShot.lxt1,
+    reply: oneShot.reply,
+    providers: {
+      decision: "openai_one_shot",
+      reply: "openai_one_shot",
+      triedDecision: ["openai_one_shot"],
+      triedReply: ["openai_one_shot"],
+    },
+    _errors: {},
+  };
+}
 
   const decision = await getDecision({ provider, text, memory, maxTokens });
   let lxt1 = decision.lxt1;
