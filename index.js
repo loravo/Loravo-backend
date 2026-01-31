@@ -58,20 +58,37 @@ function getProvider(req) {
   const p = String(req.query.provider || "trinity").toLowerCase();
   return ["openai", "gemini", "trinity"].includes(p) ? p : "trinity";
 }
-
 function pickAutoMode(text) {
-  const t = cleanText(text);
-  const lower = t.toLowerCase();
+  if (!text) return "instant";
 
-  // instant for short requests
-  if (t.length <= 60) return "instant";
+  const t = text.toLowerCase().trim();
 
-  // thinking for complex
-  const thinkingHints = ["analyze", "explain", "plan", "strategy", "compare", "build", "code", "debug", "architecture"];
-  if (t.length >= 220) return "thinking";
-  if (thinkingHints.some(k => lower.includes(k))) return "thinking";
+  // Fast / casual
+  if (
+    t.length < 40 ||
+    /^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)
+  ) {
+    return "instant";
+  }
 
-  return "auto";
+  // Simple questions
+  if (
+    /^(what|when|where|who|is|are|do|does|can|should)\b/.test(t) &&
+    t.length < 120
+  ) {
+    return "instant";
+  }
+
+  // Thinking required
+  if (
+    /(analyze|plan|compare|strategy|explain|forecast|should i|pros and cons)/.test(t) ||
+    t.length > 180
+  ) {
+    return "thinking";
+  }
+
+  // Default
+  return "instant";
 }
 /* ===================== DB (OPTIONAL) ===================== */
 /**
@@ -164,7 +181,19 @@ async function initDb() {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-
+  // news events (ingested)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS news_events (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT,
+      region TEXT,
+      severity TEXT NOT NULL DEFAULT 'low', -- low|medium|high|critical
+      action TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
   /**
    * push_devices
    * NOTE: YOUR DB already has UNIQUE (user_id, environment).
@@ -377,29 +406,27 @@ function greetingReply() {
   return options[Math.floor(Math.random() * options.length)];
 }
 // ===================== INTENT CLASSIFIER =====================
-
 function classifyIntent(text) {
-  if (!text) return "analysis";
+  const t = String(text || "").toLowerCase().trim();
 
-  const t = text.trim().toLowerCase();
+  if (/^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)) return "greeting";
 
-  // greetings / human openers
-  if (/^(hi|hello|hey|yo|sup|what's up|whats up)$/.test(t)) {
-    return "greeting";
-  }
+  // News intent
+  if (
+    /(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t)
+  ) return "news";
 
-  // short casual chat
-  if (t.length <= 20) {
-    return "chat";
-  }
+  // Weather intent
+  if (/(weather|temperature|rain|snow|wind|forecast)/.test(t)) return "weather";
 
-  // guidance / stay-ahead
-  if (/advise|stay ahead|what should i|help me decide|focus today/.test(t)) {
-    return "guidance";
-  }
-
-  return "analysis";
+  // Default: normal chat
+  return "chat";
 }
+
+
+  // real task / decision
+  return "decision";
+
 /* ===================== WEATHER ===================== */
 
 async function getWeather(lat, lon) {
@@ -927,38 +954,47 @@ async function callGeminiReply({ userText, lxt1, style, lastReplyHint }) {
   const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
 
   const system = `
-You are LORAVO — a calm, intelligent, human assistant.
+You are an intelligent assistant in a private chat.
 
-You speak like a real person, not a report.
-You are concise, confident, and natural.
-You do not over-explain.
-You do not apologize unnecessarily.
-You do not say things like “I don’t have access to live data.”
-If information is uncertain, you say what matters and move on.
+Rules:
+- Sound natural, calm, and human.
+- Short responses unless depth is clearly needed.
+- No identity statements.
+- No "I am powered by".
+- No corporate language.
+- No disclaimers.
+- Do not explain how you think.
+- If the user is casual, be casual.
+- If the user is serious, be serious.
+- Every reply should feel slightly different.
+- Never repeat phrasing from earlier replies.
 
-Tone:
-- relaxed
-- modern
-- grounded
-- confident
+Use real information when relevant.
+If you don't know, say so naturally.
 
-Length:
-- 1–3 sentences unless asked otherwise
+If news or real-world events are relevant:
+- Summarize like a human.
+- No headlines.
+- No source names.
+- No urgency unless truly urgent.
+- One or two sentences max.
 
-You should sound like ChatGPT at its best.
 Return ONLY the reply text.
 `.trim();
 
   const payload = {
-    userText,
-    verdict: lxt1.verdict,
-    one_liner: lxt1.one_liner,
-    top_actions: (lxt1.actions || []).slice(0, 2),
-    top_watchouts: (lxt1.watchouts || []).slice(0, 2),
-    top_signals: (lxt1.signals || []).slice(0, 3),
-    style: style || "imessage",
-    last_reply_hint: lastReplyHint || "",
-  };
+  userText,
+  verdict: lxt1?.verdict || null,
+  one_liner: lxt1?.one_liner || null,
+  signals: lxt1?.signals || [],
+  actions: lxt1?.actions || [],
+  watchouts: lxt1?.watchouts || [],
+  live_context: {
+    weather: liveContext?.weather || null,
+    location: liveContext?.location || null,
+  },
+  last_reply_hint: lastReplyHint || "",
+};
 
   const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
     method: "POST",
@@ -981,7 +1017,51 @@ Return ONLY the reply text.
   const j = await r.json();
   return (j?.choices?.[0]?.message?.content || "").trim();
 }
+async function callGeminiNewsSummary({ userText, memory, newsContext }) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error("Missing GEMINI_API_KEY");
 
+  const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
+
+  const system = `
+You are a calm, sharp assistant in a chat UI.
+Summarize the user's recent news items like a human.
+Rules:
+- 1 to 3 short sentences max.
+- No bullets unless user asks.
+- No hype, no ALL CAPS, no “breaking” tone.
+- No “I’m an AI”, no “powered by”.
+- If severity is critical/high, briefly say what to do next.
+Return ONLY plain text.
+`.trim();
+
+  const payload = {
+    userText,
+    memory: memory || "",
+    items: newsContext,
+  };
+
+  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${key}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify(payload) },
+      ],
+      max_tokens: 180,
+      temperature: 0.65,
+    }),
+  });
+
+  if (!r.ok) throw new Error(await r.text());
+  const j = await r.json();
+  return (j?.choices?.[0]?.message?.content || "").trim();
+}
 /* ===================== OPENAI (Reply) ===================== */
 async function callOpenAIChatOneShot({ userText, memory, weatherSignals, mode }) {
   const apiKey = process.env.OPENAI_API_KEY;
@@ -1131,7 +1211,60 @@ Return ONLY the reply text.
 
   return outText.trim();
 }
+async function callOpenAIChatOneShot({ userText, memory, liveContext, mode }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
+  const model = process.env.OPENAI_MODEL_CHAT || process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+  // keep it fast unless thinking is needed
+  const maxOut = mode === "thinking" ? 520 : 220;
+
+  const system = `
+You are a premium assistant in a chat UI.
+Write like a smart human: natural, clear, and calm.
+Rules:
+- Do NOT say you are AI, model, or “powered by”.
+- No ALL CAPS.
+- If user says “hi”, respond like a normal person.
+- If user asks about weather/news and live_context has data, use it.
+- If you don't have data, ask ONE short follow-up question.
+Return only the message text.
+`.trim();
+
+  const payload = {
+    userText,
+    memory: memory || "",
+    live_context: liveContext || {},
+  };
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify(payload) },
+      ],
+      max_output_tokens: maxOut,
+    }),
+  });
+
+  if (!resp.ok) throw new Error(await resp.text());
+
+  const data = await resp.json();
+  const outText =
+    data?.output?.flatMap((o) => o?.content || [])
+      ?.map((p) => p?.text)
+      ?.filter(Boolean)
+      ?.join("\n") || "";
+
+  return { reply: outText.trim() };
+}
 /* ===================== TRINITY ORCHESTRATION ===================== */
 
 async function getDecision({ provider, text, memory, maxTokens }) {
@@ -1171,168 +1304,208 @@ async function getDecision({ provider, text, memory, maxTokens }) {
   }
 }
 
-async function getHumanReply({ provider, decisionProvider, userText, lxt1, style, lastReplyHint }) {
-  const tried = [];
+async function getHumanReply({
+  provider,
+  decisionProvider,
+  userText,
+  lxt1,
+  style,
+  lastReplyHint,
+  liveContext,
+}) {
+  // ALWAYS use Gemini Flash for chat replies
+  // Gemini sounds more human + faster than OpenAI here
 
-  if (provider === "openai") {
-    tried.push("openai");
-    const reply = await callOpenAIReply({ userText, lxt1, style, lastReplyHint });
-    return { reply, replyProvider: "openai", tried };
-  }
+  const reply = await callGeminiReply({
+    userText,
+    lxt1,
+    style: "human",
+    lastReplyHint,
+    liveContext,
+  });
 
-  if (provider === "gemini") {
-    tried.push("gemini");
-    const reply = await callGeminiReply({ userText, lxt1, style, lastReplyHint });
-    return { reply, replyProvider: "gemini", tried };
-  }
-
-  // trinity: opposite model writes the reply
-  try {
-    if (decisionProvider === "openai") {
-      tried.push("gemini");
-      const reply = await callGeminiReply({ userText, lxt1, style, lastReplyHint });
-      return { reply, replyProvider: "gemini", tried };
-    } else {
-      tried.push("openai");
-      const reply = await callOpenAIReply({ userText, lxt1, style, lastReplyHint });
-      return { reply, replyProvider: "openai", tried };
-    }
-  } catch (e1) {
-    try {
-      tried.push("gemini");
-      const reply = await callGeminiReply({ userText, lxt1, style, lastReplyHint });
-      return { reply, replyProvider: "gemini", tried, _reply_error: String(e1) };
-    } catch (e2) {
-      return {
-        reply: "Please try again in a moment.",
-        replyProvider: "fallback",
-        tried,
-        _reply_error: String(e1),
-        _reply_error2: String(e2),
-      };
-    }
-  }
+  return {
+    reply,
+    replyProvider: "gemini_flash",
+    tried: ["gemini_flash"],
+  };
 }
 
 /* ===================== CORE HANDLER ===================== */
-
 async function runLXT({ req }) {
   const provider = getProvider(req);
+  let mode = getMode(req);
 
-let mode = getMode(req);
-const { text, user_id, lat, lon, style } = req.body || {};
-  const intent = classifyIntent(text);
-
-  // ⚡ FAST HUMAN GREETING (NO LXT-1, NO WEATHER, NO DB)
-  if (intent === "greeting") {
-    return {
-      reply: "Hey — what’s on your mind?",
-      lxt1: null,
-      providers: { reply: "human-fast" }
-    };
-  }
-
-  // ⚡ FAST HUMAN CHAT
-  if (intent === "chat") {
-    const reply = await callOpenAIReply({
-      userText: text,
-      lxt1: {
-        verdict: "HOLD",
-        one_liner: "Casual conversation",
-        actions: [],
-        signals: [],
-        watchouts: []
-      },
-      style: "human",
-      lastReplyHint: ""
-    });
-
-    return {
-      reply,
-      lxt1: null,
-      providers: { reply: "human-chat" }
-    };
-  }
-if (!text) throw new Error("Missing 'text' in body");
-
-// AUTO chooses instant vs thinking based on message
-if (mode === "auto") mode = pickAutoMode(text);
-
-const maxTokens = TOKEN_LIMITS[mode];
+  const { text, user_id, lat, lon, style } = req.body || {};
   if (!text) throw new Error("Missing 'text' in body");
 
-// FAST PATH: greetings should never trigger “signals” logic
-if (isGreeting(text)) {
-  return {
-    provider: getProvider(req),
-    mode: getMode(req),
-    lxt1: {
-      verdict: "HOLD",
-      confidence: 0.9,
-      one_liner: "Greeting / small talk.",
-      signals: [],
-      actions: [{ now: "Ask what the user wants to do", time: "today", effort: "low" }],
-      watchouts: [],
-      next_check: safeNowPlus(6 * 60 * 60 * 1000),
-    },
-    reply: greetingReply(),
-    providers: {
-      decision: "fastpath",
-      reply: "fastpath",
-      triedDecision: ["fastpath"],
-      triedReply: ["fastpath"],
-    },
-  };
-}
+  const intent = classifyIntent(text);
 
+  // AUTO mode selection
+  if (mode === "auto") mode = pickAutoMode(text);
+  const maxTokens = TOKEN_LIMITS[mode];
+
+  // =====================================================
+  // NEWS: summarize recent ingested news like a human
+  // =====================================================
+  if (intent === "news") {
+    const memory = await loadUserMemory(user_id);
+    const items = await getRecentNewsForUser(user_id, 6);
+
+    // If none, respond cleanly (no “I’m an AI”)
+    if (!items.length) {
+      return {
+        provider: "loravo_news",
+        mode: "instant",
+        reply: "Nothing important has been ingested yet. If you want, tell me your region and I’ll tailor what to watch.",
+        lxt1: null,
+        providers: { reply: "news_fastpath" },
+      };
+    }
+
+    // Ask model to summarize these items in a calm human way
+    const newsContext = items.map((n, i) => ({
+      i: i + 1,
+      title: n.title,
+      summary: n.summary,
+      region: n.region,
+      severity: n.severity,
+      action: n.action,
+      created_at: n.created_at,
+    }));
+
+    const reply = await callGeminiNewsSummary({
+      userText: text,
+      memory,
+      newsContext,
+    });
+
+    await saveUserMemory(user_id, text);
+
+    return {
+      provider: "gemini",
+      mode: "instant",
+      reply,
+      lxt1: null,
+      providers: { reply: "gemini_news_summary" },
+    };
+  }
+
+  /* =====================================================
+     FAST HUMAN CHAT (Gemini Flash – UNIQUE EVERY TIME)
+     - greetings
+     - casual chat
+     - /chat endpoint
+     ===================================================== */
+  if (intent === "greeting" || intent === "chat" || req.path === "/chat") {
+    const memory = await loadUserMemory(user_id);
+
+    const reply = await callGeminiFastReply({
+      userText: text,
+      memory,
+    });
+
+    await saveUserMemory(user_id, text);
+
+    return {
+      provider: "gemini",
+      mode: "instant",
+      reply,
+      lxt1: null,
+      providers: {
+        reply: "gemini_flash",
+      },
+      _errors: {},
+    };
+  }
+async function callGeminiFastReply({ userText, memory }) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error("Missing GEMINI_API_KEY");
+
+  const model = process.env.GEMINI_MODEL_FAST || "gemini-1.5-flash";
+
+  const system = `
+You are having a natural conversation with a human.
+Rules:
+- Sound like a real person, not an assistant.
+- No identity statements.
+- No system explanations.
+- Respond naturally to the user's message.
+- Vary phrasing every time.
+- Use clear, fluent English.
+- 1–3 sentences.
+- If the user is casual, be casual.
+- If the user is serious, be serious.
+Return ONLY the reply text.
+`.trim();
+
+  const r = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: system },
+          ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
+          { role: "user", content: userText },
+        ],
+        temperature: 0.85,   // 🔥 HUMAN VARIATION
+        max_tokens: 180,
+      }),
+    }
+  );
+
+  if (!r.ok) throw new Error(await r.text());
+
+  const j = await r.json();
+  return (j?.choices?.[0]?.message?.content || "").trim();
+}
+  /* =====================================================
+     LOAD CONTEXT (ONLY FOR REAL TASKS)
+     ===================================================== */
   const memory = await loadUserMemory(user_id);
   const state = await loadUserState(user_id);
 
-  const weather = typeof lat === "number" && typeof lon === "number" ? await getWeather(lat, lon) : null;
-  const weatherSignals = weatherToSignals(weather);
+  const weather =
+    typeof lat === "number" && typeof lon === "number"
+      ? await getWeather(lat, lon)
+      : null;
 
-// FAST PATH: /chat uses single model call (reply + lxt1) for speed + human tone
-if (req.path === "/chat") {
-  // For now: force OpenAI for best “ChatGPT feel”
-  const oneShot = await callOpenAIChatOneShot({
-    userText: text,
+  const weatherSignals = weather ? weatherToSignals(weather) : [];
+
+  /* =====================================================
+     DECISION PATH (LXT-1 = EVERYTHING ENGINE)
+     ===================================================== */
+  const decision = await getDecision({
+    provider,
+    text,
     memory,
-    weatherSignals,
-    mode,
+    maxTokens,
   });
 
-  await saveUserMemory(user_id, text);
-
-  return {
-    provider: "openai",
-    mode,
-    lxt1: oneShot.lxt1,
-    reply: oneShot.reply,
-    providers: {
-      decision: "openai_one_shot",
-      reply: "openai_one_shot",
-      triedDecision: ["openai_one_shot"],
-      triedReply: ["openai_one_shot"],
-    },
-    _errors: {},
-  };
+  let lxt1 = decision.lxt1;
+// Only inject weather if the user is actually asking about it
+if (/(weather|rain|temperature|forecast|cold|hot)/i.test(text)) {
+  lxt1.signals = [...weatherSignals, ...(lxt1.signals || [])];
 }
 
-  const decision = await getDecision({ provider, text, memory, maxTokens });
-  let lxt1 = decision.lxt1;
-
-  lxt1.signals = [...weatherSignals, ...(lxt1.signals || [])];
-
   await saveUserMemory(user_id, text);
 
-  const lastReplyHint = state?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "";
+  const lastReplyHint = state?.last_alert_hash
+    ? "Avoid repeating earlier wording."
+    : "";
 
   const voice = await getHumanReply({
     provider,
     decisionProvider: decision.decisionProvider,
     userText: text,
     lxt1,
-    style: style || "imessage",
+    style: style || "human",
     lastReplyHint,
   });
 
@@ -1348,14 +1521,11 @@ if (req.path === "/chat") {
       triedReply: voice.tried,
     },
     _errors: {
-      openai: decision._openai_error,
-      gemini: decision._gemini_error,
+      decision: decision._openai_error || decision._gemini_error,
       reply: voice._reply_error,
-      reply2: voice._reply_error2,
     },
   };
 }
-
 /* ===================== PUSH (APNs) ===================== */
 /* ===================== PUSH (APNs) ===================== */
 
@@ -1621,7 +1791,20 @@ async function getAlertHistory(userId, limit = 50, offset = 0) {
 
   return rows || [];
 }
-
+async function getRecentNewsForUser(userId, limit = 6) {
+  if (!dbReady || !userId) return [];
+  const { rows } = await dbQuery(
+    `
+    SELECT title, summary, region, severity, action, created_at
+    FROM news_events
+    WHERE user_id=$1
+    ORDER BY created_at DESC
+    LIMIT $2
+    `,
+    [userId, limit]
+  );
+  return rows || [];
+}
 /* ===================== ENDPOINTS ===================== */
 
 app.post("/lxt1", async (req, res) => {
@@ -1808,7 +1991,16 @@ app.post("/news/ingest", async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
-
+    // Always store ingested news (even low severity) so chat can recall it.
+    if (dbReady) {
+      await dbQuery(
+        `
+        INSERT INTO news_events (user_id, title, summary, region, severity, action)
+        VALUES ($1,$2,$3,$4,$5,$6)
+        `,
+        [user_id, title, summary || null, region || null, sev, action || null]
+      );
+    }
 /**
  * POST /push/register
  * Body: { user_id, device_token, environment? }
