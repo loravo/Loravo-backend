@@ -376,6 +376,30 @@ function greetingReply() {
   ];
   return options[Math.floor(Math.random() * options.length)];
 }
+// ===================== INTENT CLASSIFIER =====================
+
+function classifyIntent(text) {
+  if (!text) return "analysis";
+
+  const t = text.trim().toLowerCase();
+
+  // greetings / human openers
+  if (/^(hi|hello|hey|yo|sup|what's up|whats up)$/.test(t)) {
+    return "greeting";
+  }
+
+  // short casual chat
+  if (t.length <= 20) {
+    return "chat";
+  }
+
+  // guidance / stay-ahead
+  if (/advise|stay ahead|what should i|help me decide|focus today/.test(t)) {
+    return "guidance";
+  }
+
+  return "analysis";
+}
 /* ===================== WEATHER ===================== */
 
 async function getWeather(lat, lon) {
@@ -903,16 +927,26 @@ async function callGeminiReply({ userText, lxt1, style, lastReplyHint }) {
   const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
 
   const system = `
-You are LORAVO inside a chat UI.
+You are LORAVO — a calm, intelligent, human assistant.
 
-Write like a real helpful human (ChatGPT vibe):
-- Natural, warm, confident. Not corporate.
-- If the user is casual, be casual. If serious, be serious.
-- Short by default, but you can be longer when the user asks.
-- No random finance/market talk unless the user asks.
-- Use the LXT1 JSON only as guidance, not as something to repeat.
+You speak like a real person, not a report.
+You are concise, confident, and natural.
+You do not over-explain.
+You do not apologize unnecessarily.
+You do not say things like “I don’t have access to live data.”
+If information is uncertain, you say what matters and move on.
 
-Return ONLY plain text.
+Tone:
+- relaxed
+- modern
+- grounded
+- confident
+
+Length:
+- 1–3 sentences unless asked otherwise
+
+You should sound like ChatGPT at its best.
+Return ONLY the reply text.
 `.trim();
 
   const payload = {
@@ -1037,16 +1071,26 @@ async function callOpenAIReply({ userText, lxt1, style, lastReplyHint }) {
   const model = process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   const system = `
-You are LORAVO inside a chat UI.
+You are LORAVO — a calm, intelligent, human assistant.
 
-Write like a real helpful human (ChatGPT vibe):
-- Natural, warm, confident. Not corporate.
-- If the user is casual, be casual. If serious, be serious.
-- Short by default, but you can be longer when the user asks.
-- No random finance/market talk unless the user asks.
-- Use the LXT1 JSON only as guidance, not as something to repeat.
+You speak like a real person, not a report.
+You are concise, confident, and natural.
+You do not over-explain.
+You do not apologize unnecessarily.
+You do not say things like “I don’t have access to live data.”
+If information is uncertain, you say what matters and move on.
 
-Return ONLY plain text.
+Tone:
+- relaxed
+- modern
+- grounded
+- confident
+
+Length:
+- 1–3 sentences unless asked otherwise
+
+You should sound like ChatGPT at its best.
+Return ONLY the reply text.
 `.trim();
 
   const payload = {
@@ -1177,6 +1221,38 @@ async function runLXT({ req }) {
 
 let mode = getMode(req);
 const { text, user_id, lat, lon, style } = req.body || {};
+  const intent = classifyIntent(text);
+
+  // ⚡ FAST HUMAN GREETING (NO LXT-1, NO WEATHER, NO DB)
+  if (intent === "greeting") {
+    return {
+      reply: "Hey — what’s on your mind?",
+      lxt1: null,
+      providers: { reply: "human-fast" }
+    };
+  }
+
+  // ⚡ FAST HUMAN CHAT
+  if (intent === "chat") {
+    const reply = await callOpenAIReply({
+      userText: text,
+      lxt1: {
+        verdict: "HOLD",
+        one_liner: "Casual conversation",
+        actions: [],
+        signals: [],
+        watchouts: []
+      },
+      style: "human",
+      lastReplyHint: ""
+    });
+
+    return {
+      reply,
+      lxt1: null,
+      providers: { reply: "human-chat" }
+    };
+  }
 if (!text) throw new Error("Missing 'text' in body");
 
 // AUTO chooses instant vs thinking based on message
