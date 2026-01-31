@@ -411,20 +411,15 @@ function classifyIntent(text) {
 
   if (/^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)) return "greeting";
 
-  // News intent
-  if (
-    /(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t)
-  ) return "news";
+  if (/(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t))
+    return "news";
 
-  // Weather intent
-  if (/(weather|temperature|rain|snow|wind|forecast)/.test(t)) return "weather";
+  if (/(weather|temperature|rain|snow|wind|forecast)/.test(t))
+    return "weather";
 
-  // Default: normal chat
   return "chat";
 }
-
-
-  // real task / decision
+// real task / decision
   return "decision";
 
 /* ===================== WEATHER ===================== */
@@ -1893,6 +1888,19 @@ app.post("/news/ingest", async (req, res) => {
     if (!title) return res.status(400).json({ error: "Missing title" });
 
     const sev = String(severity || "low").toLowerCase();
+
+    // ✅ Always store ingested news so chat can recall it (even low)
+    if (dbReady) {
+      await dbQuery(
+        `
+        INSERT INTO news_events (user_id, title, summary, region, severity, action)
+        VALUES ($1,$2,$3,$4,$5,$6)
+        `,
+        [user_id, title, summary || null, region || null, sev, action || null]
+      );
+    }
+
+    // queue alert only if meaningful
     const meaningful = ["medium", "high", "critical"].includes(sev);
 
     if (meaningful && dbReady) {
@@ -1917,16 +1925,6 @@ app.post("/news/ingest", async (req, res) => {
     res.status(500).json({ error: String(e?.message || e) });
   }
 });
-    // Always store ingested news (even low severity) so chat can recall it.
-    if (dbReady) {
-      await dbQuery(
-        `
-        INSERT INTO news_events (user_id, title, summary, region, severity, action)
-        VALUES ($1,$2,$3,$4,$5,$6)
-        `,
-        [user_id, title, summary || null, region || null, sev, action || null]
-      );
-    }
 /**
  * POST /push/register
  * Body: { user_id, device_token, environment? }
