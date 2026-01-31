@@ -59,6 +59,20 @@ function getProvider(req) {
   return ["openai", "gemini", "trinity"].includes(p) ? p : "trinity";
 }
 
+function pickAutoMode(text) {
+  const t = cleanText(text);
+  const lower = t.toLowerCase();
+
+  // instant for short requests
+  if (t.length <= 60) return "instant";
+
+  // thinking for complex
+  const thinkingHints = ["analyze", "explain", "plan", "strategy", "compare", "build", "code", "debug", "architecture"];
+  if (t.length >= 220) return "thinking";
+  if (thinkingHints.some(k => lower.includes(k))) return "thinking";
+
+  return "auto";
+}
 /* ===================== DB (OPTIONAL) ===================== */
 /**
  * Local Postgres often has NO SSL -> do NOT force SSL locally.
@@ -336,7 +350,23 @@ function minutesFromHHMM(hhmm) {
   if (!m) return null;
   return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
 }
+function cleanText(s) {
+  return String(s || "").trim();
+}
 
+function isGreeting(text) {
+  const t = cleanText(text).toLowerCase();
+  return /^(hi|hello|hey|yo|sup|what'?s up|good (morning|afternoon|evening))[\s!.?]*$/.test(t);
+}
+
+function greetingReply() {
+  const options = [
+    "Hey — what can I help you with right now?",
+    "Hi. What are we working on today?",
+    "Hey! Tell me what you want to do, and I’ll handle it.",
+  ];
+  return options[Math.floor(Math.random() * options.length)];
+}
 /* ===================== WEATHER ===================== */
 
 async function getWeather(lat, lon) {
@@ -846,14 +876,15 @@ async function callGeminiReply({ userText, lxt1, style, lastReplyHint }) {
   const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
 
   const system = `
-You are LORAVO in a chat UI.
-Write like a professional person: clear, calm, simple English.
-Rules:
-- 1–2 short sentences.
-- No jokes, no emojis, no slang.
-- No bullet lists unless the user asks.
-- Use the LXT1 JSON to decide what to say.
-- Do NOT repeat the same wording as last time. If similar topic, rephrase.
+You are LORAVO inside a chat UI.
+
+Write like a real helpful human (ChatGPT vibe):
+- Natural, warm, confident. Not corporate.
+- If the user is casual, be casual. If serious, be serious.
+- Short by default, but you can be longer when the user asks.
+- No random finance/market talk unless the user asks.
+- Use the LXT1 JSON only as guidance, not as something to repeat.
+
 Return ONLY plain text.
 `.trim();
 
@@ -899,14 +930,15 @@ async function callOpenAIReply({ userText, lxt1, style, lastReplyHint }) {
   const model = process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   const system = `
-You are LORAVO in a chat UI.
-Write like a professional person: clear, calm, simple English.
-Rules:
-- 1–2 short sentences.
-- No jokes, no emojis, no slang.
-- No bullet lists unless the user asks.
-- Use the LXT1 JSON to decide what to say.
-- Do NOT repeat the same wording as last time. If similar topic, rephrase.
+You are LORAVO inside a chat UI.
+
+Write like a real helpful human (ChatGPT vibe):
+- Natural, warm, confident. Not corporate.
+- If the user is casual, be casual. If serious, be serious.
+- Short by default, but you can be longer when the user asks.
+- No random finance/market talk unless the user asks.
+- Use the LXT1 JSON only as guidance, not as something to repeat.
+
 Return ONLY plain text.
 `.trim();
 
@@ -1035,11 +1067,40 @@ async function getHumanReply({ provider, decisionProvider, userText, lxt1, style
 
 async function runLXT({ req }) {
   const provider = getProvider(req);
-  const mode = getMode(req);
-  const maxTokens = TOKEN_LIMITS[mode];
 
-  const { text, user_id, lat, lon, style } = req.body || {};
+let mode = getMode(req);
+const { text, user_id, lat, lon, style } = req.body || {};
+if (!text) throw new Error("Missing 'text' in body");
+
+// AUTO chooses instant vs thinking based on message
+if (mode === "auto") mode = pickAutoMode(text);
+
+const maxTokens = TOKEN_LIMITS[mode];
   if (!text) throw new Error("Missing 'text' in body");
+
+// FAST PATH: greetings should never trigger “signals” logic
+if (isGreeting(text)) {
+  return {
+    provider: getProvider(req),
+    mode: getMode(req),
+    lxt1: {
+      verdict: "HOLD",
+      confidence: 0.9,
+      one_liner: "Greeting / small talk.",
+      signals: [],
+      actions: [{ now: "Ask what the user wants to do", time: "today", effort: "low" }],
+      watchouts: [],
+      next_check: safeNowPlus(6 * 60 * 60 * 1000),
+    },
+    reply: greetingReply(),
+    providers: {
+      decision: "fastpath",
+      reply: "fastpath",
+      triedDecision: ["fastpath"],
+      triedReply: ["fastpath"],
+    },
+  };
+}
 
   const memory = await loadUserMemory(user_id);
   const state = await loadUserState(user_id);
