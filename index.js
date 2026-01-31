@@ -1549,8 +1549,7 @@ app.post("/push/register", async (req, res) => {
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (!device_token) return res.status(400).json({ error: "Missing device_token" });
     if (!environment) return res.status(400).json({ error: "Missing environment" });
-
-    if (!dbReady) return res.status(200).json({ ok: true, db: false });
+    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled" });
 
     await registerDevice({
       userId: String(user_id),
@@ -1562,7 +1561,7 @@ app.post("/push/register", async (req, res) => {
     return res.json({ ok: true, db: true });
   } catch (e) {
     console.error("❌ /push/register error:", e);
-    return res.status(500).json({ error: "server_error" });
+    return res.status(500).json({ error: String(e?.message || e) });
   }
 });
 
