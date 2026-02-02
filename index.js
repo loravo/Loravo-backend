@@ -449,6 +449,103 @@ function weatherToSignals(w) {
     });
   }
 
+  /* ===================== LIVE CONTEXT HELPERS ===================== */
+
+function isWeatherText(t) {
+  const s = String(t || "").toLowerCase();
+  return (
+    s.includes("weather") ||
+    s.includes("forecast") ||
+    s.includes("temperature")
+  );
+}
+
+function extractCityFromWeatherText(t) {
+  const s = String(t || "").trim();
+  const m =
+    s.match(/\bweather\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
+    s.match(/\bforecast\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
+    s.match(/\btemperature\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i);
+
+  if (!m) return null;
+  const city = String(m[2] || "").trim();
+  return city.length >= 2 ? city : null;
+}
+
+async function geocodeCity(city) {
+  const key = process.env.OPENWEATHER_API_KEY;
+  if (!key || !city) return null;
+
+  const url = `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(
+    city
+  )}&limit=1&appid=${key}`;
+
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const hit = Array.isArray(j) ? j[0] : null;
+    if (!hit || typeof hit.lat !== "number" || typeof hit.lon !== "number") {
+      return null;
+    }
+    return {
+      lat: hit.lat,
+      lon: hit.lon,
+      city: hit.name || city,
+      country: hit.country || null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizeWeatherForLLM(w) {
+  if (!w) return null;
+  return {
+    city: w.name || null,
+    temp_c: typeof w.main?.temp === "number" ? w.main.temp : null,
+    feels_like_c:
+      typeof w.main?.feels_like === "number" ? w.main.feels_like : null,
+    humidity_pct:
+      typeof w.main?.humidity === "number" ? w.main.humidity : null,
+    clouds_pct:
+      typeof w.clouds?.all === "number" ? w.clouds.all : null,
+    wind_mps:
+      typeof w.wind?.speed === "number" ? w.wind.speed : null,
+    main: w.weather?.[0]?.main || null,
+    description: w.weather?.[0]?.description || null,
+    at: new Date().toISOString(),
+  };
+}
+
+async function buildLiveContext({ userId, text, lat, lon }) {
+  // WEATHER
+  let weatherRaw = null;
+
+  if (typeof lat === "number" && typeof lon === "number") {
+    weatherRaw = await getWeather(lat, lon);
+  } else if (isWeatherText(text)) {
+    const city = extractCityFromWeatherText(text);
+    if (city) {
+      const geo = await geocodeCity(city);
+      if (geo) {
+        weatherRaw = await getWeather(geo.lat, geo.lon);
+      }
+    }
+  }
+
+  // NEWS (last few items you ingested)
+  const news =
+    typeof getRecentNewsForUser === "function" && userId
+      ? await getRecentNewsForUser(userId, 5)
+      : [];
+
+  return {
+    weather: normalizeWeatherForLLM(weatherRaw),
+    news: Array.isArray(news) ? news : [],
+  };
+}
+
   if (typeof temp === "number" && temp <= 3.5) {
     signals.push({
       name: "Low temperature",
@@ -765,20 +862,33 @@ async function updateWeatherAndMaybeAlert({ userId, lat, lon }) {
 /* ===================== OPENAI (Decision) ===================== */
 
 async function callOpenAIDecision(text, memory, maxTokens) {
-  const model = process.env.OPENAI_MODEL_DECISION || process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const model =
+    process.env.OPENAI_MODEL_DECISION ||
+    process.env.OPENAI_MODEL ||
+    "gpt-4o-mini";
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      input: [ 
-       { role: "system", content: `
+  // Hard timeout so Render doesn't "exit early" on hung requests
+  const controller = new AbortController();
+  const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 20000);
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        input: [
+          {
+            role: "system",
+            content: `
 You are LXT-1 (Loravo decision engine).
 Return ONLY valid JSON that matches the schema. No extra text.
 
@@ -789,41 +899,71 @@ Grounding rules:
 
 Focus:
 - This JSON is used to help generate a human reply. Do not overreact.
-`.trim() },
-        ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
-        { role: "user", content: text },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "lxt1",
-          strict: true,
-          schema: LXT1_SCHEMA,
+`.trim(),
+          },
+          ...(memory
+            ? [{ role: "system", content: `Memory:\n${memory}` }]
+            : []),
+          { role: "user", content: text },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "lxt1",
+            strict: true,
+            schema: LXT1_SCHEMA,
+          },
         },
-      },
-      max_output_tokens: maxTokens,
-    }),
-  });
+        max_output_tokens: maxTokens,
+      }),
+    });
 
-  if (!resp.ok) {
-    const t = await resp.text();
-    if (t.includes("text.format") || t.includes("json_schema") || t.includes("not supported")) {
+    if (!resp.ok) {
+      const bodyText = await resp.text();
+
+      // If schema formatting isn't supported by model/provider, fall back
+      const schemaNotSupported =
+        /json_schema|text\.format|not supported|unsupported/i.test(bodyText);
+
+      if (schemaNotSupported) {
+        return await callOpenAIDecision_JSONinText(text, memory, maxTokens);
+      }
+
+      throw new Error(bodyText);
+    }
+
+    const data = await resp.json();
+    const parsed = extractOpenAIParsedObject(data);
+
+    // If for any reason parsed JSON isn't present, fallback to JSON-in-text extraction
+    if (!parsed) {
       return await callOpenAIDecision_JSONinText(text, memory, maxTokens);
     }
-    throw new Error(t);
+
+    return sanitizeToSchema(parsed);
+  } catch (e) {
+    // Abort errors -> treat as retryable
+    if (String(e?.name || "").toLowerCase().includes("abort")) {
+      throw new Error("OpenAI request timed out");
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
   }
-
-  const data = await resp.json();
-  const parsed = extractOpenAIParsedObject(data);
-  if (!parsed) return await callOpenAIDecision_JSONinText(text, memory, maxTokens);
-
-  return sanitizeToSchema(parsed);
 }
 
 async function callOpenAIDecision_JSONinText(text, memory, maxTokens) {
-  const model = process.env.OPENAI_MODEL_DECISION || process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const model =
+    process.env.OPENAI_MODEL_DECISION ||
+    process.env.OPENAI_MODEL ||
+    "gpt-4o-mini";
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
+
+  const controller = new AbortController();
+  const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 20000);
+  const t = setTimeout(() => controller.abort(), timeoutMs);
 
   const prompt = `
 You are LXT-1 (Loravo decision engine).
@@ -845,38 +985,56 @@ Schema:
 NO markdown. NO extra text. JSON only.
 `.trim();
 
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      input: [
-        { role: "system", content: prompt },
-        ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
-        { role: "user", content: text },
-      ],
-      max_output_tokens: maxTokens,
-    }),
-  });
+  try {
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        input: [
+          { role: "system", content: prompt },
+          ...(memory
+            ? [{ role: "system", content: `Memory:\n${memory}` }]
+            : []),
+          { role: "user", content: text },
+        ],
+        max_output_tokens: maxTokens,
+      }),
+    });
 
-  if (!resp.ok) throw new Error(await resp.text());
-  const data = await resp.json();
+    if (!resp.ok) throw new Error(await resp.text());
 
-  let obj = extractOpenAIParsedObject(data);
-  if (!obj) {
-    const outText =
-      data?.output?.flatMap((o) => o?.content || [])
-        ?.map((p) => p?.text)
-        ?.filter(Boolean)
-        ?.join("\n") || "";
-    obj = extractFirstJSONObject(outText);
+    const data = await resp.json();
+
+    // Try parsed JSON first (some providers still return it)
+    let obj = extractOpenAIParsedObject(data);
+
+    // Fallback: extract JSON from text
+    if (!obj) {
+      const outText =
+        data?.output
+          ?.flatMap((o) => o?.content || [])
+          ?.map((p) => p?.text)
+          ?.filter(Boolean)
+          ?.join("\n") || "";
+
+      obj = extractFirstJSONObject(outText);
+    }
+
+    if (!obj) throw new Error("OpenAI returned no JSON");
+    return sanitizeToSchema(obj);
+  } catch (e) {
+    if (String(e?.name || "").toLowerCase().includes("abort")) {
+      throw new Error("OpenAI request timed out");
+    }
+    throw e;
+  } finally {
+    clearTimeout(t);
   }
-
-  if (!obj) throw new Error("OpenAI returned no JSON");
-  return sanitizeToSchema(obj);
 }
 
 async function callOpenAIDecisionWithRetry(text, memory, maxTokens, tries = 3) {
@@ -892,6 +1050,41 @@ async function callOpenAIDecisionWithRetry(text, memory, maxTokens, tries = 3) {
 }
 
 /* ===================== GEMINI (Decision + Reply + News) ===================== */
+
+function withTimeout(ms) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), ms);
+  return { controller, cancel: () => clearTimeout(t) };
+}
+
+// Make replies vary naturally (short sometimes, longer sometimes)
+function pickReplyTokens(userText) {
+  const t = String(userText || "").trim();
+  const len = t.length;
+
+  // Greetings / tiny prompts
+  if (len <= 18) return 140;
+
+  // Simple questions
+  if (len <= 80) return 260;
+
+  // Medium
+  if (len <= 200) return 520;
+
+  // Long / complex
+  return 900; // never always maxing out
+}
+
+function isPoweredByQuestion(userText) {
+  const t = String(userText || "").toLowerCase();
+  return (
+    t.includes("powered by") ||
+    t.includes("what powers") ||
+    t.includes("what are you built on") ||
+    t.includes("what model") ||
+    t.includes("what are you running on")
+  );
+}
 
 async function callGeminiDecision(text, memory, maxTokens) {
   const key = process.env.GEMINI_API_KEY;
@@ -917,37 +1110,51 @@ Rules:
 - No markdown. No commentary. JSON only.
 `.trim();
 
-  const r = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
-          { role: "user", content: String(text || "") },
-        ],
-        max_tokens: Math.min(Number(maxTokens || 1200), 2000),
-        temperature: 0.25,
-      }),
-    }
+  const { controller, cancel } = withTimeout(
+    Number(process.env.GEMINI_TIMEOUT_MS || 20000)
   );
 
-  if (!r.ok) throw new Error(await r.text());
-  const j = await r.json();
+  try {
+    const r = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: system },
+            ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
+            { role: "user", content: String(text || "") },
+          ],
+          max_tokens: Math.min(Number(maxTokens || 1200), 2000),
+          temperature: 0.20,
+        }),
+      }
+    );
 
-  const content = j?.choices?.[0]?.message?.content || "";
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
 
-  // Hardening: Gemini sometimes adds leading text or code fences.
-  const obj = extractFirstJSONObject(content);
-  if (!obj) throw new Error(`Gemini returned no JSON. Raw: ${content.slice(0, 240)}`);
+    const content = j?.choices?.[0]?.message?.content || "";
 
-  return sanitizeToSchema(obj);
+    // Hardening: Gemini sometimes adds leading text or code fences.
+    const obj = extractFirstJSONObject(content);
+    if (!obj) throw new Error(`Gemini returned no JSON. Raw: ${content.slice(0, 240)}`);
+
+    return sanitizeToSchema(obj);
+  } catch (e) {
+    if (String(e?.name || "").toLowerCase().includes("abort")) {
+      throw new Error("Gemini decision request timed out");
+    }
+    throw e;
+  } finally {
+    cancel();
+  }
 }
 
 async function callGeminiReply({ userText, lxt1, style, lastReplyHint, liveContext }) {
@@ -959,26 +1166,31 @@ async function callGeminiReply({ userText, lxt1, style, lastReplyHint, liveConte
     process.env.GEMINI_MODEL ||
     "gemini-3-flash-preview";
 
-  // Make it feel like GPT: short-but-complete, not clipped
-  const MAX_REPLY_TOKENS = 1200;
+  const replyTokens = pickReplyTokens(userText);
 
   const system = `
-You are LORAVO inside a chat UI. Write like ChatGPT at its best.
+You are LORAVO inside a chat UI. Write like ChatGPT at its best: natural, calm, sharp.
 
-Rules:
-- Sound natural, calm, and helpful (no robotic tone).
-- Default: 2–6 short sentences (unless user asks for more).
-- Never say: "I'm an AI", "powered by", "I don't have access".
-- If you don't know, ask ONE short question or say what you can.
-- Don't cut off mid-sentence. Finish thoughts.
-- Avoid repeating the user's exact wording.
-- No bullets unless the user asks.
+Behavior:
+- Vary length naturally. Sometimes 1–2 short lines, sometimes 4–8 lines when needed.
+- Default: 2–6 short sentences unless the user clearly wants depth.
+- Be direct and human. No corporate tone.
+
+Hard rules:
+- Do NOT say: "I'm an AI", "as an AI", "I don't have access", "I can't browse", "I can’t see live data".
+- Do NOT hype “headlines across the globe” unless the user asked for global news.
+- If the user asks "What are you powered by?" answer: "Powered by LXT-1." (You may add: "with OpenAI/Gemini under the hood" ONLY if they press for details.)
+- If weather is requested and live_context.weather exists, use it.
+- If weather is requested and you DON'T have live_context.weather, ask ONE question that lets the app fetch it (city or enable location), and keep it short.
+- No bullets unless user asks.
+- No repeating the user’s exact wording.
 
 Return ONLY the reply text.
 `.trim();
 
   const payload = {
     userText: String(userText || ""),
+    // keep LXT info available, but it's not a report
     lxt1: lxt1 || null,
     live_context: {
       weather: liveContext?.weather || null,
@@ -988,33 +1200,61 @@ Return ONLY the reply text.
     style: style || "human",
   };
 
-  const r = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: JSON.stringify(payload) },
-        ],
-        max_tokens: MAX_REPLY_TOKENS,
-        temperature: 0.6,
-      }),
-    }
+  const { controller, cancel } = withTimeout(
+    Number(process.env.GEMINI_TIMEOUT_MS || 20000)
   );
 
-  if (!r.ok) throw new Error(await r.text());
-  const j = await r.json();
+  try {
+    // If user asks "powered by", we want a short, consistent branded answer.
+    // We let the model answer, but we keep it constrained by tokens + rules.
+    const r = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: JSON.stringify(payload) },
+          ],
+          max_tokens: replyTokens,
+          temperature: 0.62,
+          presence_penalty: 0.20,
+          frequency_penalty: 0.25,
+        }),
+      }
+    );
 
-  const reply = (j?.choices?.[0]?.message?.content || "").trim();
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
 
-  // Safety: if empty, never return blank
-  return reply || "Got you. What do you want to do next?";
+    let reply = (j?.choices?.[0]?.message?.content || "").trim();
+
+    // If model ever gives a long “identity paragraph” for powered-by, clamp it.
+    if (isPoweredByQuestion(userText)) {
+      // Keep it clean and branded.
+      // If you want it even stricter, just always return the one-liner below.
+      if (!reply.toLowerCase().includes("lxt")) {
+        reply = "Powered by LXT-1.";
+      }
+      // trim overly long responses
+      if (reply.length > 220) reply = "Powered by LXT-1.";
+    }
+
+    return reply || "Got you. What do you want to do next?";
+  } catch (e) {
+    if (String(e?.name || "").toLowerCase().includes("abort")) {
+      return "One sec — try that again.";
+    }
+    throw e;
+  } finally {
+    cancel();
+  }
 }
 
 async function callGeminiNewsSummary({ userText, memory, newsContext }) {
@@ -1044,74 +1284,149 @@ Return ONLY plain text.
     items: Array.isArray(newsContext) ? newsContext : [],
   };
 
-  const r = await fetch(
-    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: JSON.stringify(payload) },
-        ],
-        max_tokens: 320,
-        temperature: 0.55,
-      }),
-    }
+  const { controller, cancel } = withTimeout(
+    Number(process.env.GEMINI_TIMEOUT_MS || 20000)
   );
 
-  if (!r.ok) throw new Error(await r.text());
-  const j = await r.json();
+  try {
+    const r = await fetch(
+      "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          Authorization: `Bearer ${key}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: JSON.stringify(payload) },
+          ],
+          max_tokens: 260,
+          temperature: 0.55,
+          presence_penalty: 0.10,
+          frequency_penalty: 0.20,
+        }),
+      }
+    );
 
-  const out = (j?.choices?.[0]?.message?.content || "").trim();
-  return out || "Nothing urgent on your radar right now.";
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+
+    const out = (j?.choices?.[0]?.message?.content || "").trim();
+    return out || "Nothing urgent on your radar right now.";
+  } catch (e) {
+    if (String(e?.name || "").toLowerCase().includes("abort")) {
+      return "Nothing urgent right now.";
+    }
+    throw e;
+  } finally {
+    cancel();
+  }
 }
+
 /* ===================== OPENAI (Reply) ===================== */
+
+function isPoweredByQuestion(t) {
+  const s = String(t || "").toLowerCase();
+  return (
+    s.includes("powered by") ||
+    s.includes("powerd by") ||
+    s.includes("what are you powered") ||
+    s.includes("what is this powered") ||
+    s.includes("what model") ||
+    s.includes("what are you built on") ||
+    s.includes("what is your model")
+  );
+}
+
+function isWeatherQuestion(t) {
+  const s = String(t || "").toLowerCase();
+  return s.includes("weather") || s.includes("temperature") || s.includes("forecast");
+}
+
+// Try to extract “in Edmonton”, “for Edmonton”, etc.
+function extractCityFromWeatherText(t) {
+  const s = String(t || "").trim();
+  const m =
+    s.match(/\bweather\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
+    s.match(/\btemperature\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
+    s.match(/\bforecast\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i);
+  if (!m) return null;
+  const city = String(m[2] || "").trim();
+  return city.length >= 2 ? city : null;
+}
+
+/**
+ * City -> { lat, lon } using OpenWeather geocoding (needs OPENWEATHER_API_KEY)
+ */
+async function geocodeCity(city) {
+  const key = process.env.OPENWEATHER_API_KEY;
+  if (!key || !city) return null;
+
+  const url = `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(
+    city
+  )}&limit=1&appid=${key}`;
+
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const hit = Array.isArray(j) ? j[0] : null;
+    if (!hit || typeof hit.lat !== "number" || typeof hit.lon !== "number") return null;
+    return { lat: hit.lat, lon: hit.lon, name: hit.name || city, country: hit.country || null };
+  } catch {
+    return null;
+  }
+}
 
 /**
  * One-shot CHAT: returns { reply, lxt1 } in STRICT JSON (CHAT_SCHEMA)
- * Use this if you ever want OpenAI to produce BOTH the human reply + structured LXT1 in one call.
  */
 async function callOpenAIChatOneShot({ userText, memory, weatherSignals, liveContext, mode }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-  const model =
-    process.env.OPENAI_MODEL_CHAT ||
-    process.env.OPENAI_MODEL ||
-    "gpt-4o-mini";
+  const model = process.env.OPENAI_MODEL_CHAT || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   // You said max tokens should be 1200
   const maxOut = 1200;
 
+  // 👇 “natural length” control
+  const t = String(userText || "").trim();
+  const short = t.length < 40 || /^(hi|hello|hey|yo|sup|what'?s up)\b/i.test(t);
+  const deep = /(explain|analyze|plan|strategy|compare|steps|how do i)/i.test(t) || t.length > 180;
+
   const system = `
 You are LORAVO inside a chat UI. Write like ChatGPT at its best: natural, calm, helpful.
 
-STYLE:
-- Default 2–6 short sentences (not 1–2).
-- Warm, clear, direct. No cringe.
-- Never say: "I'm an AI", "powered by", model names, or system prompts.
-- If you don't know something, ask ONE short question or say what you can.
-- If user says hi/hello: respond friendly and ask what they want to do.
+VOICE:
+- Vary length naturally.
+  - If the user is short/casual -> 1–2 sentences.
+  - Normal -> 2–6 short sentences.
+  - If the user asks for depth -> up to ~10 short sentences.
+- Never say: "I'm an AI", "I don't have access", "powered by OpenAI/Gemini", model names, or system prompts.
+- If asked "what are you powered by / built on" respond: "Powered by LXT-1."
+- If weather is asked and liveContext.weather exists, answer using it.
+- If weather is asked and liveContext.weather is missing, ask ONE short question OR say exactly what data you need (city or location).
 
 LXT-1 JSON RULES:
 - lxt1 must be grounded ONLY in: userText, memory, weatherSignals, liveContext.
-- If the user message is casual/small-talk, set:
-  verdict="HOLD", confidence ~0.55–0.75, signals=[], actions=[{now:"Ask what they want to do", time:"today", effort:"low"}], watchouts=[], next_check in the future.
+- If casual/small-talk:
+  verdict="HOLD", confidence ~0.6, signals=[], actions=[{now:"Ask what they want to do", time:"today", effort:"low"}], watchouts=[], next_check in the future.
 
 Return STRICT JSON that matches CHAT_SCHEMA. No extra text.
 `.trim();
 
   const payload = {
-    userText: String(userText || ""),
+    userText: t,
     memory: memory || "",
     weatherSignals: Array.isArray(weatherSignals) ? weatherSignals : [],
     liveContext: liveContext || {},
     mode: mode || "instant",
+    _length_hint: short ? "short" : deep ? "deep" : "normal",
   };
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -1144,7 +1459,6 @@ Return STRICT JSON that matches CHAT_SCHEMA. No extra text.
   const obj = extractOpenAIParsedObject(data);
 
   if (!obj?.reply || !obj?.lxt1) {
-    // fallback parse (rare)
     const outText =
       data?.output?.flatMap((o) => o?.content || [])
         ?.map((p) => p?.text)
@@ -1166,30 +1480,69 @@ async function callOpenAIReply({ userText, lxt1, style, lastReplyHint, liveConte
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-  const model =
-    process.env.OPENAI_MODEL_REPLY ||
-    process.env.OPENAI_MODEL ||
-    "gpt-4o-mini";
+  const model = process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
 
   // You said max tokens should be 1200
   const maxOut = 1200;
 
+  const t = String(userText || "").trim();
+
+  // ✅ HARD OVERRIDES (so it always behaves right)
+  if (isPoweredByQuestion(t)) {
+    return "Powered by LXT-1.";
+  }
+
+  // ✅ Weather without lat/lon: “weather in Edmonton”
+  // If you don't have liveContext.weather, we attempt city->lat/lon using OpenWeather geocode + getWeather()
+  if (isWeatherQuestion(t) && !liveContext?.weather) {
+    const city = extractCityFromWeatherText(t);
+    if (city) {
+      const geo = await geocodeCity(city);
+      if (geo?.lat != null && geo?.lon != null) {
+        const w = await getWeather(geo.lat, geo.lon);
+        if (w) {
+          const temp = typeof w.main?.temp === "number" ? Math.round(w.main.temp) : null;
+          const desc = w.weather?.[0]?.description || w.weather?.[0]?.main || null;
+          const feels = typeof w.main?.feels_like === "number" ? Math.round(w.main.feels_like) : null;
+
+          const parts = [];
+          parts.push(`${geo.name}${geo.country ? `, ${geo.country}` : ""}:`);
+          if (temp != null && desc) parts.push(`${temp}°C and ${desc}.`);
+          else if (temp != null) parts.push(`${temp}°C right now.`);
+          else if (desc) parts.push(`${desc}.`);
+          if (feels != null) parts.push(`Feels like ${feels}°C.`);
+          return parts.join(" ").replace(/\s+/g, " ").trim();
+        }
+      }
+    }
+    // fallback: ask ONE short question
+    return "Which city are you in (or share lat/lon), and do you want current temp or the next 24 hours?";
+  }
+
+  // 👇 Natural length control
+  const short = t.length < 40 || /^(hi|hello|hey|yo|sup|what'?s up)\b/i.test(t);
+  const deep = /(explain|analyze|plan|strategy|compare|steps|how do i)/i.test(t) || t.length > 180;
+
   const system = `
 You are LORAVO — a calm, intelligent assistant in a chat UI.
 
-Rules:
-- Sound like a smart human (ChatGPT-quality).
-- Default 2–6 short sentences unless the user asks for more.
-- No "I'm an AI", no "powered by", no model names.
-- No corporate tone, no disclaimers, no over-apologies.
-- Finish your thoughts; never cut off mid-sentence.
-- Ask ONE short clarifying question only when necessary.
+VOICE:
+- Vary length naturally.
+  - Short/casual -> 1–2 sentences.
+  - Normal -> 2–6 short sentences.
+  - Depth request -> up to ~10 short sentences.
+- Sound like ChatGPT-quality (human, clear, modern).
+- Never say: "I'm an AI", "I don't have access", "powered by OpenAI/Gemini", model names.
+- Don't over-apologize. No corporate tone.
+- Ask ONE short clarifying question only if truly needed.
 
+IMPORTANT:
+- If asked "what are you powered by / built on": reply exactly "Powered by LXT-1."
 Return ONLY the reply text.
 `.trim();
 
   const payload = {
-    userText: String(userText || ""),
+    userText: t,
     verdict: lxt1?.verdict || null,
     one_liner: lxt1?.one_liner || null,
     top_actions: (lxt1?.actions || []).slice(0, 3),
@@ -1198,6 +1551,7 @@ Return ONLY the reply text.
     live_context: liveContext || {},
     style: style || "human",
     last_reply_hint: lastReplyHint || "",
+    _length_hint: short ? "short" : deep ? "deep" : "normal",
   };
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -1227,7 +1581,6 @@ Return ONLY the reply text.
 
   return outText.trim() || "Got you — what do you want to do next?";
 }
-
 /* ===================== TRINITY ORCHESTRATION ===================== */
 
 async function getDecision({ provider, text, memory, maxTokens }) {
@@ -1281,13 +1634,13 @@ async function getHumanReply({
   // - If provider=gemini -> reply with Gemini
   // - If provider=trinity -> default Gemini reply, fallback to OpenAI if Gemini fails
   if (provider === "openai") {
-    const reply = await callOpenAIReply({
-      userText,
-      lxt1,
-      style: style || "human",
-      lastReplyHint,
-      liveContext,
-    });
+    const reply = await callGeminiReply({
+  userText: text,
+  lxt1: lxt1ForChat,
+  style: style || "human",
+  lastReplyHint: state?.last_alert_hash ? "Rephrase; avoid repeating." : "",
+  liveContext,
+});
 
     return {
       reply,
@@ -1298,12 +1651,12 @@ async function getHumanReply({
 
   if (provider === "gemini") {
     const reply = await callGeminiReply({
-      userText,
-      lxt1,
-      style: style || "human",
-      lastReplyHint,
-      liveContext,
-    });
+  userText: text,
+  lxt1: lxt1ForChat,
+  style: style || "human",
+  lastReplyHint: state?.last_alert_hash ? "Rephrase; avoid repeating." : "",
+  liveContext,
+});
 
     return {
       reply,
@@ -1362,6 +1715,31 @@ async function runLXT({ req }) {
   }
   const maxTokens = TOKEN_LIMITS[mode] || TOKEN_LIMITS.auto;
 
+  /* ===================== NEWS FAST PATH ===================== */
+if (intent === "news") {
+  const reply = await callGeminiNewsSummary({
+    userText: text,
+    memory: await loadUserMemory(user_id),
+    newsContext: liveContext?.news || [],
+  });
+
+  await saveUserMemory(user_id, text);
+
+  return {
+    provider: "gemini",
+    mode,
+    reply,
+    lxt1: null,
+    providers: {
+      decision: "news_fast",
+      reply: "gemini_news",
+      triedDecision: ["news_fast"],
+      triedReply: ["gemini_news"],
+    },
+    _errors: {},
+  };
+}
+ 
   /* ===================== FAST PATH: greeting ===================== */
   if (intent === "greeting") {
     return {
@@ -1380,15 +1758,19 @@ async function runLXT({ req }) {
   }
 
   /* ===================== LOAD CONTEXT ===================== */
-  const memory = await loadUserMemory(user_id);
-  const state = await loadUserState(user_id);
+  const liveContext = await buildLiveContext({
+  userId: user_id,
+  text,
+  lat,
+  lon,
+});
 
-  const weather =
-    typeof lat === "number" && typeof lon === "number"
-      ? await getWeather(lat, lon)
-      : null;
+const weatherRaw =
+  typeof lat === "number" && typeof lon === "number"
+    ? await getWeather(lat, lon)
+    : null;
 
-  const weatherSignals = weather ? weatherToSignals(weather) : [];
+const weatherSignals = weatherRaw ? weatherToSignals(weatherRaw) : [];
 
   /* ===================== CHAT: human response ===================== */
   // If you want chat to feel best: keep it SINGLE-PASS (no decision->reply double call)
@@ -1448,13 +1830,14 @@ async function runLXT({ req }) {
   const lastReplyHint = state?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "";
 
   const voice = await getHumanReply({
-    provider,
-    decisionProvider: decision.decisionProvider,
-    userText: text,
-    lxt1,
-    style: style || "human",
-    lastReplyHint,
-  });
+  provider,
+  decisionProvider: decision.decisionProvider,
+  userText: text,
+  lxt1,
+  style: style || "human",
+  lastReplyHint,
+  liveContext,
+});
 
   return {
     provider,
