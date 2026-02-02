@@ -449,7 +449,18 @@ function weatherToSignals(w) {
     });
   }
 
-  /* ===================== LIVE CONTEXT HELPERS ===================== */
+  if (typeof temp === "number" && temp <= 3.5) {
+    signals.push({
+      name: "Low temperature",
+      direction: "down",
+      weight: 0.2,
+      why: `It's cold (${temp.toFixed(1)}°C) — plan layers.`,
+    });
+  }
+
+  return signals;
+}
+/* ===================== LIVE CONTEXT HELPERS ===================== */
 
 function isWeatherText(t) {
   const s = String(t || "").toLowerCase();
@@ -544,18 +555,6 @@ async function buildLiveContext({ userId, text, lat, lon }) {
     weather: normalizeWeatherForLLM(weatherRaw),
     news: Array.isArray(news) ? news : [],
   };
-}
-
-  if (typeof temp === "number" && temp <= 3.5) {
-    signals.push({
-      name: "Low temperature",
-      direction: "down",
-      weight: 0.2,
-      why: `It's cold (${temp.toFixed(1)}°C) — plan layers.`,
-    });
-  }
-
-  return signals;
 }
 
 /* ===================== DB SAFE WRAPPERS ===================== */
@@ -1629,43 +1628,29 @@ async function getHumanReply({
   lastReplyHint,
   liveContext,
 }) {
-  // Reply routing:
-  // - If provider=openai -> reply with OpenAI (GPT feel)
-  // - If provider=gemini -> reply with Gemini
-  // - If provider=trinity -> default Gemini reply, fallback to OpenAI if Gemini fails
   if (provider === "openai") {
-    const reply = await callGeminiReply({
-  userText: text,
-  lxt1: lxt1ForChat,
-  style: style || "human",
-  lastReplyHint: state?.last_alert_hash ? "Rephrase; avoid repeating." : "",
-  liveContext,
-});
-
-    return {
-      reply,
-      replyProvider: "openai",
-      tried: ["openai"],
-    };
+    const reply = await callOpenAIReply({
+      userText,
+      lxt1,
+      style: style || "human",
+      lastReplyHint,
+      liveContext,
+    });
+    return { reply, replyProvider: "openai", tried: ["openai"] };
   }
 
   if (provider === "gemini") {
     const reply = await callGeminiReply({
-  userText: text,
-  lxt1: lxt1ForChat,
-  style: style || "human",
-  lastReplyHint: state?.last_alert_hash ? "Rephrase; avoid repeating." : "",
-  liveContext,
-});
-
-    return {
-      reply,
-      replyProvider: "gemini_flash",
-      tried: ["gemini_flash"],
-    };
+      userText,
+      lxt1,
+      style: style || "human",
+      lastReplyHint,
+      liveContext,
+    });
+    return { reply, replyProvider: "gemini_flash", tried: ["gemini_flash"] };
   }
 
-  // trinity default: Gemini reply, fallback OpenAI
+  // trinity: gemini reply first, fallback openai reply
   try {
     const reply = await callGeminiReply({
       userText,
@@ -1674,12 +1659,7 @@ async function getHumanReply({
       lastReplyHint,
       liveContext,
     });
-
-    return {
-      reply,
-      replyProvider: "gemini_flash",
-      tried: ["gemini_flash"],
-    };
+    return { reply, replyProvider: "gemini_flash", tried: ["gemini_flash"] };
   } catch (e) {
     const reply = await callOpenAIReply({
       userText,
@@ -1688,7 +1668,6 @@ async function getHumanReply({
       lastReplyHint,
       liveContext,
     });
-
     return {
       reply,
       replyProvider: "openai_fallback",
@@ -1705,7 +1684,8 @@ async function runLXT({ req }) {
 
   const { text, user_id, lat, lon, style } = req.body || {};
   if (!text) throw new Error("Missing 'text' in body");
-
+const state = await loadUserState(user_id);
+const memory = await loadUserMemory(user_id);
   // intent router (you already have classifyIntent + pickAutoMode)
   const intent = typeof classifyIntent === "function" ? classifyIntent(text) : "chat";
 
@@ -1717,10 +1697,12 @@ async function runLXT({ req }) {
 
   /* ===================== NEWS FAST PATH ===================== */
 if (intent === "news") {
+  const newsItems = await getRecentNewsForUser(user_id, 5);
+
   const reply = await callGeminiNewsSummary({
     userText: text,
-    memory: await loadUserMemory(user_id),
-    newsContext: liveContext?.news || [],
+    memory,
+    newsContext: newsItems,
   });
 
   await saveUserMemory(user_id, text);
@@ -1792,14 +1774,14 @@ const weatherSignals = weatherRaw ? weatherToSignals(weatherRaw) : [];
   style: style || "human",
   lastReplyHint: state?.last_alert_hash ? "Rephrase; avoid repeating." : "",
   liveContext: {
-    weather,
-    location: {
-      lat: typeof lat === "number" ? lat : null,
-      lon: typeof lon === "number" ? lon : null,
-      city: state?.last_city || null,
-      country: state?.last_country || null,
-      timezone: state?.last_timezone || null,
-    },
+  weather: liveContext?.weather || null,
+  location: {
+    lat: typeof lat === "number" ? lat : null,
+    lon: typeof lon === "number" ? lon : null,
+    city: state?.last_city || null,
+    country: state?.last_country || null,
+    timezone: state?.last_timezone || null,
+   },
   },
 });
     await saveUserMemory(user_id, text);
