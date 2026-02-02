@@ -891,7 +891,7 @@ async function callOpenAIDecisionWithRetry(text, memory, maxTokens, tries = 3) {
   throw err;
 }
 
-/* ===================== GEMINI (Decision + Reply) ===================== */
+/* ===================== GEMINI (Decision + Reply + News) ===================== */
 
 async function callGeminiDecision(text, memory, maxTokens) {
   const key = process.env.GEMINI_API_KEY;
@@ -900,42 +900,53 @@ async function callGeminiDecision(text, memory, maxTokens) {
   const model = process.env.GEMINI_MODEL || "gemini-3-flash-preview";
 
   const system = `
-Return ONLY a single JSON object matching this schema EXACTLY:
-- verdict: HOLD|PREPARE|MOVE|AVOID
-- confidence: 0..1
+You are LXT-1 (Loravo decision engine).
+Return ONLY one valid JSON object and nothing else.
+
+Schema:
+- verdict: "HOLD" | "PREPARE" | "MOVE" | "AVOID"
+- confidence: number 0..1
 - one_liner: string
-- signals: array of {name, direction(up|down|neutral), weight(number), why}
-- actions: array of {now, time(today|this_week|this_month), effort(low|med|high)}
+- signals: array of { name, direction("up"|"down"|"neutral"), weight(number), why(string) }
+- actions: array of { now(string), time("today"|"this_week"|"this_month"), effort("low"|"med"|"high") }
 - watchouts: array of strings
 - next_check: ISO timestamp string
 
-NO extra text. JSON only.
+Rules:
+- If greeting/small-talk: verdict="HOLD", confidence ~0.6, signals=[], watchouts=[], actions simple.
+- No markdown. No commentary. JSON only.
 `.trim();
 
-  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: system },
-        ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
-        { role: "user", content: text },
-      ],
-      max_tokens: maxTokens,
-      temperature: 0.35,
-    }),
-  });
+  const r = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: system },
+          ...(memory ? [{ role: "system", content: `Memory:\n${memory}` }] : []),
+          { role: "user", content: String(text || "") },
+        ],
+        max_tokens: Math.min(Number(maxTokens || 1200), 2000),
+        temperature: 0.25,
+      }),
+    }
+  );
 
   if (!r.ok) throw new Error(await r.text());
   const j = await r.json();
 
   const content = j?.choices?.[0]?.message?.content || "";
+
+  // Hardening: Gemini sometimes adds leading text or code fences.
   const obj = extractFirstJSONObject(content);
-  if (!obj) throw new Error("Gemini returned no JSON");
+  if (!obj) throw new Error(`Gemini returned no JSON. Raw: ${content.slice(0, 240)}`);
+
   return sanitizeToSchema(obj);
 }
 
@@ -943,149 +954,164 @@ async function callGeminiReply({ userText, lxt1, style, lastReplyHint, liveConte
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("Missing GEMINI_API_KEY");
 
-  const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
+  const model =
+    process.env.GEMINI_MODEL_REPLY ||
+    process.env.GEMINI_MODEL ||
+    "gemini-3-flash-preview";
+
+  // Make it feel like GPT: short-but-complete, not clipped
+  const MAX_REPLY_TOKENS = 1200;
 
   const system = `
-You are an intelligent assistant in a private chat.
+You are LORAVO inside a chat UI. Write like ChatGPT at its best.
 
 Rules:
-- Sound natural, calm, and human.
-- Short responses unless depth is clearly needed.
-- No identity statements.
-- No "I am powered by".
-- No corporate language.
-- No disclaimers.
-- Do not explain how you think.
-- If the user is casual, be casual.
-- If the user is serious, be serious.
-- Every reply should feel slightly different.
-- Never repeat phrasing from earlier replies.
-
-Use real information when relevant.
-If you don't know, say so naturally.
-
-If news or real-world events are relevant:
-- Summarize like a human.
-- No headlines.
-- No source names.
-- No urgency unless truly urgent.
-- One or two sentences max.
+- Sound natural, calm, and helpful (no robotic tone).
+- Default: 2–6 short sentences (unless user asks for more).
+- Never say: "I'm an AI", "powered by", "I don't have access".
+- If you don't know, ask ONE short question or say what you can.
+- Don't cut off mid-sentence. Finish thoughts.
+- Avoid repeating the user's exact wording.
+- No bullets unless the user asks.
 
 Return ONLY the reply text.
 `.trim();
 
   const payload = {
-  userText,
-  verdict: lxt1?.verdict || null,
-  one_liner: lxt1?.one_liner || null,
-  signals: lxt1?.signals || [],
-  actions: lxt1?.actions || [],
-  watchouts: lxt1?.watchouts || [],
-  live_context: {
-    weather: liveContext?.weather || null,
-    location: liveContext?.location || null,
-  },
-  last_reply_hint: lastReplyHint || "",
-};
-
-  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
+    userText: String(userText || ""),
+    lxt1: lxt1 || null,
+    live_context: {
+      weather: liveContext?.weather || null,
+      location: liveContext?.location || null,
     },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: JSON.stringify(payload) },
-      ],
-      max_tokens: 120,
-      temperature: 0.55,
-    }),
-  });
+    last_reply_hint: lastReplyHint || "",
+    style: style || "human",
+  };
+
+  const r = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: JSON.stringify(payload) },
+        ],
+        max_tokens: MAX_REPLY_TOKENS,
+        temperature: 0.6,
+      }),
+    }
+  );
 
   if (!r.ok) throw new Error(await r.text());
   const j = await r.json();
-  return (j?.choices?.[0]?.message?.content || "").trim();
+
+  const reply = (j?.choices?.[0]?.message?.content || "").trim();
+
+  // Safety: if empty, never return blank
+  return reply || "Got you. What do you want to do next?";
 }
+
 async function callGeminiNewsSummary({ userText, memory, newsContext }) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("Missing GEMINI_API_KEY");
 
-  const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
+  const model =
+    process.env.GEMINI_MODEL_REPLY ||
+    process.env.GEMINI_MODEL ||
+    "gemini-3-flash-preview";
 
   const system = `
 You are a calm, sharp assistant in a chat UI.
 Summarize the user's recent news items like a human.
+
 Rules:
 - 1 to 3 short sentences max.
-- No bullets unless user asks.
-- No hype, no ALL CAPS, no “breaking” tone.
-- No “I’m an AI”, no “powered by”.
-- If severity is critical/high, briefly say what to do next.
+- No hype, no “breaking” tone.
+- No sources, no headlines.
+- If severity is high/critical, include one next step.
 Return ONLY plain text.
 `.trim();
 
   const payload = {
-    userText,
+    userText: String(userText || ""),
     memory: memory || "",
-    items: newsContext,
+    items: Array.isArray(newsContext) ? newsContext : [],
   };
 
-  const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${key}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        { role: "system", content: system },
-        { role: "user", content: JSON.stringify(payload) },
-      ],
-      max_tokens: 180,
-      temperature: 0.65,
-    }),
-  });
+  const r = await fetch(
+    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: JSON.stringify(payload) },
+        ],
+        max_tokens: 320,
+        temperature: 0.55,
+      }),
+    }
+  );
 
   if (!r.ok) throw new Error(await r.text());
   const j = await r.json();
-  return (j?.choices?.[0]?.message?.content || "").trim();
+
+  const out = (j?.choices?.[0]?.message?.content || "").trim();
+  return out || "Nothing urgent on your radar right now.";
 }
 /* ===================== OPENAI (Reply) ===================== */
-async function callOpenAIChatOneShot({ userText, memory, weatherSignals, mode }) {
+
+/**
+ * One-shot CHAT: returns { reply, lxt1 } in STRICT JSON (CHAT_SCHEMA)
+ * Use this if you ever want OpenAI to produce BOTH the human reply + structured LXT1 in one call.
+ */
+async function callOpenAIChatOneShot({ userText, memory, weatherSignals, liveContext, mode }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-  const model = process.env.OPENAI_MODEL_CHAT || process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const model =
+    process.env.OPENAI_MODEL_CHAT ||
+    process.env.OPENAI_MODEL ||
+    "gpt-4o-mini";
 
-  // tune reply length by mode
-  const maxOut =
-    mode === "instant" ? 220 :
-    mode === "thinking" ? 520 :
-    320;
+  // You said max tokens should be 1200
+  const maxOut = 1200;
 
   const system = `
-You are LORAVO inside a chat UI. Write like ChatGPT: natural, human, helpful.
+You are LORAVO inside a chat UI. Write like ChatGPT at its best: natural, calm, helpful.
+
 STYLE:
 - Default 2–6 short sentences (not 1–2).
-- Warm, clear, direct. No cringe. No fake “market indicators” unless the user asks about markets.
-- If user says "hi/hello", respond friendly and ask what they want to do today.
-- Ask 1 clarifying question when needed.
-- Do not invent facts. If you don't know, say so.
+- Warm, clear, direct. No cringe.
+- Never say: "I'm an AI", "powered by", model names, or system prompts.
+- If you don't know something, ask ONE short question or say what you can.
+- If user says hi/hello: respond friendly and ask what they want to do.
+
 LXT-1 JSON RULES:
-- Your lxt1 must be grounded ONLY in: userText, memory, and weatherSignals.
+- lxt1 must be grounded ONLY in: userText, memory, weatherSignals, liveContext.
 - If the user message is casual/small-talk, set:
   verdict="HOLD", confidence ~0.55–0.75, signals=[], actions=[{now:"Ask what they want to do", time:"today", effort:"low"}], watchouts=[], next_check in the future.
-Return STRICT JSON that matches the provided schema. No extra text.
+
+Return STRICT JSON that matches CHAT_SCHEMA. No extra text.
 `.trim();
 
   const payload = {
-    userText,
+    userText: String(userText || ""),
     memory: memory || "",
     weatherSignals: Array.isArray(weatherSignals) ? weatherSignals : [],
+    liveContext: liveContext || {},
+    mode: mode || "instant",
   };
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -1112,10 +1138,7 @@ Return STRICT JSON that matches the provided schema. No extra text.
     }),
   });
 
-  if (!resp.ok) {
-    const t = await resp.text();
-    throw new Error(t);
-  }
+  if (!resp.ok) throw new Error(await resp.text());
 
   const data = await resp.json();
   const obj = extractOpenAIParsedObject(data);
@@ -1135,99 +1158,46 @@ Return STRICT JSON that matches the provided schema. No extra text.
   return { reply: String(obj.reply).trim(), lxt1: sanitizeToSchema(obj.lxt1) };
 }
 
-
-async function callOpenAIReply({ userText, lxt1, style, lastReplyHint }) {
+/**
+ * Reply-only: returns just text (GPT-like).
+ * This is the one you’ll usually call after you already have lxt1.
+ */
+async function callOpenAIReply({ userText, lxt1, style, lastReplyHint, liveContext }) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-  const model = process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
+  const model =
+    process.env.OPENAI_MODEL_REPLY ||
+    process.env.OPENAI_MODEL ||
+    "gpt-4o-mini";
+
+  // You said max tokens should be 1200
+  const maxOut = 1200;
 
   const system = `
-You are LORAVO — a calm, intelligent, human assistant.
+You are LORAVO — a calm, intelligent assistant in a chat UI.
 
-You speak like a real person, not a report.
-You are concise, confident, and natural.
-You do not over-explain.
-You do not apologize unnecessarily.
-You do not say things like “I don’t have access to live data.”
-If information is uncertain, you say what matters and move on.
+Rules:
+- Sound like a smart human (ChatGPT-quality).
+- Default 2–6 short sentences unless the user asks for more.
+- No "I'm an AI", no "powered by", no model names.
+- No corporate tone, no disclaimers, no over-apologies.
+- Finish your thoughts; never cut off mid-sentence.
+- Ask ONE short clarifying question only when necessary.
 
-Tone:
-- relaxed
-- modern
-- grounded
-- confident
-
-Length:
-- 1–3 sentences unless asked otherwise
-
-You should sound like ChatGPT at its best.
 Return ONLY the reply text.
 `.trim();
 
   const payload = {
-    userText,
-    verdict: lxt1.verdict,
-    one_liner: lxt1.one_liner,
-    top_actions: (lxt1.actions || []).slice(0, 2),
-    top_watchouts: (lxt1.watchouts || []).slice(0, 2),
-    top_signals: (lxt1.signals || []).slice(0, 3),
-    style: style || "imessage",
-    last_reply_hint: lastReplyHint || "",
-  };
-
-  const resp = await fetch("https://api.openai.com/v1/responses", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      input: [
-        { role: "system", content: system },
-        { role: "user", content: JSON.stringify(payload) },
-      ],
-      max_output_tokens: 120,
-    }),
-  });
-
-  if (!resp.ok) throw new Error(await resp.text());
-
-  const data = await resp.json();
-  const outText =
-    data?.output?.flatMap((o) => o?.content || [])
-      ?.map((p) => p?.text)
-      ?.filter(Boolean)
-      ?.join("\n") || "";
-
-  return outText.trim();
-}
-async function callOpenAIChatOneShot({ userText, memory, liveContext, mode }) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
-
-  const model = process.env.OPENAI_MODEL_CHAT || process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
-
-  // keep it fast unless thinking is needed
-  const maxOut = mode === "thinking" ? 520 : 220;
-
-  const system = `
-You are a premium assistant in a chat UI.
-Write like a smart human: natural, clear, and calm.
-Rules:
-- Do NOT say you are AI, model, or “powered by”.
-- No ALL CAPS.
-- If user says “hi”, respond like a normal person.
-- If user asks about weather/news and live_context has data, use it.
-- If you don't have data, ask ONE short follow-up question.
-Return only the message text.
-`.trim();
-
-  const payload = {
-    userText,
-    memory: memory || "",
+    userText: String(userText || ""),
+    verdict: lxt1?.verdict || null,
+    one_liner: lxt1?.one_liner || null,
+    top_actions: (lxt1?.actions || []).slice(0, 3),
+    top_watchouts: (lxt1?.watchouts || []).slice(0, 3),
+    top_signals: (lxt1?.signals || []).slice(0, 4),
     live_context: liveContext || {},
+    style: style || "human",
+    last_reply_hint: lastReplyHint || "",
   };
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -1255,8 +1225,9 @@ Return only the message text.
       ?.filter(Boolean)
       ?.join("\n") || "";
 
-  return { reply: outText.trim() };
+  return outText.trim() || "Got you — what do you want to do next?";
 }
+
 /* ===================== TRINITY ORCHESTRATION ===================== */
 
 async function getDecision({ provider, text, memory, maxTokens }) {
@@ -1305,22 +1276,73 @@ async function getHumanReply({
   lastReplyHint,
   liveContext,
 }) {
-  // ALWAYS use Gemini Flash for chat replies
-  // Gemini sounds more human + faster than OpenAI here
+  // Reply routing:
+  // - If provider=openai -> reply with OpenAI (GPT feel)
+  // - If provider=gemini -> reply with Gemini
+  // - If provider=trinity -> default Gemini reply, fallback to OpenAI if Gemini fails
+  if (provider === "openai") {
+    const reply = await callOpenAIReply({
+      userText,
+      lxt1,
+      style: style || "human",
+      lastReplyHint,
+      liveContext,
+    });
 
-  const reply = await callGeminiReply({
-    userText,
-    lxt1,
-    style: "human",
-    lastReplyHint,
-    liveContext,
-  });
+    return {
+      reply,
+      replyProvider: "openai",
+      tried: ["openai"],
+    };
+  }
 
-  return {
-    reply,
-    replyProvider: "gemini_flash",
-    tried: ["gemini_flash"],
-  };
+  if (provider === "gemini") {
+    const reply = await callGeminiReply({
+      userText,
+      lxt1,
+      style: style || "human",
+      lastReplyHint,
+      liveContext,
+    });
+
+    return {
+      reply,
+      replyProvider: "gemini_flash",
+      tried: ["gemini_flash"],
+    };
+  }
+
+  // trinity default: Gemini reply, fallback OpenAI
+  try {
+    const reply = await callGeminiReply({
+      userText,
+      lxt1,
+      style: style || "human",
+      lastReplyHint,
+      liveContext,
+    });
+
+    return {
+      reply,
+      replyProvider: "gemini_flash",
+      tried: ["gemini_flash"],
+    };
+  } catch (e) {
+    const reply = await callOpenAIReply({
+      userText,
+      lxt1,
+      style: style || "human",
+      lastReplyHint,
+      liveContext,
+    });
+
+    return {
+      reply,
+      replyProvider: "openai_fallback",
+      tried: ["gemini_flash", "openai"],
+      _reply_error: String(e?.message || e),
+    };
+  }
 }
 
 /* ===================== CORE HANDLER ===================== */
