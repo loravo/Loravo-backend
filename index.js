@@ -419,9 +419,6 @@ function classifyIntent(text) {
 
   return "chat";
 }
-// real task / decision
-  return "decision";
-
 /* ===================== WEATHER ===================== */
 
 async function getWeather(lat, lon) {
@@ -942,7 +939,7 @@ NO extra text. JSON only.
   return sanitizeToSchema(obj);
 }
 
-async function callGeminiReply({ userText, lxt1, style, lastReplyHint }) {
+async function callGeminiReply({ userText, lxt1, style, lastReplyHint, liveContext }) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("Missing GEMINI_API_KEY");
 
@@ -1386,12 +1383,21 @@ async function runLXT({ req }) {
     };
 
     const reply = await callGeminiReply({
-      userText: text,
-      lxt1: lxt1ForChat,
-      style: style || "human",
-      lastReplyHint: state?.last_alert_hash ? "Rephrase; avoid repeating." : "",
-    });
-
+  userText: text,
+  lxt1: lxt1ForChat,
+  style: style || "human",
+  lastReplyHint: state?.last_alert_hash ? "Rephrase; avoid repeating." : "",
+  liveContext: {
+    weather,
+    location: {
+      lat: typeof lat === "number" ? lat : null,
+      lon: typeof lon === "number" ? lon : null,
+      city: state?.last_city || null,
+      country: state?.last_country || null,
+      timezone: state?.last_timezone || null,
+    },
+  },
+});
     await saveUserMemory(user_id, text);
 
     return {
