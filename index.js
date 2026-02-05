@@ -1189,7 +1189,6 @@ Return ONLY the reply text.
 
   const payload = {
     userText: String(userText || ""),
-    // keep LXT info available, but it's not a report
     lxt1: lxt1 || null,
     live_context: {
       weather: liveContext?.weather || null,
@@ -1204,8 +1203,6 @@ Return ONLY the reply text.
   );
 
   try {
-    // If user asks "powered by", we want a short, consistent branded answer.
-    // We let the model answer, but we keep it constrained by tokens + rules.
     const r = await fetch(
       "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
       {
@@ -1223,8 +1220,9 @@ Return ONLY the reply text.
           ],
           max_tokens: replyTokens,
           temperature: 0.62,
-          presence_penalty: 0.20,
-          frequency_penalty: 0.25,
+          // ❌ IMPORTANT: Gemini OpenAI-compat may reject these:
+          // presence_penalty: 0.20,
+          // frequency_penalty: 0.25,
         }),
       }
     );
@@ -1234,14 +1232,8 @@ Return ONLY the reply text.
 
     let reply = (j?.choices?.[0]?.message?.content || "").trim();
 
-    // If model ever gives a long “identity paragraph” for powered-by, clamp it.
     if (isPoweredByQuestion(userText)) {
-      // Keep it clean and branded.
-      // If you want it even stricter, just always return the one-liner below.
-      if (!reply.toLowerCase().includes("lxt")) {
-        reply = "Powered by LXT-1.";
-      }
-      // trim overly long responses
+      if (!reply.toLowerCase().includes("lxt")) reply = "Powered by LXT-1.";
       if (reply.length > 220) reply = "Powered by LXT-1.";
     }
 
@@ -1305,8 +1297,9 @@ Return ONLY plain text.
           ],
           max_tokens: 260,
           temperature: 0.55,
-          presence_penalty: 0.10,
-          frequency_penalty: 0.20,
+          // ❌ IMPORTANT: Gemini OpenAI-compat may reject these:
+          // presence_penalty: 0.10,
+          // frequency_penalty: 0.20,
         }),
       }
     );
