@@ -1749,7 +1749,7 @@ const weatherSignals = weatherRaw ? weatherToSignals(weatherRaw) : [];
 
   /* ===================== CHAT: human response ===================== */
   // If you want chat to feel best: keep it SINGLE-PASS (no decision->reply double call)
-if (intent === "chat") {
+  if (intent === "chat") {
     // Use the existing reply model, but give it useful live context in lxt1
     const lxt1ForChat = {
       verdict: "HOLD",
