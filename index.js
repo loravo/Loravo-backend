@@ -41,11 +41,13 @@ const fetch = require("node-fetch"); // node-fetch@2
 const { Pool } = require("pg");
 const crypto = require("crypto");
 const weatherRoute = require("./weather");
+const newsRoute = require("./news");
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(cors({ origin: "*" }));
 app.use("/", weatherRoute);
+app.use("/", newsRoute);
 
 /* ===================== CONFIG ===================== */
 
