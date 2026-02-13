@@ -1,137 +1,195 @@
-// news.js (CommonJS) — production-ready News route for Loravo
+// news.js (CommonJS) — Production-ready News route with CA fallback + images
+// Endpoint:
+//   GET /news?country=ca&pageSize=10
+//   GET /news?country=ca&q=calgary&pageSize=10
+//   GET /news?q=canada&pageSize=10
+//
+// Env:
+//   NEWSAPI_KEY=...
+
 const express = require("express");
 const fetch = require("node-fetch"); // node-fetch@2
 
 const router = express.Router();
 
+function clamp(n, a, b) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return a;
+  return Math.max(a, Math.min(b, x));
+}
+
+function clean(s) {
+  return String(s || "").trim();
+}
+
 function normalizeCountry(c) {
-  const s = String(c || "").trim().toLowerCase();
-  return s.length === 2 ? s : "";
+  const s = clean(c).toLowerCase();
+  if (!s) return null;
+  // NewsAPI expects 2-letter ISO (us, ca, gb, etc.)
+  if (s.length === 2) return s;
+  // allow "canada" / "united states" → map common ones
+  if (s === "canada") return "ca";
+  if (s === "united states" || s === "usa" || s === "america") return "us";
+  return s.slice(0, 2);
 }
 
-function pickRegionFromQuery(q) {
-  return {
-    country: normalizeCountry(q.country || q.cc || "us"),
-    city: q.city ? String(q.city).trim() : null,
-  };
+function mapArticles(arr) {
+  const list = Array.isArray(arr) ? arr : [];
+  return list
+    .map((a) => ({
+      title: clean(a?.title),
+      description: clean(a?.description) || clean(a?.content) || null,
+      url: clean(a?.url) || null,
+      image_url: clean(a?.urlToImage) || null,
+      source: clean(a?.source?.name) || "Unknown",
+      published_at: a?.publishedAt || null,
+    }))
+    .filter((a) => a.title && a.url);
 }
 
+async function fetchJson(url) {
+  const r = await fetch(url);
+  const j = await r.json().catch(() => null);
+  return { ok: r.ok, status: r.status, json: j, raw: r };
+}
+
+function buildTopHeadlinesUrl({ key, country, q, pageSize }) {
+  const params = new URLSearchParams();
+  if (country) params.set("country", country);
+  if (q) params.set("q", q);
+  params.set("pageSize", String(pageSize));
+  params.set("apiKey", key);
+  return `https://newsapi.org/v2/top-headlines?${params.toString()}`;
+}
+
+function buildEverythingUrl({ key, q, pageSize, language = "en", sortBy = "publishedAt" }) {
+  const params = new URLSearchParams();
+  params.set("q", q || "canada");
+  params.set("language", language);
+  params.set("sortBy", sortBy);
+  params.set("pageSize", String(pageSize));
+  params.set("apiKey", key);
+  return `https://newsapi.org/v2/everything?${params.toString()}`;
+}
+
+/**
+ * GET /news
+ * Query:
+ *  - country=ca|us|...
+ *  - city=Calgary (optional, used only to help q)
+ *  - q=canada (optional)
+ *  - pageSize=1..20
+ */
 router.get("/news", async (req, res) => {
   try {
-    const key = String(process.env.NEWSAPI_KEY || "").trim();
+    const key = clean(process.env.NEWSAPI_KEY);
     if (!key) {
-      return res.status(400).json({ ok: false, error: "Missing NEWSAPI_KEY on server" });
+      return res.status(400).json({ error: "Missing NEWSAPI_KEY on server" });
     }
 
-    const region = pickRegionFromQuery(req.query);
+    const country = normalizeCountry(req.query.country);
+    const city = clean(req.query.city) || null;
+    const qIn = clean(req.query.q) || null;
+    const pageSize = clamp(req.query.pageSize || 10, 1, 20);
 
-    const pageSize = Math.max(1, Math.min(Number(req.query.pageSize || 20), 50));
-    const category = req.query.category ? String(req.query.category).trim().toLowerCase() : "general";
-    const q = req.query.q ? String(req.query.q).trim() : "";
+    // If user passes a city but no q, we lightly use it as a query hint
+    const q = qIn || city || null;
 
-    async function callNewsApi(url) {
-      const r = await fetch(url);
-      const rawText = await r.text();
-      let j = null;
-      try { j = JSON.parse(rawText); } catch {}
-      return { ok: r.ok, status: r.status, json: j, rawText };
-    }
+    let provider = "newsapi";
+    let region = { country: country || null, city: city || null };
 
-    function cleanArticles(j) {
-      const articles = Array.isArray(j?.articles) ? j.articles : [];
-      return articles
-        .filter(a => a?.title && a?.url)
-        .map(a => ({
-          title: a.title,
-          description: a.description || "",
-          source: a.source?.name || "",
-          url: a.url,
-          image_url: a.urlToImage || null,
-          published_at: a.publishedAt || null,
-        }));
-    }
+    // 1) Primary: top-headlines
+    let url = buildTopHeadlinesUrl({ key, country, q, pageSize });
+    let { ok, status, json } = await fetchJson(url);
 
-    // 1) Default: top-headlines by country
-    const u1 = new URL("https://newsapi.org/v2/top-headlines");
-    u1.searchParams.set("apiKey", key);
-    u1.searchParams.set("country", region.country || "us");
-    u1.searchParams.set("pageSize", String(pageSize));
-    u1.searchParams.set("category", category);
-    u1.searchParams.set("language", "en");
-    if (q) u1.searchParams.set("q", q);
+    // Sometimes top-headlines returns ok but empty; normalize output
+    let total = Number(json?.totalResults || 0);
+    let articles = mapArticles(json?.articles);
 
-    let r1 = await callNewsApi(u1.toString());
-    if (!r1.ok) {
-      return res.status(r1.status).json({
+    // If request failed, surface the error cleanly
+    if (!ok) {
+      return res.status(502).json({
         ok: false,
-        provider: "newsapi",
-        region,
-        error: r1.json?.message || r1.rawText || `News API error ${r1.status}`,
+        provider,
+        error: `News provider error (${status})`,
+        detail: json || null,
       });
     }
 
-    let total = Number(r1.json?.totalResults || 0);
-    let articles = cleanArticles(r1.json);
+    // --- Canada fallback logic (CA often returns 0 on some accounts/regions) ---
+    if (total === 0 && String(country || "").toLowerCase() === "ca") {
+      // 2) Fallback A: US headlines filtered to Canada (reliable)
+      const url2 = buildTopHeadlinesUrl({
+        key,
+        country: "us",
+        q: q || "canada",
+        pageSize,
+      });
+      const r2 = await fetchJson(url2);
 
-    // 2) Fallback for Canada (some keys/plans return 0 for country=ca)
-    if ((region.country === "ca") && total === 0) {
-      const caSources = [
-        "cbc-news",
-        "the-globe-and-mail",
-        "financial-post",
-      ].join(",");
+      const total2 = Number(r2.json?.totalResults || 0);
+      const articles2 = mapArticles(r2.json?.articles);
 
-      const u2 = new URL("https://newsapi.org/v2/top-headlines");
-      u2.searchParams.set("apiKey", key);
-      u2.searchParams.set("sources", caSources);
-      u2.searchParams.set("pageSize", String(pageSize));
-      u2.searchParams.set("language", "en");
-      if (q) u2.searchParams.set("q", q);
+      if (r2.ok && total2 > 0 && articles2.length > 0) {
+        provider = "newsapi_fallback_us_q_canada";
+        total = total2;
+        articles = articles2;
+        region = { country: "ca", city: city || null };
+      } else {
+        // 3) Fallback B: everything endpoint (more coverage)
+        const url3 = buildEverythingUrl({
+          key,
+          q: q || "canada",
+          pageSize,
+          language: "en",
+          sortBy: "publishedAt",
+        });
+        const r3 = await fetchJson(url3);
 
-      const r2 = await callNewsApi(u2.toString());
-      if (r2.ok) {
-        const t2 = Number(r2.json?.totalResults || 0);
-        const a2 = cleanArticles(r2.json);
-        if (t2 > 0 && a2.length) {
-          total = t2;
-          articles = a2;
+        const total3 = Number(r3.json?.totalResults || 0);
+        const articles3 = mapArticles(r3.json?.articles);
+
+        if (r3.ok && total3 > 0 && articles3.length > 0) {
+          provider = "newsapi_fallback_everything";
+          total = total3;
+          articles = articles3;
+          region = { country: "ca", city: city || null };
         }
       }
     }
 
-    // 3) Final fallback: Everything search (always returns something)
-    if ((region.country === "ca") && total === 0) {
-      const u3 = new URL("https://newsapi.org/v2/everything");
-      u3.searchParams.set("apiKey", key);
-      u3.searchParams.set("pageSize", String(pageSize));
-      u3.searchParams.set("language", "en");
-      u3.searchParams.set("sortBy", "publishedAt");
+    // If still empty and user provided q, try everything as a universal fallback
+    if (articles.length === 0 && q) {
+      const url4 = buildEverythingUrl({
+        key,
+        q,
+        pageSize,
+        language: "en",
+        sortBy: "publishedAt",
+      });
+      const r4 = await fetchJson(url4);
 
-      const fallbackQuery =
-        q ||
-        'canada OR toronto OR vancouver OR calgary OR ottawa OR montreal OR alberta';
-      u3.searchParams.set("q", fallbackQuery);
+      const total4 = Number(r4.json?.totalResults || 0);
+      const articles4 = mapArticles(r4.json?.articles);
 
-      const r3 = await callNewsApi(u3.toString());
-      if (r3.ok) {
-        const t3 = Number(r3.json?.totalResults || 0);
-        const a3 = cleanArticles(r3.json);
-        if (t3 > 0 && a3.length) {
-          total = t3;
-          articles = a3;
-        }
+      if (r4.ok && total4 > 0 && articles4.length > 0) {
+        provider = provider + "_plus_everything";
+        total = total4;
+        articles = articles4;
       }
     }
 
     return res.json({
       ok: true,
-      provider: "newsapi",
+      provider,
       region,
-      total,
+      total: articles.length, // return actual list count (more useful than huge totals)
       articles,
       fetched_at: new Date().toISOString(),
     });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok: false, error: "server error", detail: String(e?.message || e) });
   }
 });
+
+module.exports = router;
