@@ -138,7 +138,11 @@ function verifyState(state) {
   }
 
   const expected = crypto.createHmac("sha256", STATE_SECRET).update(JSON.stringify(obj)).digest("hex");
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  } catch {
+    return null;
+  }
 
   // exp check
   if (obj?.exp && Date.now() > Number(obj.exp)) return null;
