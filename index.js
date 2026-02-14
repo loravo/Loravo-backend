@@ -38,6 +38,7 @@
 require("dotenv").config();
 
 const express = require("express");
+const path = require("path");
 const cors = require("cors");
 const fetch = require("node-fetch"); // node-fetch@2
 const { Pool } = require("pg");
@@ -66,6 +67,19 @@ app.use("/", newsRoute);
 // Mount Gmail routes under /gmail
 // Your ./Emails/gmail.js must export an express.Router()
 app.use("/gmail", gmailRoute);
+
+
+// ================= LEGAL PAGES =================
+app.use("/legal", express.static(path.join(__dirname, "public")));
+
+app.get("/privacy", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "privacy.html"));
+});
+
+app.get("/terms", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "terms.html"));
+});
+// ===============================================
 
 /* ===================== DB (OPTIONAL) ===================== */
 /**

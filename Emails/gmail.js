@@ -51,7 +51,6 @@ function isLocalDbUrl(url) {
   );
 }
 
-// Use Render DB if present; local can also work if URL set.
 const pool = DB_ENABLED
   ? new Pool({
       connectionString: DATABASE_URL,
@@ -86,7 +85,6 @@ async function initDbIfPossible() {
     console.error("⚠️ Gmail DB init failed (fallback to in-memory):", e?.message || e);
   }
 }
-// fire once
 initDbIfPossible().catch(() => {});
 
 /* ===================== HELPERS ===================== */
@@ -138,15 +136,9 @@ function verifyState(state) {
   }
 
   const expected = crypto.createHmac("sha256", STATE_SECRET).update(JSON.stringify(obj)).digest("hex");
-  try {
-    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-  } catch {
-    return null;
-  }
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
 
-  // exp check
   if (obj?.exp && Date.now() > Number(obj.exp)) return null;
-
   return obj;
 }
 
@@ -158,7 +150,6 @@ async function dbQuery(sql, params) {
 async function saveTokens(userId, tokens, email) {
   if (!userId || !tokens) return;
 
-  // If DB available: persist
   if (dbReady) {
     await dbQuery(
       `
@@ -174,7 +165,6 @@ async function saveTokens(userId, tokens, email) {
     return;
   }
 
-  // fallback in-memory
   memTokens.set(String(userId), { tokens, email: email || null, updated_at: new Date().toISOString() });
 }
 
@@ -214,14 +204,11 @@ async function getAuthedGmailClient(userId) {
   const oauth2 = makeOAuthClient();
   oauth2.setCredentials(record.tokens);
 
-  // googleapis will refresh access token automatically when refresh_token exists
-  // but it only updates in-memory; we persist if it changes:
   oauth2.on("tokens", async (newTokens) => {
     try {
       const merged = { ...(record.tokens || {}), ...(newTokens || {}) };
       await saveTokens(userId, merged, record.email || null);
     } catch (e) {
-      // never crash request
       console.error("⚠️ token refresh save failed:", e?.message || e);
     }
   });
@@ -245,19 +232,16 @@ function decodeBody(dataB64Url) {
 function extractTextPlain(payload) {
   if (!payload) return "";
 
-  // Direct body
   const mimeType = payload.mimeType || "";
   if (mimeType === "text/plain" && payload.body?.data) {
     return decodeBody(payload.body.data);
   }
 
-  // Walk parts
   const parts = payload.parts || [];
   for (const p of parts) {
     if (p?.mimeType === "text/plain" && p?.body?.data) return decodeBody(p.body.data);
   }
 
-  // If nested multipart
   for (const p of parts) {
     const nested = extractTextPlain(p);
     if (nested) return nested;
@@ -267,7 +251,6 @@ function extractTextPlain(payload) {
 }
 
 function buildRawEmail({ to, subject, text, from, inReplyTo, references }) {
-  // NOTE: Gmail API will set From based on authenticated account; you can omit from.
   const headers = [];
   headers.push(`To: ${to}`);
   if (from) headers.push(`From: ${from}`);
@@ -311,17 +294,19 @@ router.get("/auth-url", async (req, res) => {
 
     const oauth2 = makeOAuthClient();
 
-    // State protects user_id + CSRF + exp
     const state = signState({
       user_id: userId,
       nonce: crypto.randomBytes(12).toString("hex"),
-      exp: Date.now() + 10 * 60 * 1000, // 10 minutes
+      exp: Date.now() + 10 * 60 * 1000,
     });
 
     const url = oauth2.generateAuthUrl({
       access_type: "offline",
-      prompt: "consent", // ensures refresh_token on first connect
-      scope: ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"],
+      prompt: "consent",
+      scope: [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+      ],
       state,
     });
 
@@ -332,7 +317,6 @@ router.get("/auth-url", async (req, res) => {
 });
 
 // GET /gmail/oauth2callback?code=...&state=...
-// Put THIS exact URL in Google Cloud OAuth Redirect URIs (must match GOOGLE_REDIRECT_URI)
 router.get("/oauth2callback", async (req, res) => {
   try {
     const code = String(req.query.code || "").trim();
@@ -346,21 +330,18 @@ router.get("/oauth2callback", async (req, res) => {
 
     const oauth2 = makeOAuthClient();
     const { tokens } = await oauth2.getToken(code);
-
     if (!tokens) return res.status(500).send("No tokens returned");
 
     oauth2.setCredentials(tokens);
 
-    // Fetch the connected Gmail address
     const gmail = google.gmail({ version: "v1", auth: oauth2 });
     const profile = await gmail.users.getProfile({ userId: "me" });
     const email = profile?.data?.emailAddress || null;
 
     await saveTokens(userId, tokens, email);
 
-    // ✅ IMPORTANT: finish OAuth by redirecting back into the app so ASWebAuthenticationSession closes cleanly
-    // iOS expects a deep link matching callbackURLScheme: "loravo"
-    const deeplink = `loravo://gmail/connected?user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(
+    // ✅ IMPORTANT: host must match what your iOS app accepts (fixes "Unexpected callback host: gmail")
+    const deeplink = `loravo://connected?provider=gmail&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(
       email || ""
     )}`;
     return res.redirect(deeplink);
@@ -382,8 +363,6 @@ router.post("/disconnect", async (req, res) => {
 });
 
 // POST /gmail/list
-// body: { user_id, q?, maxResults? }
-// q examples: "newer_than:2d", "from:apple.com", "is:unread"
 router.post("/list", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -394,16 +373,10 @@ router.post("/list", async (req, res) => {
 
     const { gmail } = await getAuthedGmailClient(userId);
 
-    const list = await gmail.users.messages.list({
-      userId: "me",
-      q,
-      maxResults,
-    });
-
+    const list = await gmail.users.messages.list({ userId: "me", q, maxResults });
     const messages = list?.data?.messages || [];
     if (!messages.length) return res.json({ ok: true, q, emails: [] });
 
-    // Fetch metadata in batch-ish (parallel, small limit)
     const details = await Promise.all(
       messages.map((m) =>
         gmail.users.messages.get({
@@ -437,7 +410,6 @@ router.post("/list", async (req, res) => {
 });
 
 // POST /gmail/read
-// body: { user_id, id } (gmail message id)
 router.post("/read", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -447,11 +419,7 @@ router.post("/read", async (req, res) => {
 
     const { gmail } = await getAuthedGmailClient(userId);
 
-    const r = await gmail.users.messages.get({
-      userId: "me",
-      id,
-      format: "full",
-    });
+    const r = await gmail.users.messages.get({ userId: "me", id, format: "full" });
 
     const msg = r?.data || {};
     const headers = msg.payload?.headers || [];
@@ -479,7 +447,6 @@ router.post("/read", async (req, res) => {
 });
 
 // POST /gmail/send
-// body: { user_id, to, subject, body, threadId? }
 router.post("/send", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -511,14 +478,11 @@ router.post("/send", async (req, res) => {
 });
 
 // POST /gmail/reply
-// body: { user_id, id, body, replyAll? }
-// Replies inside the original thread and preserves Message-Id threading.
 router.post("/reply", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
     const id = String(req.body?.id || "").trim();
     const body = String(req.body?.body || "").trim();
-    const replyAll = Boolean(req.body?.replyAll);
 
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
@@ -526,12 +490,11 @@ router.post("/reply", async (req, res) => {
 
     const { gmail } = await getAuthedGmailClient(userId);
 
-    // Read original to get headers + thread
     const original = await gmail.users.messages.get({
       userId: "me",
       id,
       format: "metadata",
-      metadataHeaders: ["From", "To", "Cc", "Subject", "Message-Id", "References"],
+      metadataHeaders: ["From", "Subject", "Message-Id", "References"],
     });
 
     const msg = original?.data || {};
@@ -542,12 +505,8 @@ router.post("/reply", async (req, res) => {
     const messageId = pickHeader(headers, "Message-Id");
     const references0 = pickHeader(headers, "References");
 
-    // Default: reply to the original From
     const to = from || "";
     const references = references0 ? `${references0} ${messageId || ""}`.trim() : messageId || null;
-
-    // Keep replyAll for later if you want to add CC handling
-    void replyAll;
 
     const subject = /^re:/i.test(subject0) ? subject0 : `Re: ${subject0}`;
 
@@ -563,7 +522,7 @@ router.post("/reply", async (req, res) => {
       userId: "me",
       requestBody: {
         raw,
-        threadId: msg.threadId, // IMPORTANT: keeps it in the same thread
+        threadId: msg.threadId,
       },
     });
 
@@ -577,7 +536,5 @@ router.post("/reply", async (req, res) => {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
 });
-
-/* ===================== EXPORT ===================== */
 
 module.exports = router;
