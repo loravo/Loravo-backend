@@ -2,10 +2,12 @@
 // =====================================================
 // LORAVO — Gmail (single-file router)
 //
-// ✅ OAuth2 connect (auth-url + callback)
+// ✅ OAuth2 connect (auth + callback)
 // ✅ Stores tokens in Postgres if DATABASE_URL exists (Render) else in-memory fallback
 // ✅ Status, list, read, send, reply
-// ✅ Friendly GET routes for easy browser testing
+// ✅ Disconnect (GET + POST)
+// ✅ Browser success page + iOS deeplink option
+// ✅ Friendly GET routes for quick testing
 //
 // Mount in index.js:
 //   const gmail = require("./Emails/gmail");
@@ -19,7 +21,7 @@
 // Optional env:
 //   DATABASE_URL
 //   GMAIL_STATE_SECRET
-//   GMAIL_SUCCESS_WEB_URL (optional override; default uses your render host)
+//   GMAIL_SUCCESS_WEB_URL (default https://loravo-backend.onrender.com)
 // =====================================================
 
 require("dotenv").config();
@@ -43,10 +45,9 @@ const STATE_SECRET = String(process.env.GMAIL_STATE_SECRET || "loravo_state_secr
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const DB_ENABLED = Boolean(DATABASE_URL);
 
-// Optional: where to send browser users after connect
 const SUCCESS_WEB_BASE =
   String(process.env.GMAIL_SUCCESS_WEB_URL || "").trim() ||
-  "https://loravo-backend.onrender.com"; // change if you want onrender.com domain
+  "https://loravo-backend.onrender.com"; // set to your canonical backend URL
 
 function isLocalDbUrl(url) {
   if (!url) return true;
@@ -244,7 +245,6 @@ function decodeBody(dataB64Url) {
 
 function extractTextPlain(payload) {
   if (!payload) return "";
-
   const mimeType = payload.mimeType || "";
   if (mimeType === "text/plain" && payload.body?.data) return decodeBody(payload.body.data);
 
@@ -278,22 +278,33 @@ function buildRawEmail({ to, subject, text, from, inReplyTo, references }) {
 
 /* ===================== ROUTES ===================== */
 
-// Root for quick check
 router.get("/", (_, res) => {
   res.json({
     ok: true,
     service: "loravo-gmail-router",
     dbReady,
-    endpoints: ["/auth", "/auth-url", "/oauth2callback", "/connected", "/status", "/list", "/read", "/send", "/reply"],
+    endpoints: [
+      "/auth",
+      "/auth-url",
+      "/oauth2callback",
+      "/connected",
+      "/status",
+      "/disconnect",
+      "/list",
+      "/read",
+      "/send",
+      "/reply",
+    ],
   });
 });
 
-// ✅ Friendly alias so /gmail/auth works
-// GET /gmail/auth?user_id=...
+// GET /gmail/auth?user_id=...   (alias)
 router.get("/auth", (req, res) => {
   const userId = String(req.query.user_id || "").trim();
+  const mode = String(req.query.mode || "").trim(); // "app" or ""
   if (!userId) return res.status(400).send("Missing user_id");
-  return res.redirect(`/gmail/auth-url?user_id=${encodeURIComponent(userId)}`);
+  const extra = mode ? `&mode=${encodeURIComponent(mode)}` : "";
+  return res.redirect(`/gmail/auth-url?user_id=${encodeURIComponent(userId)}${extra}`);
 });
 
 // GET /gmail/status?user_id=...
@@ -315,18 +326,20 @@ router.get("/status", async (req, res) => {
   }
 });
 
-// GET /gmail/auth-url?user_id=...
+// GET /gmail/auth-url?user_id=...&mode=app?
 router.get("/auth-url", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
+    const mode = String(req.query.mode || "").trim(); // "app" for iOS deep link
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
 
     const oauth2 = makeOAuthClient();
 
     const state = signState({
       user_id: userId,
+      mode: mode || "",
       nonce: crypto.randomBytes(12).toString("hex"),
-      exp: Date.now() + 10 * 60 * 1000, // 10 mins
+      exp: Date.now() + 10 * 60 * 1000,
     });
 
     const url = oauth2.generateAuthUrl({
@@ -336,18 +349,17 @@ router.get("/auth-url", async (req, res) => {
       state,
     });
 
-    // If you open this in browser, it will redirect you automatically:
-    // /gmail/auth-url?user_id=123 -> returns JSON { url }
+    // For Xcode you should OPEN THIS URL in ASWebAuthenticationSession.
     res.json({ ok: true, url });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
 });
 
-// ✅ Web “success page” (browser-safe)
-// GET /gmail/connected?user_id=...&email=...
+// Browser success page: GET /gmail/connected?user_id=...&email=...
 router.get("/connected", (req, res) => {
   const email = String(req.query.email || "");
+  const userId = String(req.query.user_id || "");
   res.setHeader("Content-Type", "text/html");
   res.send(`
     <html>
@@ -363,9 +375,7 @@ router.get("/connected", (req, res) => {
           If you’re on iPhone, go back to Loravo. If Loravo didn’t open automatically, tap the button below.
         </p>
 
-        <a href="loravo://connected?provider=gmail&user_id=${encodeURIComponent(
-          String(req.query.user_id || "")
-        )}&email=${encodeURIComponent(email)}"
+        <a href="loravo://connected?provider=gmail&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(email)}"
            style="display:inline-block; padding:12px 16px; border-radius:12px; background:#111; color:#fff; text-decoration:none;">
           Open Loravo
         </a>
@@ -374,7 +384,7 @@ router.get("/connected", (req, res) => {
   `);
 });
 
-// GET /gmail/oauth2callback?code=...&state=...
+// OAuth callback: GET /gmail/oauth2callback?code=...&state=...
 router.get("/oauth2callback", async (req, res) => {
   try {
     const code = String(req.query.code || "").trim();
@@ -385,6 +395,7 @@ router.get("/oauth2callback", async (req, res) => {
     if (!state?.user_id) return res.status(400).send("Invalid state (expired or tampered)");
 
     const userId = String(state.user_id);
+    const mode = String(state.mode || "").trim(); // "app" -> deep link
 
     const oauth2 = makeOAuthClient();
     const { tokens } = await oauth2.getToken(code);
@@ -398,30 +409,42 @@ router.get("/oauth2callback", async (req, res) => {
 
     await saveTokens(userId, tokens, email);
 
-    // ✅ IMPORTANT:
-    // - iOS app can handle loravo:// (deeplink)
-    // - Mac/desktop Safari often cannot, so we also provide a browser success page.
-    //
-    // What we do:
-    // 1) Redirect to /gmail/connected which shows “✅ Connected” + has an "Open Loravo" button
-    // 2) That page contains the deeplink the user can tap on iPhone
-    //
-    // If you want to deeplink directly (only iOS), swap to: return res.redirect(deeplink);
+    // ✅ If mode=app, deep link directly back to iOS (best for auto-close)
+    if (mode === "app") {
+      const deeplink = `loravo://connected?provider=gmail&user_id=${encodeURIComponent(
+        userId
+      )}&email=${encodeURIComponent(email || "")}`;
+      return res.redirect(deeplink);
+    }
 
+    // ✅ Otherwise show browser success page (good for desktop testing)
     const successPage = `${SUCCESS_WEB_BASE}/gmail/connected?user_id=${encodeURIComponent(
       userId
     )}&email=${encodeURIComponent(email || "")}`;
-
     return res.redirect(successPage);
   } catch (e) {
     res.status(e?.status || 500).send(`OAuth error: ${String(e?.message || e)}`);
   }
 });
 
+/* ===================== DISCONNECT ===================== */
+
 // POST /gmail/disconnect  { user_id }
 router.post("/disconnect", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
+    if (!userId) return res.status(400).json({ error: "Missing user_id" });
+    await clearTokens(userId);
+    res.json({ ok: true, disconnected: true });
+  } catch (e) {
+    res.status(e?.status || 500).json({ error: String(e?.message || e) });
+  }
+});
+
+// GET /gmail/disconnect?user_id=...   (easy testing)
+router.get("/disconnect", async (req, res) => {
+  try {
+    const userId = String(req.query.user_id || "").trim();
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     await clearTokens(userId);
     res.json({ ok: true, disconnected: true });
@@ -590,66 +613,35 @@ router.post("/reply", async (req, res) => {
 });
 
 /* ===================== EASY TEST ROUTES (GET) ===================== */
-// These simply wrap the POST routes so you can test in browser quickly.
 
 // GET /gmail/list?user_id=...&q=...&maxResults=...
 router.get("/list", async (req, res) => {
-  try {
-    const userId = String(req.query.user_id || "").trim();
-    if (!userId) return res.status(400).json({ error: "Missing user_id" });
-
-    const q = req.query.q ? String(req.query.q) : "newer_than:2d";
-    const maxResults = req.query.maxResults ? Number(req.query.maxResults) : 10;
-
-    // call POST handler logic directly
-    req.body = { user_id: userId, q, maxResults };
-    return router.stack.find((r) => r.route?.path === "/list" && r.route?.methods?.post).route.stack[0].handle(
-      req,
-      res
-    );
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
+  req.body = {
+    user_id: String(req.query.user_id || "").trim(),
+    q: req.query.q ? String(req.query.q) : "newer_than:2d",
+    maxResults: req.query.maxResults ? Number(req.query.maxResults) : 10,
+  };
+  return router.handle(Object.assign(req, { method: "POST", url: "/list" }), res);
 });
 
 // GET /gmail/read?user_id=...&id=...
 router.get("/read", async (req, res) => {
-  try {
-    const userId = String(req.query.user_id || "").trim();
-    const id = String(req.query.id || "").trim();
-    if (!userId) return res.status(400).json({ error: "Missing user_id" });
-    if (!id) return res.status(400).json({ error: "Missing id" });
-
-    req.body = { user_id: userId, id };
-    return router.stack.find((r) => r.route?.path === "/read" && r.route?.methods?.post).route.stack[0].handle(
-      req,
-      res
-    );
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
+  req.body = {
+    user_id: String(req.query.user_id || "").trim(),
+    id: String(req.query.id || "").trim(),
+  };
+  return router.handle(Object.assign(req, { method: "POST", url: "/read" }), res);
 });
 
 // GET /gmail/send?user_id=...&to=...&subject=...&body=...
 router.get("/send", async (req, res) => {
-  try {
-    const userId = String(req.query.user_id || "").trim();
-    const to = String(req.query.to || "").trim();
-    const subject = String(req.query.subject || "").trim();
-    const body = String(req.query.body || "").trim();
-
-    if (!userId) return res.status(400).json({ error: "Missing user_id" });
-    if (!to) return res.status(400).json({ error: "Missing to" });
-    if (!body) return res.status(400).json({ error: "Missing body" });
-
-    req.body = { user_id: userId, to, subject, body };
-    return router.stack.find((r) => r.route?.path === "/send" && r.route?.methods?.post).route.stack[0].handle(
-      req,
-      res
-    );
-  } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
-  }
+  req.body = {
+    user_id: String(req.query.user_id || "").trim(),
+    to: String(req.query.to || "").trim(),
+    subject: String(req.query.subject || "").trim(),
+    body: String(req.query.body || "").trim(),
+  };
+  return router.handle(Object.assign(req, { method: "POST", url: "/send" }), res);
 });
 
 module.exports = router;
