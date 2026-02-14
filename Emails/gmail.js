@@ -2,11 +2,12 @@
 // =====================================================
 // LORAVO — Gmail (single-file router)
 //
-// ✅ OAuth2 connect (auth + callback)
+// ✅ OAuth2 connect (auth-url + callback)
 // ✅ Stores tokens in Postgres if DATABASE_URL exists (Render) else in-memory fallback
 // ✅ Status, list, read, send, reply
 // ✅ Disconnect (GET + POST)
-// ✅ Browser success page + iOS deeplink option
+// ✅ iOS auto-close: mode=app -> redirects to loravo://connected (no success page)
+// ✅ Browser success page (for desktop/manual testing)
 // ✅ Friendly GET routes for quick testing
 //
 // Mount in index.js:
@@ -47,7 +48,7 @@ const DB_ENABLED = Boolean(DATABASE_URL);
 
 const SUCCESS_WEB_BASE =
   String(process.env.GMAIL_SUCCESS_WEB_URL || "").trim() ||
-  "https://loravo-backend.onrender.com"; // set to your canonical backend URL
+  "https://loravo-backend.onrender.com"; // canonical backend URL
 
 function isLocalDbUrl(url) {
   if (!url) return true;
@@ -218,6 +219,7 @@ async function getAuthedGmailClient(userId) {
   const oauth2 = makeOAuthClient();
   oauth2.setCredentials(record.tokens);
 
+  // Persist refreshed tokens
   oauth2.on("tokens", async (newTokens) => {
     try {
       const merged = { ...(record.tokens || {}), ...(newTokens || {}) };
@@ -298,7 +300,7 @@ router.get("/", (_, res) => {
   });
 });
 
-// GET /gmail/auth?user_id=...   (alias)
+// GET /gmail/auth?user_id=...&mode=app?
 router.get("/auth", (req, res) => {
   const userId = String(req.query.user_id || "").trim();
   const mode = String(req.query.mode || "").trim(); // "app" or ""
@@ -330,7 +332,7 @@ router.get("/status", async (req, res) => {
 router.get("/auth-url", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
-    const mode = String(req.query.mode || "").trim(); // "app" for iOS deep link
+    const mode = String(req.query.mode || "").trim(); // "app" for iOS auto-close
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
 
     const oauth2 = makeOAuthClient();
@@ -339,7 +341,7 @@ router.get("/auth-url", async (req, res) => {
       user_id: userId,
       mode: mode || "",
       nonce: crypto.randomBytes(12).toString("hex"),
-      exp: Date.now() + 10 * 60 * 1000,
+      exp: Date.now() + 10 * 60 * 1000, // 10 min
     });
 
     const url = oauth2.generateAuthUrl({
@@ -349,7 +351,6 @@ router.get("/auth-url", async (req, res) => {
       state,
     });
 
-    // For Xcode you should OPEN THIS URL in ASWebAuthenticationSession.
     res.json({ ok: true, url });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
@@ -409,15 +410,16 @@ router.get("/oauth2callback", async (req, res) => {
 
     await saveTokens(userId, tokens, email);
 
-    // ✅ If mode=app, deep link directly back to iOS (best for auto-close)
+    // ✅ iOS auto-close path:
+    // If your app requested /gmail/auth-url?mode=app then we return a deeplink.
     if (mode === "app") {
-      const deeplink =
-  `loravo://connected?provider=gmail&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(email || "")}`;
-
-return res.redirect(deeplink);
+      const deeplink = `loravo://connected?provider=gmail&user_id=${encodeURIComponent(
+        userId
+      )}&email=${encodeURIComponent(email || "")}`;
+      return res.redirect(deeplink);
     }
 
-    // ✅ Otherwise show browser success page (good for desktop testing)
+    // ✅ Desktop/manual testing path:
     const successPage = `${SUCCESS_WEB_BASE}/gmail/connected?user_id=${encodeURIComponent(
       userId
     )}&email=${encodeURIComponent(email || "")}`;
@@ -616,32 +618,53 @@ router.post("/reply", async (req, res) => {
 
 // GET /gmail/list?user_id=...&q=...&maxResults=...
 router.get("/list", async (req, res) => {
-  req.body = {
-    user_id: String(req.query.user_id || "").trim(),
-    q: req.query.q ? String(req.query.q) : "newer_than:2d",
-    maxResults: req.query.maxResults ? Number(req.query.maxResults) : 10,
-  };
-  return router.handle(Object.assign(req, { method: "POST", url: "/list" }), res);
+  try {
+    const userId = String(req.query.user_id || "").trim();
+    if (!userId) return res.status(400).json({ error: "Missing user_id" });
+
+    const q = req.query.q ? String(req.query.q) : "newer_than:2d";
+    const maxResults = req.query.maxResults ? Number(req.query.maxResults) : 10;
+
+    // Call the POST handler
+    req.body = { user_id: userId, q, maxResults };
+    return router.handle(Object.assign(req, { method: "POST", url: "/list" }), res);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
 // GET /gmail/read?user_id=...&id=...
 router.get("/read", async (req, res) => {
-  req.body = {
-    user_id: String(req.query.user_id || "").trim(),
-    id: String(req.query.id || "").trim(),
-  };
-  return router.handle(Object.assign(req, { method: "POST", url: "/read" }), res);
+  try {
+    const userId = String(req.query.user_id || "").trim();
+    const id = String(req.query.id || "").trim();
+    if (!userId) return res.status(400).json({ error: "Missing user_id" });
+    if (!id) return res.status(400).json({ error: "Missing id" });
+
+    req.body = { user_id: userId, id };
+    return router.handle(Object.assign(req, { method: "POST", url: "/read" }), res);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
 // GET /gmail/send?user_id=...&to=...&subject=...&body=...
 router.get("/send", async (req, res) => {
-  req.body = {
-    user_id: String(req.query.user_id || "").trim(),
-    to: String(req.query.to || "").trim(),
-    subject: String(req.query.subject || "").trim(),
-    body: String(req.query.body || "").trim(),
-  };
-  return router.handle(Object.assign(req, { method: "POST", url: "/send" }), res);
+  try {
+    const userId = String(req.query.user_id || "").trim();
+    const to = String(req.query.to || "").trim();
+    const subject = String(req.query.subject || "").trim();
+    const body = String(req.query.body || "").trim();
+
+    if (!userId) return res.status(400).json({ error: "Missing user_id" });
+    if (!to) return res.status(400).json({ error: "Missing to" });
+    if (!body) return res.status(400).json({ error: "Missing body" });
+
+    req.body = { user_id: userId, to, subject, body };
+    return router.handle(Object.assign(req, { method: "POST", url: "/send" }), res);
+  } catch (e) {
+    res.status(500).json({ error: String(e?.message || e) });
+  }
 });
 
 module.exports = router;
