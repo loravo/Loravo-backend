@@ -1,9 +1,11 @@
 // Emails/gmail.js
 // =====================================================
 // LORAVO — Gmail (single-file router)
+//
 // ✅ OAuth2 connect (auth-url + callback)
 // ✅ Stores tokens in Postgres if DATABASE_URL exists (Render) else in-memory fallback
 // ✅ List recent emails, read email, send email, reply to email
+// ✅ Adds friendly GET routes for easy browser/terminal testing
 //
 // Mount in index.js:
 //   const gmail = require("./Emails/gmail");
@@ -13,6 +15,7 @@
 //   GOOGLE_CLIENT_ID
 //   GOOGLE_CLIENT_SECRET
 //   GOOGLE_REDIRECT_URI   (must match Google Cloud OAuth redirect URI exactly)
+//
 // Optional env:
 //   DATABASE_URL          (Render Postgres URL)
 //   GMAIL_STATE_SECRET    (any random string; recommended)
@@ -136,7 +139,11 @@ function verifyState(state) {
   }
 
   const expected = crypto.createHmac("sha256", STATE_SECRET).update(JSON.stringify(obj)).digest("hex");
-  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  try {
+    if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  } catch {
+    return null;
+  }
 
   if (obj?.exp && Date.now() > Number(obj.exp)) return null;
   return obj;
@@ -196,7 +203,7 @@ async function clearTokens(userId) {
 async function getAuthedGmailClient(userId) {
   const record = await loadTokens(userId);
   if (!record?.tokens) {
-    const err = new Error("Gmail not connected for this user_id. Call /gmail/auth-url first.");
+    const err = new Error("Gmail not connected for this user_id. Call /gmail/auth (or /gmail/auth-url) first.");
     err.status = 401;
     throw err;
   }
@@ -204,6 +211,7 @@ async function getAuthedGmailClient(userId) {
   const oauth2 = makeOAuthClient();
   oauth2.setCredentials(record.tokens);
 
+  // Persist refreshed tokens
   oauth2.on("tokens", async (newTokens) => {
     try {
       const merged = { ...(record.tokens || {}), ...(newTokens || {}) };
@@ -233,9 +241,7 @@ function extractTextPlain(payload) {
   if (!payload) return "";
 
   const mimeType = payload.mimeType || "";
-  if (mimeType === "text/plain" && payload.body?.data) {
-    return decodeBody(payload.body.data);
-  }
+  if (mimeType === "text/plain" && payload.body?.data) return decodeBody(payload.body.data);
 
   const parts = payload.parts || [];
   for (const p of parts) {
@@ -267,6 +273,13 @@ function buildRawEmail({ to, subject, text, from, inReplyTo, references }) {
 
 /* ===================== ROUTES ===================== */
 
+// ✅ Friendly alias so /gmail/auth works (fixes your “Cannot GET /gmail/auth”)
+router.get("/auth", (req, res) => {
+  const userId = String(req.query.user_id || "").trim();
+  if (!userId) return res.status(400).send("Missing user_id");
+  return res.redirect(`/gmail/auth-url?user_id=${encodeURIComponent(userId)}`);
+});
+
 // GET /gmail/status?user_id=...
 router.get("/status", async (req, res) => {
   try {
@@ -297,16 +310,13 @@ router.get("/auth-url", async (req, res) => {
     const state = signState({
       user_id: userId,
       nonce: crypto.randomBytes(12).toString("hex"),
-      exp: Date.now() + 10 * 60 * 1000,
+      exp: Date.now() + 10 * 60 * 1000, // 10 mins
     });
 
     const url = oauth2.generateAuthUrl({
       access_type: "offline",
       prompt: "consent",
-      scope: [
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.send",
-      ],
+      scope: ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"],
       state,
     });
 
@@ -340,7 +350,7 @@ router.get("/oauth2callback", async (req, res) => {
 
     await saveTokens(userId, tokens, email);
 
-    // ✅ IMPORTANT: host must match what your iOS app accepts (fixes "Unexpected callback host: gmail")
+    // ✅ Deep link back to iOS app (you already fixed host issue)
     const deeplink = `loravo://connected?provider=gmail&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(
       email || ""
     )}`;
@@ -362,7 +372,9 @@ router.post("/disconnect", async (req, res) => {
   }
 });
 
-// POST /gmail/list
+/* ===================== API (POST) ===================== */
+
+// POST /gmail/list  body: { user_id, q?, maxResults? }
 router.post("/list", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -409,7 +421,7 @@ router.post("/list", async (req, res) => {
   }
 });
 
-// POST /gmail/read
+// POST /gmail/read  body: { user_id, id }
 router.post("/read", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -446,7 +458,7 @@ router.post("/read", async (req, res) => {
   }
 });
 
-// POST /gmail/send
+// POST /gmail/send  body: { user_id, to, subject, body, threadId? }
 router.post("/send", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -465,10 +477,7 @@ router.post("/send", async (req, res) => {
 
     const sent = await gmail.users.messages.send({
       userId: "me",
-      requestBody: {
-        raw,
-        ...(threadId ? { threadId } : {}),
-      },
+      requestBody: { raw, ...(threadId ? { threadId } : {}) },
     });
 
     res.json({ ok: true, id: sent?.data?.id || null, threadId: sent?.data?.threadId || threadId || null });
@@ -477,7 +486,7 @@ router.post("/send", async (req, res) => {
   }
 });
 
-// POST /gmail/reply
+// POST /gmail/reply  body: { user_id, id, body }
 router.post("/reply", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -510,20 +519,11 @@ router.post("/reply", async (req, res) => {
 
     const subject = /^re:/i.test(subject0) ? subject0 : `Re: ${subject0}`;
 
-    const raw = buildRawEmail({
-      to,
-      subject,
-      text: body,
-      inReplyTo: messageId || null,
-      references: references || null,
-    });
+    const raw = buildRawEmail({ to, subject, text: body, inReplyTo: messageId || null, references });
 
     const sent = await gmail.users.messages.send({
       userId: "me",
-      requestBody: {
-        raw,
-        threadId: msg.threadId,
-      },
+      requestBody: { raw, threadId: msg.threadId },
     });
 
     res.json({
@@ -535,6 +535,33 @@ router.post("/reply", async (req, res) => {
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
+});
+
+/* ===================== EASY TEST ROUTES (GET) ===================== */
+/* These call your POST handlers so you can test quickly from browser/terminal */
+
+router.get("/list", async (req, res) => {
+  req.body = {
+    user_id: String(req.query.user_id || ""),
+    q: req.query.q ? String(req.query.q) : undefined,
+    maxResults: req.query.maxResults ? Number(req.query.maxResults) : undefined,
+  };
+  return router.handle({ ...req, method: "POST", url: "/list" }, res);
+});
+
+router.get("/read", async (req, res) => {
+  req.body = { user_id: String(req.query.user_id || ""), id: String(req.query.id || "") };
+  return router.handle({ ...req, method: "POST", url: "/read" }, res);
+});
+
+router.get("/send", async (req, res) => {
+  req.body = {
+    user_id: String(req.query.user_id || ""),
+    to: String(req.query.to || ""),
+    subject: String(req.query.subject || ""),
+    body: String(req.query.body || ""),
+  };
+  return router.handle({ ...req, method: "POST", url: "/send" }, res);
 });
 
 module.exports = router;
