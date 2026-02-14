@@ -1,8 +1,9 @@
 /*************************************************
  * LORAVO – Backend (HTTP + DB + Stay-Ahead Alerts + Push + Quiet Hours)
  *
- * ✅ Uses LXT.js for /chat + /lxt1 (AI brain is now isolated in LXT.js)
+ * ✅ Uses /services/LXT.js for /chat + /lxt1 (AI brain isolated)
  * ✅ index.js keeps: DB, state/location/weather/news ingest, alert queue, push, prefs
+ * ✅ NEW: Gmail (OAuth) routes mounted from /Emails/gmail.js
  *
  * Endpoints:
  *  - GET  /                -> basic root
@@ -26,6 +27,9 @@
  *  - POST /prefs/quiet-hours
  *  - GET  /prefs
  *
+ * Gmail (OAuth v1):
+ *  - (mounted) /gmail/*     -> handled by ./Emails/gmail.js (you create these routes)
+ *
  * Query params (for LXT.js):
  *  - provider=openai | gemini | trinity   (default: trinity)
  *  - mode=instant | auto | thinking       (default: auto)
@@ -40,18 +44,28 @@ const { Pool } = require("pg");
 const crypto = require("crypto");
 const http2 = require("http2");
 
-// routes you already had
-const weatherRoute = require("./weather");
-const newsRoute = require("./news");
+// ✅ MOVED: routes live in /services now
+const weatherRoute = require("./services/weather");
+const newsRoute = require("./services/news");
 
-// ✅ NEW: LXT engine (AI brain)
-const { createLXT } = require("./LXT"); // file: LXT.js (exporting createLXT)
+// ✅ Gmail routes (IMPORTANT: case-sensitive on Render/Linux)
+// Must be EXACT file path: Emails/gmail.js
+const gmailRoute = require("./Emails/gmail");
+
+// ✅ MOVED: LXT engine lives in /services now
+const { createLXT } = require("./services/LXT"); // file: /services/LXT.js
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(cors({ origin: "*" }));
+
+// Mount route modules
 app.use("/", weatherRoute);
 app.use("/", newsRoute);
+
+// Mount Gmail routes under /gmail
+// Your ./Emails/gmail.js must export an express.Router()
+app.use("/gmail", gmailRoute);
 
 /* ===================== DB (OPTIONAL) ===================== */
 /**
@@ -808,6 +822,7 @@ app.get("/", (_, res) => {
       "/push/send-test",
       "/prefs/quiet-hours",
       "/prefs",
+      "/gmail/*",
     ],
   });
 });
@@ -839,7 +854,9 @@ app.post("/chat", async (req, res) => {
       reply: result.reply,
       lxt1: result.lxt1, // may be null for chat_fast/news_fast paths (by design)
       _providers: result.providers,
-      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply ? { _errors: result._errors } : {}),
+      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply
+        ? { _errors: result._errors }
+        : {}),
     });
   } catch (e) {
     res.status(500).json({ error: "server error", detail: String(e?.message || e) });
@@ -848,10 +865,6 @@ app.post("/chat", async (req, res) => {
 
 /* ===================== STAY-AHEAD ENDPOINTS ===================== */
 
-/**
- * POST /state/location
- * Body: { user_id, lat, lon, city?, country?, timezone? }
- */
 app.post("/state/location", async (req, res) => {
   try {
     const { user_id, lat, lon, city, country, timezone } = req.body || {};
@@ -869,10 +882,6 @@ app.post("/state/location", async (req, res) => {
   }
 });
 
-/**
- * POST /state/weather
- * Body: { user_id, lat, lon }
- */
 app.post("/state/weather", async (req, res) => {
   try {
     const { user_id, lat, lon } = req.body || {};
@@ -888,9 +897,6 @@ app.post("/state/weather", async (req, res) => {
   }
 });
 
-/**
- * GET /poll?user_id=...&limit=5
- */
 app.get("/poll", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "");
@@ -904,9 +910,6 @@ app.get("/poll", async (req, res) => {
   }
 });
 
-/**
- * GET /history?user_id=...&limit=50&offset=0
- */
 app.get("/history", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "");
@@ -922,10 +925,6 @@ app.get("/history", async (req, res) => {
   }
 });
 
-/**
- * POST /trip/set
- * Body: { user_id, active, destination?, depart_at?, notes? }
- */
 app.post("/trip/set", async (req, res) => {
   try {
     const { user_id, active, destination, depart_at, notes } = req.body || {};
@@ -969,10 +968,6 @@ app.post("/trip/set", async (req, res) => {
   }
 });
 
-/**
- * POST /news/ingest
- * Body: { user_id, title, summary, region?, severity?, action? }
- */
 app.post("/news/ingest", async (req, res) => {
   try {
     const { user_id, title, summary, region, severity, action } = req.body || {};
@@ -1020,10 +1015,6 @@ app.post("/news/ingest", async (req, res) => {
 
 /* ===================== PUSH ENDPOINTS ===================== */
 
-/**
- * POST /push/register
- * Body: { user_id, device_token, environment }
- */
 app.post("/push/register", async (req, res) => {
   try {
     const { user_id, device_token, environment } = req.body || {};
@@ -1047,10 +1038,6 @@ app.post("/push/register", async (req, res) => {
   }
 });
 
-/**
- * POST /push/send-test
- * Body: { user_id, environment?, title?, body, payload?, force? }
- */
 app.post("/push/send-test", async (req, res) => {
   try {
     const { user_id, environment, title, body, payload, force } = req.body || {};
@@ -1095,10 +1082,6 @@ app.post("/push/send-test", async (req, res) => {
 
 /* ===================== PREFS ENDPOINTS ===================== */
 
-/**
- * POST /prefs/quiet-hours
- * Body: { user_id, enabled, start, end, timezone? }
- */
 app.post("/prefs/quiet-hours", async (req, res) => {
   try {
     const { user_id, enabled, start, end, timezone } = req.body || {};
@@ -1129,9 +1112,6 @@ app.post("/prefs/quiet-hours", async (req, res) => {
   }
 });
 
-/**
- * GET /prefs?user_id=...
- */
 app.get("/prefs", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "");

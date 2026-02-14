@@ -3,21 +3,14 @@
  * ✅ No Express routes here.
  * ✅ index.js wires HTTP endpoints + DB + push + routes.
  *
- * Exports:
- *   const { createLXT } = require("./LXT");
- *   const lxt = createLXT({ pool, getDbReady: () => dbReady });
- *   const result = await lxt.runLXT({ req }); // { reply, lxt1, providers, ... }
- *
- * What this engine does:
- * - Intent routing: greeting | news | weather | chat | decision
- * - Live context: weather (lat/lon OR "weather in City"), news (ingested news_events)
- * - LXT-1 decision JSON (OpenAI schema-first, Gemini fallback)
- * - Human reply text (Gemini default, OpenAI fallback)
- * - /lxt1 safety: supports `forceDecision` so you can guarantee lxt1 JSON always
+ * Gmail integration:
+ * ✅ Reads OAuth tokens from DB (gmail_tokens)
+ * ✅ Uses Gmail API directly (fast)
  *************************************************/
 
 const fetch = require("node-fetch"); // node-fetch@2
 const crypto = require("crypto");
+const { google } = require("googleapis");
 
 /* ===================== FACTORY ===================== */
 
@@ -180,6 +173,15 @@ function createLXT({ pool, getDbReady }) {
     return { controller, cancel: () => clearTimeout(t) };
   }
 
+  function stripHtml(s) {
+    return String(s || "")
+      .replace(/<style[\s\S]*?>[\s\S]*?<\/style>/gi, "")
+      .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, "")
+      .replace(/<\/?[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   /* ===================== INTENT ===================== */
 
   function classifyIntent(text) {
@@ -189,6 +191,15 @@ function createLXT({ pool, getDbReady }) {
     if (/(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t))
       return "news";
     if (/(weather|temperature|temp\b|forecast|rain|snow|wind)/.test(t)) return "weather";
+
+    // ✅ Gmail / email intent
+    if (
+      /(gmail|email|inbox|unread|important email|summari[sz]e.*email|summari[sz]e.*inbox|reply to.*email|send.*email|check.*email|new emails)/.test(
+        t
+      )
+    )
+      return "email";
+
     return "chat";
   }
 
@@ -272,6 +283,217 @@ function createLXT({ pool, getDbReady }) {
       [userId, limit]
     );
     return rows || [];
+  }
+
+  /* ===================== GMAIL (FAST, DIRECT) ===================== */
+
+  async function loadGmailRecord(userId) {
+    if (!userId) return null;
+    const { rows } = await dbQuery(
+      `SELECT user_id, email, tokens, updated_at FROM gmail_tokens WHERE user_id=$1 LIMIT 1`,
+      [String(userId)]
+    );
+    return rows?.[0] || null;
+  }
+
+  function requireGmailEnv() {
+    const CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim();
+    const CLIENT_SECRET = String(process.env.GOOGLE_CLIENT_SECRET || "").trim();
+    const REDIRECT_URI = String(process.env.GOOGLE_REDIRECT_URI || "").trim();
+    if (!CLIENT_ID || !CLIENT_SECRET || !REDIRECT_URI) {
+      throw new Error("Missing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET / GOOGLE_REDIRECT_URI");
+    }
+    return { CLIENT_ID, CLIENT_SECRET, REDIRECT_URI };
+  }
+
+  async function getAuthedGmail(userId) {
+    const rec = await loadGmailRecord(userId);
+    if (!rec?.tokens) {
+      const err = new Error("Gmail not connected. Connect Gmail first.");
+      err.status = 401;
+      throw err;
+    }
+
+    const { CLIENT_ID, CLIENT_SECRET, REDIRECT_URI } = requireGmailEnv();
+    const oauth2 = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+
+    // pg might return object already; or string
+    const tokens = typeof rec.tokens === "string" ? JSON.parse(rec.tokens) : rec.tokens;
+    oauth2.setCredentials(tokens);
+
+    // auto-save refreshed tokens
+    oauth2.on("tokens", async (newTokens) => {
+      try {
+        const merged = { ...(tokens || {}), ...(newTokens || {}) };
+        await dbQuery(`UPDATE gmail_tokens SET tokens=$2, updated_at=NOW() WHERE user_id=$1`, [
+          String(userId),
+          merged,
+        ]);
+      } catch {
+        // ignore
+      }
+    });
+
+    return google.gmail({ version: "v1", auth: oauth2 });
+  }
+
+  async function gmailList({ userId, q, max = 6 }) {
+    const gmail = await getAuthedGmail(userId);
+
+    const list = await gmail.users.messages.list({
+      userId: "me",
+      q: q || "newer_than:2d",
+      maxResults: Math.max(1, Math.min(Number(max || 6), 12)),
+    });
+
+    const ids = (list.data.messages || []).map((m) => m.id).filter(Boolean);
+    if (!ids.length) return [];
+
+    // Fetch metadata only (FAST)
+    const out = [];
+    for (const id of ids) {
+      const msg = await gmail.users.messages.get({
+        userId: "me",
+        id,
+        format: "metadata",
+        metadataHeaders: ["From", "To", "Subject", "Date"],
+      });
+
+      const headers = msg.data.payload?.headers || [];
+      const getH = (name) => headers.find((h) => String(h.name).toLowerCase() === name.toLowerCase())?.value || "";
+
+      out.push({
+        id,
+        threadId: msg.data.threadId || null,
+        subject: getH("Subject"),
+        from: getH("From"),
+        date: getH("Date"),
+        snippet: stripHtml(msg.data.snippet || ""),
+      });
+    }
+
+    return out;
+  }
+
+  async function gmailGetBody({ userId, messageId }) {
+    const gmail = await getAuthedGmail(userId);
+
+    const msg = await gmail.users.messages.get({
+      userId: "me",
+      id: String(messageId),
+      format: "full",
+    });
+
+    // best-effort extract plain content
+    function findText(payload) {
+      if (!payload) return "";
+      const mime = payload.mimeType || "";
+      const data = payload.body?.data || null;
+      if (data && (mime.includes("text/plain") || mime.includes("text/html"))) {
+        const buff = Buffer.from(data.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+        const text = buff.toString("utf8");
+        return mime.includes("text/html") ? stripHtml(text) : String(text || "").trim();
+      }
+      const parts = payload.parts || [];
+      for (const p of parts) {
+        const got = findText(p);
+        if (got) return got;
+      }
+      return "";
+    }
+
+    const headers = msg.data.payload?.headers || [];
+    const getH = (name) => headers.find((h) => String(h.name).toLowerCase() === name.toLowerCase())?.value || "";
+
+    return {
+      id: msg.data.id,
+      threadId: msg.data.threadId || null,
+      subject: getH("Subject"),
+      from: getH("From"),
+      date: getH("Date"),
+      body: findText(msg.data.payload) || stripHtml(msg.data.snippet || ""),
+    };
+  }
+
+  async function gmailSend({ userId, to, subject, body, threadId = null }) {
+    const gmail = await getAuthedGmail(userId);
+
+    const raw = [
+      `To: ${to}`,
+      `Subject: ${subject || ""}`,
+      "MIME-Version: 1.0",
+      "Content-Type: text/plain; charset=utf-8",
+      "",
+      String(body || ""),
+    ].join("\r\n");
+
+    const encodedMessage = Buffer.from(raw)
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+
+    const resp = await gmail.users.messages.send({
+      userId: "me",
+      requestBody: threadId ? { raw: encodedMessage, threadId } : { raw: encodedMessage },
+    });
+
+    return { id: resp.data.id || null, threadId: resp.data.threadId || null };
+  }
+
+  function parseEmailCommand(userText) {
+    const t = String(userText || "").trim();
+
+    const lower = t.toLowerCase();
+
+    // send email to X subject Y body Z
+    const sendMatch =
+      t.match(/send (an )?email to\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i) ||
+      t.match(/email\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i);
+
+    if (sendMatch) {
+      const to = sendMatch[2] || sendMatch[1];
+      const subject = (sendMatch[3] || sendMatch[2] || "").trim();
+      const body = (sendMatch[4] || sendMatch[3] || "").trim();
+      return { kind: "send", to, subject, body };
+    }
+
+    // reply latest email: ...
+    const replyLatest = t.match(/reply to (the )?(latest|last) email[:\-]?\s*([\s\S]+)/i);
+    if (replyLatest) {
+      return { kind: "reply_latest", body: String(replyLatest[3] || "").trim() };
+    }
+
+    // reply to message id XXX: ...
+    const replyId = t.match(/reply to (message )?id\s+([a-zA-Z0-9_\-]+)[:\-]?\s*([\s\S]+)/i);
+    if (replyId) {
+      return { kind: "reply_id", messageId: String(replyId[2] || "").trim(), body: String(replyId[3] || "").trim() };
+    }
+
+    // summarize inbox / emails
+    if (/(summari[sz]e).*(inbox|emails|email)/i.test(t)) return { kind: "summarize" };
+
+    // new important emails / important emails / unread
+    if (/(important|urgent).*(email|emails)|new important emails|unread emails|check my inbox/i.test(lower)) {
+      return { kind: "important" };
+    }
+
+    // search my email for ___
+    const search = t.match(/search (my )?(email|gmail|inbox) for\s+([\s\S]+)/i);
+    if (search) return { kind: "search", query: String(search[3] || "").trim() };
+
+    return { kind: "unknown" };
+  }
+
+  function formatEmailList(items) {
+    if (!items?.length) return "No emails found.";
+    const lines = items.slice(0, 6).map((m, i) => {
+      const subj = m.subject ? m.subject : "(no subject)";
+      const from = m.from ? m.from : "(unknown sender)";
+      const snip = m.snippet ? ` — ${m.snippet.slice(0, 120)}` : "";
+      return `${i + 1}) ${subj}\n   From: ${from}\n   id: ${m.id}${snip}`;
+    });
+    return lines.join("\n");
   }
 
   /* ===================== WEATHER / GEO ===================== */
@@ -370,7 +592,7 @@ function createLXT({ pool, getDbReady }) {
     const desc = w.description || w.main || null;
 
     if (temp != null && desc) parts.push(`${temp}°C and ${desc}.`);
-    else if (temp != null) parts.push(`${temp}°C right now.`);
+    else if (temp !=null) parts.push(`${temp}°C right now.`);
     else if (desc) parts.push(`${desc}.`);
 
     if (feels != null && temp != null && feels !== temp) parts.push(`Feels like ${feels}°C.`);
@@ -382,7 +604,6 @@ function createLXT({ pool, getDbReady }) {
     const weather = liveContext.weather || null;
     const weather_geo = liveContext.weather_geo || null;
 
-    // keep this small to avoid token waste + hallucination risk
     const news = Array.isArray(liveContext.news)
       ? liveContext.news.slice(0, 5).map((n) => ({
           title: n?.title || "",
@@ -421,12 +642,10 @@ function createLXT({ pool, getDbReady }) {
     let weatherRaw = null;
     let weatherGeo = null;
 
-    // A) if app provides lat/lon -> use it
     if (typeof lat === "number" && typeof lon === "number") {
       weatherRaw = await getWeather(lat, lon);
       weatherGeo = { lat, lon };
     } else {
-      // B) if user asked “weather in City” -> geocode -> fetch
       if (isWeatherQuestion(text)) {
         const city = extractCityFromWeatherText(text);
         if (city) {
@@ -442,9 +661,9 @@ function createLXT({ pool, getDbReady }) {
     const news = userId ? await getRecentNewsForUser(userId, 5) : [];
 
     return {
-      weather_raw: weatherRaw, // internal (for signals); not sent to models
+      weather_raw: weatherRaw,
       weather: normalizeWeatherForLLM(weatherRaw),
-      weather_geo: weatherGeo, // {lat,lon,name,country} OR null
+      weather_geo: weatherGeo,
       news: Array.isArray(news) ? news : [],
     };
   }
@@ -678,7 +897,6 @@ Rules:
 
     const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
 
-    // hard override
     if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
 
     const replyTokens = pickReplyTokens(userText);
@@ -892,7 +1110,6 @@ Return ONLY the reply text.
       return { lxt1, decisionProvider: "gemini", tried };
     }
 
-    // trinity
     try {
       tried.push("openai");
       const lxt1 = await callOpenAIDecisionWithRetry({ text, memory, liveContextCompact, maxTokens });
@@ -925,7 +1142,6 @@ Return ONLY the reply text.
       return { reply, replyProvider: "gemini_flash", tried: ["gemini_flash"] };
     }
 
-    // trinity: gemini first, fallback openai
     try {
       const reply = await callGeminiReply({ userText, lxt1, style, lastReplyHint, liveContext });
       return { reply, replyProvider: "gemini_flash", tried: ["gemini_flash"] };
@@ -941,11 +1157,7 @@ Return ONLY the reply text.
   }
 
   /* ===================== MAIN ENGINE: runLXT ===================== */
-  /**
-   * Options:
-   * - forceDecision: boolean (use this for /lxt1 endpoint so lxt1 is NEVER null)
-   * - forceIntent: "chat"|"weather"|"news"|"greeting"|"decision"
-   */
+
   async function runLXT({ req, forceDecision = false, forceIntent = null }) {
     const provider = getProvider(req);
     let mode = getMode(req);
@@ -955,21 +1167,17 @@ Return ONLY the reply text.
 
     const userId = String(user_id || "").trim() || null;
 
-    // load saved context
     const [state, memory] = await Promise.all([
       userId ? loadUserState(userId) : Promise.resolve(null),
       userId ? loadUserMemory(userId) : Promise.resolve(""),
     ]);
 
-    // intent
     let intent = classifyIntent(text);
     if (forceIntent) intent = String(forceIntent);
 
-    // auto mode
     if (mode === "auto") mode = pickAutoMode(text);
     const maxTokens = TOKEN_LIMITS[mode] || TOKEN_LIMITS.auto;
 
-    // live context (weather/news)
     const liveContext = await buildLiveContext({
       userId,
       text,
@@ -978,11 +1186,8 @@ Return ONLY the reply text.
     });
 
     const liveCompact = compactLiveContextForDecision(liveContext);
-
-    // weather signals (from raw weather only)
     const weatherSignals = weatherToSignalsFromRaw(liveContext?.weather_raw);
 
-    // hard override: powered by
     if (isPoweredByQuestion(text)) {
       if (userId) await saveUserMemory(userId, text);
       return {
@@ -1007,8 +1212,286 @@ Return ONLY the reply text.
       };
     }
 
-    // if caller demands lxt1 JSON always (your /lxt1 endpoint)
     if (forceDecision) intent = "decision";
+
+    /* ===================== EMAIL FAST PATH (GMAIL) ===================== */
+    if (intent === "email" && !forceDecision) {
+      if (!userId) {
+        return {
+          provider: "loravo_gmail",
+          mode: "instant",
+          reply: "To use Gmail, I need your user_id (the same one you connected Gmail with).",
+          lxt1: null,
+          providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+          _errors: {},
+        };
+      }
+
+      const cmd = parseEmailCommand(text);
+
+      try {
+        // IMPORTANT/UNREAD
+        if (cmd.kind === "important") {
+          const items = await gmailList({
+            userId,
+            q: "newer_than:7d (is:unread OR category:primary)",
+            max: 6,
+          });
+
+          const reply =
+            items.length === 0
+              ? "No unread/important emails in the last 7 days."
+              : `Here are your top unread/important emails:\n\n${formatEmailList(items)}\n\nTell me: “summarize #1” or “reply to latest email: …”`;
+
+          if (userId) await saveUserMemory(userId, text);
+
+          return {
+            provider: "loravo_gmail",
+            mode: "instant",
+            reply,
+            lxt1: null,
+            providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+            _errors: {},
+          };
+        }
+
+        // SUMMARIZE
+        if (cmd.kind === "summarize") {
+          const items = await gmailList({
+            userId,
+            q: "newer_than:7d",
+            max: 6,
+          });
+
+          if (!items.length) {
+            if (userId) await saveUserMemory(userId, text);
+            return {
+              provider: "loravo_gmail",
+              mode: "instant",
+              reply: "No emails found in the last 7 days.",
+              lxt1: null,
+              providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+              _errors: {},
+            };
+          }
+
+          const compact = items.map((m, i) => ({
+            n: i + 1,
+            id: m.id,
+            subject: m.subject,
+            from: m.from,
+            snippet: m.snippet,
+            date: m.date,
+          }));
+
+          // Use Gemini reply model just for a short summary (still fast)
+          const summary = await callGeminiReply({
+            userText: `Summarize these emails into 3–6 short bullets. Highlight anything urgent.\n\n${JSON.stringify(compact)}`,
+            lxt1: { verdict: "HOLD", confidence: 0.8, one_liner: "Inbox summary.", signals: [], actions: [], watchouts: [], next_check: safeNowPlus(6 * 60 * 60 * 1000) },
+            style: "human",
+            lastReplyHint: "",
+            liveContext: {},
+          });
+
+          if (userId) await saveUserMemory(userId, text);
+
+          return {
+            provider: "loravo_gmail",
+            mode: "instant",
+            reply: summary,
+            lxt1: null,
+            providers: { decision: "gmail_fast", reply: "gemini_summary", triedDecision: ["gmail_fast"], triedReply: ["gemini_summary"] },
+            _errors: {},
+          };
+        }
+
+        // SEARCH
+        if (cmd.kind === "search") {
+          const query = cmd.query || "";
+          const items = await gmailList({
+            userId,
+            q: query ? `newer_than:180d ${query}` : "newer_than:30d",
+            max: 6,
+          });
+
+          const reply =
+            items.length === 0
+              ? `No matches for: "${query}".`
+              : `Top matches:\n\n${formatEmailList(items)}\n\nIf you want, say: “open id <id>” or “reply to id <id>: …”`;
+
+          if (userId) await saveUserMemory(userId, text);
+
+          return {
+            provider: "loravo_gmail",
+            mode: "instant",
+            reply,
+            lxt1: null,
+            providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+            _errors: {},
+          };
+        }
+
+        // SEND
+        if (cmd.kind === "send") {
+          if (!cmd.to || !cmd.body) {
+            return {
+              provider: "loravo_gmail",
+              mode: "instant",
+              reply: 'Send format: `send email to someone@email.com subject Your subject body Your message`',
+              lxt1: null,
+              providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+              _errors: {},
+            };
+          }
+
+          const sent = await gmailSend({
+            userId,
+            to: cmd.to,
+            subject: cmd.subject || "Loravo",
+            body: cmd.body,
+          });
+
+          if (userId) await saveUserMemory(userId, text);
+
+          return {
+            provider: "loravo_gmail",
+            mode: "instant",
+            reply: `Sent. ✅\nMessage id: ${sent.id}`,
+            lxt1: null,
+            providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+            _errors: {},
+          };
+        }
+
+        // REPLY LATEST
+        if (cmd.kind === "reply_latest") {
+          const latest = await gmailList({ userId, q: "newer_than:30d", max: 1 });
+          if (!latest.length) {
+            return {
+              provider: "loravo_gmail",
+              mode: "instant",
+              reply: "No recent email to reply to.",
+              lxt1: null,
+              providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+              _errors: {},
+            };
+          }
+
+          const full = await gmailGetBody({ userId, messageId: latest[0].id });
+
+          // Best effort: extract reply-to email from From header
+          const from = full.from || "";
+          const m = from.match(/<([^>]+)>/) || from.match(/([^\s]+@[^\s]+)/);
+          const to = m ? (m[1] || m[0]) : null;
+
+          if (!to) {
+            return {
+              provider: "loravo_gmail",
+              mode: "instant",
+              reply: `I couldn't detect the sender email. Here is the From header:\n${from}`,
+              lxt1: null,
+              providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+              _errors: {},
+            };
+          }
+
+          const subject = full.subject?.startsWith("Re:") ? full.subject : `Re: ${full.subject || ""}`;
+
+          const sent = await gmailSend({
+            userId,
+            to,
+            subject,
+            body: cmd.body || "",
+            threadId: full.threadId || null,
+          });
+
+          if (userId) await saveUserMemory(userId, text);
+
+          return {
+            provider: "loravo_gmail",
+            mode: "instant",
+            reply: `Replied. ✅\nTo: ${to}\nMessage id: ${sent.id}`,
+            lxt1: null,
+            providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+            _errors: {},
+          };
+        }
+
+        // REPLY ID
+        if (cmd.kind === "reply_id") {
+          const full = await gmailGetBody({ userId, messageId: cmd.messageId });
+
+          const from = full.from || "";
+          const m = from.match(/<([^>]+)>/) || from.match(/([^\s]+@[^\s]+)/);
+          const to = m ? (m[1] || m[0]) : null;
+
+          if (!to) {
+            return {
+              provider: "loravo_gmail",
+              mode: "instant",
+              reply: `I couldn't detect the sender email. From:\n${from}`,
+              lxt1: null,
+              providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+              _errors: {},
+            };
+          }
+
+          const subject = full.subject?.startsWith("Re:") ? full.subject : `Re: ${full.subject || ""}`;
+
+          const sent = await gmailSend({
+            userId,
+            to,
+            subject,
+            body: cmd.body || "",
+            threadId: full.threadId || null,
+          });
+
+          if (userId) await saveUserMemory(userId, text);
+
+          return {
+            provider: "loravo_gmail",
+            mode: "instant",
+            reply: `Replied. ✅\nTo: ${to}\nMessage id: ${sent.id}`,
+            lxt1: null,
+            providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+            _errors: {},
+          };
+        }
+
+        // unknown email command
+        const hint =
+          "Tell me what you want:\n" +
+          "- “new important emails”\n" +
+          "- “summarize my inbox”\n" +
+          "- “search my email for paypal”\n" +
+          "- “send email to a@b.com subject Hi body Hello…”\n" +
+          "- “reply to latest email: …”";
+
+        if (userId) await saveUserMemory(userId, text);
+
+        return {
+          provider: "loravo_gmail",
+          mode: "instant",
+          reply: hint,
+          lxt1: null,
+          providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+          _errors: {},
+        };
+      } catch (e) {
+        const msg = String(e?.message || e);
+        if (userId) await saveUserMemory(userId, text);
+        return {
+          provider: "loravo_gmail",
+          mode: "instant",
+          reply: msg.includes("not connected")
+            ? "Gmail isn’t connected for this user_id yet. Connect Gmail first, then try again."
+            : `Email error: ${msg}`,
+          lxt1: null,
+          providers: { decision: "gmail_fast", reply: "gmail_fast", triedDecision: ["gmail_fast"], triedReply: ["gmail_fast"] },
+          _errors: { gmail: msg },
+        };
+      }
+    }
 
     /* ===================== NEWS FAST PATH ===================== */
     if (intent === "news" && !forceDecision) {
@@ -1056,7 +1539,6 @@ Return ONLY the reply text.
 
     /* ===================== WEATHER FAST PATH (REAL WEATHER) ===================== */
     if (intent === "weather" && !forceDecision) {
-      // If we have weather, answer directly (no model call needed)
       if (liveContext?.weather) {
         const one = formatWeatherOneLiner(liveContext.weather, liveContext?.weather_geo?.name || null);
         const reply = one || "I have your weather context. Do you want current conditions or the next 24 hours?";
@@ -1078,7 +1560,6 @@ Return ONLY the reply text.
         };
       }
 
-      // If we don't have weather yet, ask ONE short question
       const city = extractCityFromWeatherText(text);
       const ask = city
         ? `I can pull it — do you want current conditions in ${city}, or the next 24 hours?`
@@ -1158,12 +1639,9 @@ Return ONLY the reply text.
     });
 
     let lxt1 = decision.lxt1 || safeFallbackResult("Temporary issue—retry.");
-
-    // merge in trusted signals we already know (weather)
     const mergedSignals = Array.isArray(lxt1.signals) ? lxt1.signals : [];
     lxt1.signals = [...weatherSignals, ...mergedSignals].slice(0, 12);
 
-    // If they asked weather and we have it, force the one_liner to the real one.
     const askedWeather = isWeatherQuestion(text);
     const weatherOne = askedWeather ? formatWeatherOneLiner(liveContext?.weather, liveContext?.weather_geo?.name || null) : null;
 
@@ -1177,7 +1655,6 @@ Return ONLY the reply text.
 
     const lastReplyHint = state?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "";
 
-    // If caller only wants lxt1 JSON (like /lxt1), skip reply generation
     if (forceDecision) {
       return {
         provider,
@@ -1239,8 +1716,6 @@ Return ONLY the reply text.
 
   return {
     runLXT,
-
-    // optional for unit tests / debugging
     _internals: {
       classifyIntent,
       pickAutoMode,
