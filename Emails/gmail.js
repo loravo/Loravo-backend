@@ -354,7 +354,7 @@ router.get("/oauth2callback", async (req, res) => {
     const deeplink = `loravo://connected?provider=gmail&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(
       email || ""
     )}`;
-    return res.redirect(deeplink);
+    return res.send("Gmail connected successfully");
   } catch (e) {
     res.status(e?.status || 500).send(`OAuth error: ${String(e?.message || e)}`);
   }
