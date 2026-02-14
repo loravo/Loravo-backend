@@ -411,10 +411,10 @@ router.get("/oauth2callback", async (req, res) => {
 
     // ✅ If mode=app, deep link directly back to iOS (best for auto-close)
     if (mode === "app") {
-      const deeplink = `loravo://connected?provider=gmail&user_id=${encodeURIComponent(
-        userId
-      )}&email=${encodeURIComponent(email || "")}`;
-      return res.redirect(deeplink);
+      const deeplink =
+  `loravo://connected?provider=gmail&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(email || "")}`;
+
+return res.redirect(deeplink);
     }
 
     // ✅ Otherwise show browser success page (good for desktop testing)
