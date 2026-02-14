@@ -178,9 +178,10 @@ async function loadTokens(userId) {
   if (!userId) return null;
 
   if (dbReady) {
-    const { rows } = await dbQuery(`SELECT user_id, email, tokens, updated_at FROM gmail_tokens WHERE user_id=$1 LIMIT 1`, [
-      String(userId),
-    ]);
+    const { rows } = await dbQuery(
+      `SELECT user_id, email, tokens, updated_at FROM gmail_tokens WHERE user_id=$1 LIMIT 1`,
+      [String(userId)]
+    );
     return rows?.[0] || null;
   }
 
@@ -316,10 +317,7 @@ router.get("/auth-url", async (req, res) => {
     const url = oauth2.generateAuthUrl({
       access_type: "offline",
       prompt: "consent", // ensures refresh_token on first connect
-      scope: [
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/gmail.send",
-      ],
+      scope: ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"],
       state,
     });
 
@@ -356,17 +354,12 @@ router.get("/oauth2callback", async (req, res) => {
 
     await saveTokens(userId, tokens, email);
 
-    // Nice simple page
-    res
-      .status(200)
-      .send(
-        `<html><body style="font-family: -apple-system, system-ui; padding: 24px;">
-          <h2>✅ Gmail connected</h2>
-          <p>User: <b>${userId}</b></p>
-          <p>Email: <b>${email || "unknown"}</b></p>
-          <p>You can close this tab and return to Loravo.</p>
-        </body></html>`
-      );
+    // ✅ IMPORTANT: finish OAuth by redirecting back into the app so ASWebAuthenticationSession closes cleanly
+    // iOS expects a deep link matching callbackURLScheme: "loravo"
+    const deeplink = `loravo://gmail/connected?user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(
+      email || ""
+    )}`;
+    return res.redirect(deeplink);
   } catch (e) {
     res.status(e?.status || 500).send(`OAuth error: ${String(e?.message || e)}`);
   }
@@ -541,27 +534,19 @@ router.post("/reply", async (req, res) => {
     const headers = msg.payload?.headers || [];
 
     const from = pickHeader(headers, "From");
-    const toHeader = pickHeader(headers, "To");
-    const ccHeader = pickHeader(headers, "Cc");
     const subject0 = pickHeader(headers, "Subject") || "";
     const messageId = pickHeader(headers, "Message-Id");
     const references0 = pickHeader(headers, "References");
 
-    // Determine reply recipient(s)
-    // - Default: reply to the original From
-    // - ReplyAll: include To + Cc + From (best-effort; Gmail may dedupe)
-    let to = from || "";
-    let references = references0 ? `${references0} ${messageId || ""}`.trim() : (messageId || null);
+    // Default: reply to the original From
+    const to = from || "";
+    const references = references0 ? `${references0} ${messageId || ""}`.trim() : messageId || null;
 
-    if (replyAll) {
-      // Keep simple: reply-to From, and include original To/Cc in body headers via raw headers (To/Cc)
-      // We'll set To = From and add CC = original To + Cc
-      // (This avoids accidentally emailing yourself or weird parsing)
-    }
+    // Keep replyAll for later if you want to add CC handling
+    void replyAll;
 
     const subject = /^re:/i.test(subject0) ? subject0 : `Re: ${subject0}`;
 
-    // Build raw
     const raw = buildRawEmail({
       to,
       subject,
