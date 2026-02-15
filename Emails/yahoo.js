@@ -6,8 +6,7 @@
 // ✅ Stores tokens in Postgres user_state (Render DATABASE_URL)
 // ✅ Status, list, read, send, reply
 // ✅ Disconnect (GET + POST)
-// ✅ iOS auto-close: mode=app -> redirects to loravo://connected (no success page)
-// ✅ Browser success page (for desktop/manual testing)
+// ✅ iOS auto-close: mode=app -> redirects to loravo://connected
 //
 // Mount in index.js:
 //   const yahoo = require("./Emails/yahoo");
@@ -22,7 +21,7 @@
 //   DATABASE_URL
 //   YAHOO_STATE_SECRET
 //   YAHOO_SUCCESS_WEB_URL (default https://loravo-backend.onrender.com)
-//   YAHOO_SCOPES (default: "openid profile email")
+//   YAHOO_SCOPES (default: "openid profile email mail-r mail-w")
 //
 // Required npm deps:
 //   npm i imap mailparser nodemailer
@@ -49,7 +48,11 @@ const CLIENT_SECRET = String(process.env.YAHOO_CLIENT_SECRET || "").trim();
 const REDIRECT_URI = String(process.env.YAHOO_REDIRECT_URI || "").trim();
 
 const STATE_SECRET = String(process.env.YAHOO_STATE_SECRET || "loravo_yahoo_state_secret_change_me").trim();
-const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email").trim();
+
+// ✅ IMPORTANT: include Yahoo Mail scopes (IMAP/SMTP) so inbox actually works
+// - mail-r = read mail (IMAP)
+// - mail-w = send/modify mail (SMTP / future actions)
+const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email mail-r mail-w").trim();
 
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const DB_ENABLED = Boolean(DATABASE_URL);
@@ -435,15 +438,15 @@ router.get("/auth-url", async (req, res) => {
       exp: Date.now() + 10 * 60 * 1000,
     });
 
-       const params = new URLSearchParams();
+    const params = new URLSearchParams();
     params.set("client_id", CLIENT_ID);
     params.set("redirect_uri", REDIRECT_URI);
     params.set("response_type", "code");
     params.set("state", state);
-    params.set("language", "en-us"); // optional but matches Yahoo doc
+    params.set("language", "en-us");
 
-    // ❌ REMOVE this line if you have it:
-    // params.set("scope", SCOPES);
+    // ✅ REQUIRED: request the mail scopes so IMAP/SMTP work
+    params.set("scope", SCOPES);
 
     // ✅ IMPORTANT: helps ensure refresh_token is issued
     params.set("prompt", "consent");
@@ -515,13 +518,15 @@ router.get("/oauth2callback", async (req, res) => {
 
     const text = await resp.text();
     let tokenJson = null;
-    try { tokenJson = JSON.parse(text); } catch {}
+    try {
+      tokenJson = JSON.parse(text);
+    } catch {}
 
     if (!resp.ok || !tokenJson?.access_token) {
       return res.status(500).send(`Yahoo OAuth token exchange failed (${resp.status}): ${text}`);
     }
 
-    // ✅ IMPORTANT: fetch the user's email via OIDC userinfo
+    // ✅ fetch the user's email via OIDC userinfo
     let emailGuess = null;
     try {
       const u = await fetch(YAHOO_USERINFO_URL, {
@@ -529,7 +534,9 @@ router.get("/oauth2callback", async (req, res) => {
       });
       const uText = await u.text();
       let userinfo = null;
-      try { userinfo = JSON.parse(uText); } catch {}
+      try {
+        userinfo = JSON.parse(uText);
+      } catch {}
       emailGuess = userinfo?.email || null;
     } catch (e) {
       console.warn("Yahoo userinfo fetch failed:", e?.message || e);
@@ -538,9 +545,9 @@ router.get("/oauth2callback", async (req, res) => {
     await saveYahooTokens(userId, tokenJson, emailGuess);
 
     if (mode === "app") {
-      const deeplink = `loravo://connected?provider=yahoo&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(
-        emailGuess || ""
-      )}`;
+      const deeplink = `loravo://connected?provider=yahoo&user_id=${encodeURIComponent(
+        userId
+      )}&email=${encodeURIComponent(emailGuess || "")}`;
       return res.redirect(deeplink);
     }
 
@@ -613,7 +620,6 @@ router.get("/list", async (req, res) => {
 
           const total = box.messages.total || 0;
 
-          // ✅ FIX: empty inbox -> don't fetch 1:0
           if (!total || total <= 0) {
             imap.end();
             return resolve();
@@ -624,7 +630,7 @@ router.get("/list", async (req, res) => {
 
           const f = imap.fetch(range, {
             bodies: "HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID REFERENCES IN-REPLY-TO)",
-            struct: false,
+            struct: true, // ✅ so attrs.flags exists
           });
 
           f.on("message", (msg) => {
@@ -646,7 +652,11 @@ router.get("/list", async (req, res) => {
               const dateStr = parseHeaderValue(headerBuf, "Date");
               const messageId = parseHeaderValue(headerBuf, "Message-Id");
 
+              const flags = attrs?.flags || [];
+              const isUnread = !flags.includes("\\Seen");
+
               emailsOut.push({
+                provider: "yahoo",
                 id: String(attrs?.uid || ""),
                 threadId: null,
                 from: from || "",
@@ -655,6 +665,8 @@ router.get("/list", async (req, res) => {
                 date: dateStr || "",
                 messageId: messageId || "",
                 snippet: "",
+                isUnread,
+                labelIds: [], // Gmail-style labels not available in Yahoo IMAP in the same way
               });
             });
           });
@@ -730,6 +742,7 @@ router.get("/read", async (req, res) => {
     res.json({
       ok: true,
       email: {
+        provider: "yahoo",
         id,
         threadId: null,
         from: parsed.from?.text || "",
@@ -784,7 +797,7 @@ router.get("/send", async (req, res) => {
       text: body,
     });
 
-    res.json({ ok: true, id: info?.messageId || null, threadId: null });
+    res.json({ ok: true, provider: "yahoo", id: info?.messageId || null, threadId: null });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
@@ -844,7 +857,7 @@ router.get("/reply", async (req, res) => {
       },
     });
 
-    res.json({ ok: true, id: info?.messageId || null, threadId: null });
+    res.json({ ok: true, provider: "yahoo", id: info?.messageId || null, threadId: null });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
