@@ -59,11 +59,11 @@ const SUCCESS_WEB_BASE =
   "https://loravo-backend.onrender.com";
 
 // Yahoo OAuth endpoints
-// Auth guide: https://developer.yahoo.com/oauth2/guide/  [oai_citation:2‡Yahoo Developer](https://developer.yahoo.com/oauth2/guide/?utm_source=chatgpt.com)
 const YAHOO_AUTH_URL = "https://api.login.yahoo.com/oauth2/request_auth";
 const YAHOO_TOKEN_URL = "https://api.login.yahoo.com/oauth2/get_token";
+const YAHOO_USERINFO_URL = "https://api.login.yahoo.com/openid/v1/userinfo";
 
-// Yahoo Mail servers (IMAP/SMTP)  [oai_citation:3‡WIRED](https://www.wired.com/story/how-to-delete-yahoo-account?utm_source=chatgpt.com)
+// Yahoo Mail servers (IMAP/SMTP)
 const YAHOO_IMAP_HOST = "imap.mail.yahoo.com";
 const YAHOO_IMAP_PORT = 993;
 const YAHOO_SMTP_HOST = "smtp.mail.yahoo.com";
@@ -98,8 +98,6 @@ async function initDbIfPossible() {
     return;
   }
   try {
-    // Ensure user_state exists and has yahoo columns (you already added columns)
-    // We do NOT create user_state; we assume your backend already has it.
     await pool.query("SELECT 1");
     dbReady = true;
   } catch (e) {
@@ -172,7 +170,6 @@ async function dbQuery(sql, params) {
 
 async function ensureUserStateRow(userId) {
   if (!dbReady) return;
-  // user_state has PK user_id, but row might not exist yet
   await dbQuery(
     `INSERT INTO user_state (user_id) VALUES ($1)
      ON CONFLICT (user_id) DO NOTHING`,
@@ -207,14 +204,7 @@ async function saveYahooTokens(userId, tokenResponse, emailGuess) {
       updated_at = NOW()
     WHERE user_id = $1
     `,
-    [
-      String(userId),
-      true,
-      emailGuess || null,
-      accessToken,
-      refreshToken,
-      expiresAt,
-    ]
+    [String(userId), true, emailGuess || null, accessToken, refreshToken, expiresAt]
   );
 }
 
@@ -268,7 +258,6 @@ async function refreshYahooAccessToken(refreshToken) {
     throw err;
   }
 
-  // Yahoo token endpoint expects application/x-www-form-urlencoded + Basic auth
   const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
 
   const body = new URLSearchParams();
@@ -287,7 +276,9 @@ async function refreshYahooAccessToken(refreshToken) {
 
   const text = await resp.text();
   let json = null;
-  try { json = JSON.parse(text); } catch {}
+  try {
+    json = JSON.parse(text);
+  } catch {}
 
   if (!resp.ok) {
     const msg = `Yahoo token refresh failed (${resp.status}): ${text}`;
@@ -308,7 +299,7 @@ async function getValidYahooAccessToken(userId) {
   }
 
   const exp = rec.yahoo_token_expires_at ? new Date(rec.yahoo_token_expires_at).getTime() : 0;
-  const needsRefresh = exp && (Date.now() > (exp - 60_000)); // refresh 60s early
+  const needsRefresh = exp && Date.now() > exp - 60_000;
 
   if (!needsRefresh) {
     return {
@@ -340,7 +331,6 @@ async function getValidYahooAccessToken(userId) {
 /* ===================== IMAP/SMTP HELPERS ===================== */
 
 function buildXOAuth2(user, accessToken) {
-  // XOAUTH2 format: base64("user=<email>\x01auth=Bearer <token>\x01\x01")
   const s = `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`;
   return Buffer.from(s, "utf8").toString("base64");
 }
@@ -350,7 +340,6 @@ function parseHeaderValue(rawHeaderBlock, key) {
   const lines = String(rawHeaderBlock).split(/\r?\n/);
   const lowerKey = String(key).toLowerCase();
 
-  // unfold headers (continuations)
   const unfolded = [];
   for (const line of lines) {
     if (/^\s/.test(line) && unfolded.length) {
@@ -453,6 +442,9 @@ router.get("/auth-url", async (req, res) => {
     params.set("scope", SCOPES);
     params.set("state", state);
 
+    // ✅ IMPORTANT: helps ensure refresh_token is issued
+    params.set("prompt", "consent");
+
     const url = `${YAHOO_AUTH_URL}?${params.toString()}`;
     res.json({ ok: true, url });
   } catch (e) {
@@ -500,9 +492,8 @@ router.get("/oauth2callback", async (req, res) => {
     if (!state?.user_id) return res.status(400).send("Invalid state (expired or tampered)");
 
     const userId = String(state.user_id);
-    const mode = String(state.mode || "").trim(); // "app" -> deep link
+    const mode = String(state.mode || "").trim();
 
-    // Exchange code for tokens
     const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
 
     const body = new URLSearchParams();
@@ -527,9 +518,19 @@ router.get("/oauth2callback", async (req, res) => {
       return res.status(500).send(`Yahoo OAuth token exchange failed (${resp.status}): ${text}`);
     }
 
-    // Yahoo doesn’t reliably provide mailbox email in token response.
-    // We’ll store email if present, else keep null; your UI can still show connected.
-    const emailGuess = tokenJson?.xoauth_yahoo_guid ? null : null;
+    // ✅ IMPORTANT: fetch the user's email via OIDC userinfo
+    let emailGuess = null;
+    try {
+      const u = await fetch(YAHOO_USERINFO_URL, {
+        headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+      });
+      const uText = await u.text();
+      let userinfo = null;
+      try { userinfo = JSON.parse(uText); } catch {}
+      emailGuess = userinfo?.email || null;
+    } catch (e) {
+      console.warn("Yahoo userinfo fetch failed:", e?.message || e);
+    }
 
     await saveYahooTokens(userId, tokenJson, emailGuess);
 
@@ -551,7 +552,6 @@ router.get("/oauth2callback", async (req, res) => {
 
 /* ===================== DISCONNECT ===================== */
 
-// POST /yahoo/disconnect  { user_id }
 router.post("/disconnect", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -563,7 +563,6 @@ router.post("/disconnect", async (req, res) => {
   }
 });
 
-// GET /yahoo/disconnect?user_id=...
 router.get("/disconnect", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -578,7 +577,6 @@ router.get("/disconnect", async (req, res) => {
 /* ===================== MAIL API ===================== */
 
 // GET /yahoo/list?user_id=...&maxResults=...
-// (Matches your Gmail list style response: { ok, q, emails: [...] })
 router.get("/list", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -588,8 +586,6 @@ router.get("/list", async (req, res) => {
     const { accessToken, email } = await getValidYahooAccessToken(userId);
 
     if (!email) {
-      // We can still be connected but not know the email; user must be stored once we can infer it.
-      // For now: return connected but no emails.
       return res.json({ ok: true, q: "INBOX", emails: [] });
     }
 
@@ -612,8 +608,14 @@ router.get("/list", async (req, res) => {
         imap.openBox("INBOX", true, (err, box) => {
           if (err) return reject(err);
 
-          // Fetch last N messages
           const total = box.messages.total || 0;
+
+          // ✅ FIX: empty inbox -> don't fetch 1:0
+          if (!total || total <= 0) {
+            imap.end();
+            return resolve();
+          }
+
           const start = Math.max(1, total - maxResults + 1);
           const range = `${start}:${total}`;
 
@@ -641,12 +643,6 @@ router.get("/list", async (req, res) => {
               const dateStr = parseHeaderValue(headerBuf, "Date");
               const messageId = parseHeaderValue(headerBuf, "Message-Id");
 
-              let when = "—";
-              try {
-                const d = dateStr ? new Date(dateStr) : null;
-                if (d && !isNaN(d.getTime())) when = relativeShort(d);
-              } catch {}
-
               emailsOut.push({
                 id: String(attrs?.uid || ""),
                 threadId: null,
@@ -672,9 +668,7 @@ router.get("/list", async (req, res) => {
       imap.connect();
     });
 
-    // newest first
     emailsOut.sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
-
     res.json({ ok: true, q: "INBOX", emails: emailsOut });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
@@ -685,12 +679,12 @@ router.get("/list", async (req, res) => {
 router.get("/read", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
-    const id = String(req.query.id || "").trim(); // uid
+    const id = String(req.query.id || "").trim();
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
 
     const { accessToken, email } = await getValidYahooAccessToken(userId);
-    if (!email) return res.status(400).json({ error: "Yahoo connected but email missing; reconnect and capture email." });
+    if (!email) return res.status(400).json({ error: "Yahoo connected but email missing; reconnect." });
 
     const xoauth2 = buildXOAuth2(email, accessToken);
 
@@ -711,7 +705,7 @@ router.get("/read", async (req, res) => {
         imap.openBox("INBOX", true, (err) => {
           if (err) return reject(err);
 
-          const f = imap.fetch(String(id), { bodies: "" }); // full RFC822
+          const f = imap.fetch(String(id), { bodies: "" });
           f.on("message", (msg) => {
             msg.on("body", (stream) => {
               stream.on("data", (chunk) => (raw += chunk.toString("utf8")));
@@ -764,7 +758,7 @@ router.get("/send", async (req, res) => {
     if (!body) return res.status(400).json({ error: "Missing body" });
 
     const { accessToken, refreshToken, email } = await getValidYahooAccessToken(userId);
-    if (!email) return res.status(400).json({ error: "Yahoo connected but email missing; reconnect and capture email." });
+    if (!email) return res.status(400).json({ error: "Yahoo connected but email missing; reconnect." });
 
     const transport = nodemailer.createTransport({
       host: YAHOO_SMTP_HOST,
@@ -797,15 +791,13 @@ router.get("/send", async (req, res) => {
 router.get("/reply", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
-    const id = String(req.query.id || "").trim(); // uid
+    const id = String(req.query.id || "").trim();
     const body = String(req.query.body || "").trim();
 
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    // read original to get Reply-To/From + Subject + Message-Id
-    // reuse /read
     const readResp = await fetch(
       `${SUCCESS_WEB_BASE}/yahoo/read?user_id=${encodeURIComponent(userId)}&id=${encodeURIComponent(id)}`
     );
@@ -822,7 +814,7 @@ router.get("/reply", async (req, res) => {
     const references = original.references || undefined;
 
     const { accessToken, refreshToken, email } = await getValidYahooAccessToken(userId);
-    if (!email) return res.status(400).json({ error: "Yahoo connected but email missing; reconnect and capture email." });
+    if (!email) return res.status(400).json({ error: "Yahoo connected but email missing; reconnect." });
 
     const transport = nodemailer.createTransport({
       host: YAHOO_SMTP_HOST,

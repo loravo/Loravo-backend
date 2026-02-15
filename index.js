@@ -68,6 +68,8 @@ app.use("/", newsRoute);
 // Your ./Emails/gmail.js must export an express.Router()
 app.use("/gmail", gmailRoute);
 
+const yahoo = require("./Emails/yahoo");
+app.use("/yahoo", yahoo);
 
 // ================= LEGAL PAGES =================
 app.use("/legal", express.static(path.join(__dirname, "public")));
