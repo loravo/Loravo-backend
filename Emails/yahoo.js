@@ -435,12 +435,15 @@ router.get("/auth-url", async (req, res) => {
       exp: Date.now() + 10 * 60 * 1000,
     });
 
-    const params = new URLSearchParams();
+       const params = new URLSearchParams();
     params.set("client_id", CLIENT_ID);
     params.set("redirect_uri", REDIRECT_URI);
     params.set("response_type", "code");
-    params.set("scope", SCOPES);
     params.set("state", state);
+    params.set("language", "en-us"); // optional but matches Yahoo doc
+
+    // ❌ REMOVE this line if you have it:
+    // params.set("scope", SCOPES);
 
     // ✅ IMPORTANT: helps ensure refresh_token is issued
     params.set("prompt", "consent");
