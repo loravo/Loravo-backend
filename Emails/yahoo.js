@@ -49,7 +49,7 @@ const CLIENT_SECRET = String(process.env.YAHOO_CLIENT_SECRET || "").trim();
 const REDIRECT_URI = String(process.env.YAHOO_REDIRECT_URI || "").trim();
 
 const STATE_SECRET = String(process.env.YAHOO_STATE_SECRET || "loravo_yahoo_state_secret_change_me").trim();
-const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email").trim();
+const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email mail-r mail-w").trim();
 
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const DB_ENABLED = Boolean(DATABASE_URL);
@@ -441,12 +441,12 @@ router.get("/auth-url", async (req, res) => {
     params.set("response_type", "code");
     params.set("state", state);
     params.set("language", "en-us");
-     // optional but matches Yahoo docs
-     // ❌ REMOVE this line if you have it:
-     params.set("scope", SCOPES);
 
-    // ✅ IMPORTANT: helps ensure refresh_token is issued
-    params.set("prompt", "consent");
+// ✅ REQUIRED: without this you often won't get mail permissions → IMAP fails → 500 in /list
+params.set("scope", SCOPES);
+
+// ✅ IMPORTANT: helps ensure refresh_token is issued
+params.set("prompt", "consent");
 
     const url = `${YAHOO_AUTH_URL}?${params.toString()}`;
     res.json({ ok: true, url });
