@@ -49,7 +49,7 @@ const CLIENT_SECRET = String(process.env.YAHOO_CLIENT_SECRET || "").trim();
 const REDIRECT_URI = String(process.env.YAHOO_REDIRECT_URI || "").trim();
 
 const STATE_SECRET = String(process.env.YAHOO_STATE_SECRET || "loravo_yahoo_state_secret_change_me").trim();
-const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email mail-r mail-w").trim();
+const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email").trim();
 
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const DB_ENABLED = Boolean(DATABASE_URL);
@@ -486,7 +486,7 @@ router.get("/connected", (req, res) => {
 // OAuth callback: GET /yahoo/oauth2callback?code=...&state=...
 router.get("/oauth2callback", async (req, res) => {
   try {
-    // ✅ 1. If Yahoo returned an OAuth error, show it clearly
+    // 0) If Yahoo sent an error, show it clearly (ex: invalid_scope)
     const oauthErr = String(req.query.error || "").trim();
     const oauthDesc = String(req.query.error_description || "").trim();
     if (oauthErr) {
@@ -500,14 +500,14 @@ router.get("/oauth2callback", async (req, res) => {
     const code = String(req.query.code || "").trim();
     const stateStr = String(req.query.state || "").trim();
 
-    // ✅ 2. If no code, show what Yahoo actually sent (debug)
+    // 1) If no code, show what Yahoo returned (prevents blank "Missing code" page)
     if (!code) {
       return res
         .status(400)
         .send(`Missing code. Query received: ${JSON.stringify(req.query)}`);
     }
 
-    // ✅ 3. Validate state
+    // 2) Validate state
     const state = verifyState(stateStr);
     if (!state?.user_id) {
       return res.status(400).send("Invalid state (expired or tampered)");
@@ -516,6 +516,7 @@ router.get("/oauth2callback", async (req, res) => {
     const userId = String(state.user_id);
     const mode = String(state.mode || "").trim();
 
+    // 3) Exchange code for tokens
     const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
 
     const body = new URLSearchParams();
@@ -534,9 +535,7 @@ router.get("/oauth2callback", async (req, res) => {
 
     const text = await resp.text();
     let tokenJson = null;
-    try {
-      tokenJson = JSON.parse(text);
-    } catch {}
+    try { tokenJson = JSON.parse(text); } catch {}
 
     if (!resp.ok || !tokenJson?.access_token) {
       return res
@@ -544,30 +543,24 @@ router.get("/oauth2callback", async (req, res) => {
         .send(`Yahoo OAuth token exchange failed (${resp.status}): ${text}`);
     }
 
-    // ✅ 4. Fetch Yahoo account email via OIDC userinfo
+    // 4) Fetch email via OIDC userinfo
     let emailGuess = null;
     try {
       const u = await fetch(YAHOO_USERINFO_URL, {
-        headers: {
-          Authorization: `Bearer ${tokenJson.access_token}`,
-        },
+        headers: { Authorization: `Bearer ${tokenJson.access_token}` },
       });
-
       const uText = await u.text();
       let userinfo = null;
-      try {
-        userinfo = JSON.parse(uText);
-      } catch {}
-
+      try { userinfo = JSON.parse(uText); } catch {}
       emailGuess = userinfo?.email || null;
     } catch (e) {
       console.warn("Yahoo userinfo fetch failed:", e?.message || e);
     }
 
-    // ✅ 5. Save tokens in Postgres
+    // 5) Save tokens
     await saveYahooTokens(userId, tokenJson, emailGuess);
 
-    // ✅ 6. If coming from iOS app → deep link back
+    // 6) Deep-link back to iOS app (mode=app)
     if (mode === "app") {
       const deeplink = `loravo://connected?provider=yahoo&user_id=${encodeURIComponent(
         userId
@@ -575,11 +568,10 @@ router.get("/oauth2callback", async (req, res) => {
       return res.redirect(deeplink);
     }
 
-    // ✅ 7. Otherwise show browser success page
+    // 7) Web success page
     const successPage = `${SUCCESS_WEB_BASE}/yahoo/connected?user_id=${encodeURIComponent(
       userId
     )}&email=${encodeURIComponent(emailGuess || "")}`;
-
     return res.redirect(successPage);
 
   } catch (e) {
