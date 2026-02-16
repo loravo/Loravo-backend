@@ -486,13 +486,32 @@ router.get("/connected", (req, res) => {
 // OAuth callback: GET /yahoo/oauth2callback?code=...&state=...
 router.get("/oauth2callback", async (req, res) => {
   try {
+    // ✅ 1. If Yahoo returned an OAuth error, show it clearly
+    const oauthErr = String(req.query.error || "").trim();
+    const oauthDesc = String(req.query.error_description || "").trim();
+    if (oauthErr) {
+      return res
+        .status(400)
+        .send(`Yahoo OAuth error: ${oauthErr}${oauthDesc ? " — " + oauthDesc : ""}`);
+    }
+
     requireEnv();
+
     const code = String(req.query.code || "").trim();
     const stateStr = String(req.query.state || "").trim();
-    if (!code) return res.status(400).send("Missing code");
 
+    // ✅ 2. If no code, show what Yahoo actually sent (debug)
+    if (!code) {
+      return res
+        .status(400)
+        .send(`Missing code. Query received: ${JSON.stringify(req.query)}`);
+    }
+
+    // ✅ 3. Validate state
     const state = verifyState(stateStr);
-    if (!state?.user_id) return res.status(400).send("Invalid state (expired or tampered)");
+    if (!state?.user_id) {
+      return res.status(400).send("Invalid state (expired or tampered)");
+    }
 
     const userId = String(state.user_id);
     const mode = String(state.mode || "").trim();
@@ -515,41 +534,58 @@ router.get("/oauth2callback", async (req, res) => {
 
     const text = await resp.text();
     let tokenJson = null;
-    try { tokenJson = JSON.parse(text); } catch {}
+    try {
+      tokenJson = JSON.parse(text);
+    } catch {}
 
     if (!resp.ok || !tokenJson?.access_token) {
-      return res.status(500).send(`Yahoo OAuth token exchange failed (${resp.status}): ${text}`);
+      return res
+        .status(500)
+        .send(`Yahoo OAuth token exchange failed (${resp.status}): ${text}`);
     }
 
-    // ✅ IMPORTANT: fetch the user's email via OIDC userinfo
+    // ✅ 4. Fetch Yahoo account email via OIDC userinfo
     let emailGuess = null;
     try {
       const u = await fetch(YAHOO_USERINFO_URL, {
-        headers: { Authorization: `Bearer ${tokenJson.access_token}` },
+        headers: {
+          Authorization: `Bearer ${tokenJson.access_token}`,
+        },
       });
+
       const uText = await u.text();
       let userinfo = null;
-      try { userinfo = JSON.parse(uText); } catch {}
+      try {
+        userinfo = JSON.parse(uText);
+      } catch {}
+
       emailGuess = userinfo?.email || null;
     } catch (e) {
       console.warn("Yahoo userinfo fetch failed:", e?.message || e);
     }
 
+    // ✅ 5. Save tokens in Postgres
     await saveYahooTokens(userId, tokenJson, emailGuess);
 
+    // ✅ 6. If coming from iOS app → deep link back
     if (mode === "app") {
-      const deeplink = `loravo://connected?provider=yahoo&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(
-        emailGuess || ""
-      )}`;
+      const deeplink = `loravo://connected?provider=yahoo&user_id=${encodeURIComponent(
+        userId
+      )}&email=${encodeURIComponent(emailGuess || "")}`;
       return res.redirect(deeplink);
     }
 
+    // ✅ 7. Otherwise show browser success page
     const successPage = `${SUCCESS_WEB_BASE}/yahoo/connected?user_id=${encodeURIComponent(
       userId
     )}&email=${encodeURIComponent(emailGuess || "")}`;
+
     return res.redirect(successPage);
+
   } catch (e) {
-    res.status(e?.status || 500).send(`OAuth error: ${String(e?.message || e)}`);
+    return res
+      .status(e?.status || 500)
+      .send(`OAuth error: ${String(e?.message || e)}`);
   }
 });
 
