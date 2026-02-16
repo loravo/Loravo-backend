@@ -1,4 +1,3 @@
-// Emails/yahoo.js
 // =====================================================
 // LORAVO — Yahoo Mail (single-file router)
 //
