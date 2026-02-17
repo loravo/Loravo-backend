@@ -50,7 +50,7 @@ const REDIRECT_URI = String(process.env.YAHOO_REDIRECT_URI || "").trim();
 const STATE_SECRET = String(process.env.YAHOO_STATE_SECRET || "loravo_yahoo_state_secret_change_me").trim();
 // ✅ Yahoo Mail IMAP needs mail scopes + you want refresh tokens
 const SCOPES = String(
-  process.env.YAHOO_SCOPES || "openid profile email mail-r mail-w offline_access"
+  process.env.YAHOO_SCOPES || "openid profile email mail-r mail-w"
 ).trim();
 
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
@@ -397,8 +397,14 @@ router.get("/", (_, res) => {
 router.get("/auth", (req, res) => {
   const userId = String(req.query.user_id || "").trim();
   const mode = String(req.query.mode || "").trim();
+  const email = String(req.query.email || "").trim(); // ✅ add
+
   if (!userId) return res.status(400).send("Missing user_id");
-  const extra = mode ? `&mode=${encodeURIComponent(mode)}` : "";
+
+  const extra =
+    (mode ? `&mode=${encodeURIComponent(mode)}` : "") +
+    (email ? `&email=${encodeURIComponent(email)}` : "");
+
   return res.redirect(`/yahoo/auth-url?user_id=${encodeURIComponent(userId)}${extra}`);
 });
 
@@ -430,12 +436,14 @@ router.get("/auth-url", async (req, res) => {
     const mode = String(req.query.mode || "").trim();
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
 
+    const email = String(req.query.email || "").trim();
     const state = signState({
-      user_id: userId,
-      mode: mode || "",
-      nonce: crypto.randomBytes(12).toString("hex"),
-      exp: Date.now() + 10 * 60 * 1000,
-    });
+  user_id: userId,
+  mode: mode || "",
+  email: email || "",   // ✅ add
+  nonce: crypto.randomBytes(12).toString("hex"),
+  exp: Date.now() + 10 * 60 * 1000,
+});
 
        const params = new URLSearchParams();
     params.set("client_id", CLIENT_ID);
@@ -558,6 +566,10 @@ router.get("/oauth2callback", async (req, res) => {
     } catch (e) {
       console.warn("Yahoo userinfo fetch failed:", e?.message || e);
     }
+
+    if (!emailGuess) {
+  emailGuess = String(state.email || "").trim() || null;
+}
 
     // 5) Save tokens
     await saveYahooTokens(userId, tokenJson, emailGuess);
