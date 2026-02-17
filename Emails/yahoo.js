@@ -1,12 +1,12 @@
 // =====================================================
 // LORAVO — Yahoo Mail (single-file router)
 //
-// ✅ OAuth2 connect (auth-url + callback)
+// ✅ OAuth2 connect (auth + callback)
 // ✅ Stores tokens in Postgres user_state (Render DATABASE_URL)
 // ✅ Status, list, read, send, reply
 // ✅ Disconnect (GET + POST)
 // ✅ iOS auto-close: mode=app -> redirects to loravo://connected (no success page)
-// ✅ Browser success page (for desktop/manual testing)
+// ✅ Web success page (desktop/manual testing)
 //
 // Mount in index.js:
 //   const yahoo = require("./Emails/yahoo");
@@ -21,7 +21,7 @@
 //   DATABASE_URL
 //   YAHOO_STATE_SECRET
 //   YAHOO_SUCCESS_WEB_URL (default https://loravo-backend.onrender.com)
-//   YAHOO_SCOPES (default: "openid profile email")
+//   YAHOO_SCOPES (default: "openid profile email")  <-- keep simple to avoid invalid_scope
 //
 // Required npm deps:
 //   npm i imap mailparser nodemailer
@@ -47,11 +47,12 @@ const CLIENT_ID = String(process.env.YAHOO_CLIENT_ID || "").trim();
 const CLIENT_SECRET = String(process.env.YAHOO_CLIENT_SECRET || "").trim();
 const REDIRECT_URI = String(process.env.YAHOO_REDIRECT_URI || "").trim();
 
-const STATE_SECRET = String(process.env.YAHOO_STATE_SECRET || "loravo_yahoo_state_secret_change_me").trim();
-// ✅ Yahoo Mail IMAP needs mail scopes + you want refresh tokens
-const SCOPES = String(
-  process.env.YAHOO_SCOPES || "openid profile email mail-r mail-w"
+const STATE_SECRET = String(
+  process.env.YAHOO_STATE_SECRET || "loravo_yahoo_state_secret_change_me"
 ).trim();
+
+// ✅ KEEP SIMPLE to avoid Yahoo "invalid_scope"
+const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email").trim();
 
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const DB_ENABLED = Boolean(DATABASE_URL);
@@ -255,7 +256,7 @@ async function clearYahooTokens(userId) {
 async function refreshYahooAccessToken(refreshToken) {
   requireEnv();
   if (!refreshToken) {
-    const err = new Error("Missing Yahoo refresh_token. Reconnect Yahoo with prompt=consent.");
+    const err = new Error("Missing Yahoo refresh_token. Reconnect Yahoo (prompt=consent).");
     err.status = 401;
     throw err;
   }
@@ -360,17 +361,6 @@ function parseHeaderValue(rawHeaderBlock, key) {
   return null;
 }
 
-function relativeShort(d) {
-  const secs = (Date.now() - d.getTime()) / 1000;
-  if (secs < 60) return "now";
-  const mins = Math.floor(secs / 60);
-  if (mins < 60) return `${mins}m`;
-  const hrs = Math.floor(secs / 3600);
-  if (hrs < 24) return `${hrs}h`;
-  const days = Math.floor(secs / 86400);
-  return `${days}d`;
-}
-
 /* ===================== ROUTES ===================== */
 
 router.get("/", (_, res) => {
@@ -378,6 +368,7 @@ router.get("/", (_, res) => {
     ok: true,
     service: "loravo-yahoo-router",
     dbReady,
+    scopes: SCOPES,
     endpoints: [
       "/auth",
       "/auth-url",
@@ -393,19 +384,20 @@ router.get("/", (_, res) => {
   });
 });
 
-// GET /yahoo/auth?user_id=...&mode=app?
+// ✅ MAIN ENTRY: GET /yahoo/auth?user_id=...&mode=app&email=...
+// This now redirects straight to Yahoo login (like Gmail).
 router.get("/auth", (req, res) => {
   const userId = String(req.query.user_id || "").trim();
   const mode = String(req.query.mode || "").trim();
-  const email = String(req.query.email || "").trim(); // ✅ add
+  const email = String(req.query.email || "").trim();
 
   if (!userId) return res.status(400).send("Missing user_id");
 
-  const extra =
-    (mode ? `&mode=${encodeURIComponent(mode)}` : "") +
-    (email ? `&email=${encodeURIComponent(email)}` : "");
+  const redirectTo = `/yahoo/auth-url?user_id=${encodeURIComponent(userId)}${
+    mode ? `&mode=${encodeURIComponent(mode)}` : ""
+  }${email ? `&email=${encodeURIComponent(email)}` : ""}`;
 
-  return res.redirect(`/yahoo/auth-url?user_id=${encodeURIComponent(userId)}${extra}`);
+  return res.redirect(redirectTo);
 });
 
 // GET /yahoo/status?user_id=...
@@ -428,44 +420,53 @@ router.get("/status", async (req, res) => {
   }
 });
 
-// GET /yahoo/auth-url?user_id=...&mode=app?
+// ✅ GET /yahoo/auth-url?user_id=...&mode=app&email=...
+// Default behavior: REDIRECT to Yahoo.
+// If you want JSON for debugging: add &format=json
 router.get("/auth-url", async (req, res) => {
   try {
     requireEnv();
     const userId = String(req.query.user_id || "").trim();
     const mode = String(req.query.mode || "").trim();
+    const email = String(req.query.email || "").trim();
+    const format = String(req.query.format || "").trim().toLowerCase();
+
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
 
-    const email = String(req.query.email || "").trim();
     const state = signState({
-  user_id: userId,
-  mode: mode || "",
-  email: email || "",   // ✅ add
-  nonce: crypto.randomBytes(12).toString("hex"),
-  exp: Date.now() + 10 * 60 * 1000,
-});
+      user_id: userId,
+      mode: mode || "",
+      email: email || "",
+      nonce: crypto.randomBytes(12).toString("hex"),
+      exp: Date.now() + 10 * 60 * 1000,
+    });
 
-       const params = new URLSearchParams();
+    const params = new URLSearchParams();
     params.set("client_id", CLIENT_ID);
     params.set("redirect_uri", REDIRECT_URI);
     params.set("response_type", "code");
     params.set("state", state);
     params.set("language", "en-us");
+    params.set("scope", SCOPES);
 
-// ✅ REQUIRED: without this you often won't get mail permissions → IMAP fails → 500 in /list
-params.set("scope", SCOPES);
-
-// ✅ IMPORTANT: helps ensure refresh_token is issued
-params.set("prompt", "consent");
+    // ✅ Helps ensure refresh_token is issued (if Yahoo allows it for your app)
+    params.set("prompt", "consent");
 
     const url = `${YAHOO_AUTH_URL}?${params.toString()}`;
-    res.json({ ok: true, url });
+
+    // Debug mode: return JSON url
+    if (format === "json") {
+      return res.json({ ok: true, url, scopes: SCOPES });
+    }
+
+    // Normal mode: redirect to Yahoo login
+    return res.redirect(url);
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
 });
 
-// Browser success page: GET /yahoo/connected?user_id=...&email=...
+// Web success page: GET /yahoo/connected?user_id=...&email=...
 router.get("/connected", (req, res) => {
   const email = String(req.query.email || "");
   const userId = String(req.query.user_id || "");
@@ -479,11 +480,9 @@ router.get("/connected", (req, res) => {
       <body style="font-family: -apple-system, system-ui; padding: 28px; line-height: 1.4;">
         <h1 style="margin:0 0 12px 0;">✅ Yahoo Connected</h1>
         <p style="margin:0 0 18px 0;">${email ? `Connected as <b>${email}</b>.` : "Connection saved."}</p>
-
         <p style="margin:0 0 10px 0; opacity:.75;">
-          If you’re on iPhone, go back to Loravo. If Loravo didn’t open automatically, tap the button below.
+          If you’re on iPhone, go back to Loravo. If Loravo didn’t open automatically, tap below.
         </p>
-
         <a href="loravo://connected?provider=yahoo&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(email)}"
            style="display:inline-block; padding:12px 16px; border-radius:12px; background:#111; color:#fff; text-decoration:none;">
           Open Loravo
@@ -496,13 +495,10 @@ router.get("/connected", (req, res) => {
 // OAuth callback: GET /yahoo/oauth2callback?code=...&state=...
 router.get("/oauth2callback", async (req, res) => {
   try {
-    // 0) If Yahoo sent an error, show it clearly (ex: invalid_scope)
     const oauthErr = String(req.query.error || "").trim();
     const oauthDesc = String(req.query.error_description || "").trim();
     if (oauthErr) {
-      return res
-        .status(400)
-        .send(`Yahoo OAuth error: ${oauthErr}${oauthDesc ? " — " + oauthDesc : ""}`);
+      return res.status(400).send(`Yahoo OAuth error: ${oauthErr}${oauthDesc ? " — " + oauthDesc : ""}`);
     }
 
     requireEnv();
@@ -510,14 +506,10 @@ router.get("/oauth2callback", async (req, res) => {
     const code = String(req.query.code || "").trim();
     const stateStr = String(req.query.state || "").trim();
 
-    // 1) If no code, show what Yahoo returned (prevents blank "Missing code" page)
     if (!code) {
-      return res
-        .status(400)
-        .send(`Missing code. Query received: ${JSON.stringify(req.query)}`);
+      return res.status(400).send(`Missing code. Query received: ${JSON.stringify(req.query)}`);
     }
 
-    // 2) Validate state
     const state = verifyState(stateStr);
     if (!state?.user_id) {
       return res.status(400).send("Invalid state (expired or tampered)");
@@ -526,7 +518,6 @@ router.get("/oauth2callback", async (req, res) => {
     const userId = String(state.user_id);
     const mode = String(state.mode || "").trim();
 
-    // 3) Exchange code for tokens
     const basic = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString("base64");
 
     const body = new URLSearchParams();
@@ -548,12 +539,10 @@ router.get("/oauth2callback", async (req, res) => {
     try { tokenJson = JSON.parse(text); } catch {}
 
     if (!resp.ok || !tokenJson?.access_token) {
-      return res
-        .status(500)
-        .send(`Yahoo OAuth token exchange failed (${resp.status}): ${text}`);
+      return res.status(500).send(`Yahoo OAuth token exchange failed (${resp.status}): ${text}`);
     }
 
-    // 4) Fetch email via OIDC userinfo
+    // Try to get email from userinfo
     let emailGuess = null;
     try {
       const u = await fetch(YAHOO_USERINFO_URL, {
@@ -567,31 +556,22 @@ router.get("/oauth2callback", async (req, res) => {
       console.warn("Yahoo userinfo fetch failed:", e?.message || e);
     }
 
+    // fallback: use email passed into state (from iOS)
     if (!emailGuess) {
-  emailGuess = String(state.email || "").trim() || null;
-}
+      emailGuess = String(state.email || "").trim() || null;
+    }
 
-    // 5) Save tokens
     await saveYahooTokens(userId, tokenJson, emailGuess);
 
-    // 6) Deep-link back to iOS app (mode=app)
     if (mode === "app") {
-      const deeplink = `loravo://connected?provider=yahoo&user_id=${encodeURIComponent(
-        userId
-      )}&email=${encodeURIComponent(emailGuess || "")}`;
+      const deeplink = `loravo://connected?provider=yahoo&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(emailGuess || "")}`;
       return res.redirect(deeplink);
     }
 
-    // 7) Web success page
-    const successPage = `${SUCCESS_WEB_BASE}/yahoo/connected?user_id=${encodeURIComponent(
-      userId
-    )}&email=${encodeURIComponent(emailGuess || "")}`;
+    const successPage = `${SUCCESS_WEB_BASE}/yahoo/connected?user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(emailGuess || "")}`;
     return res.redirect(successPage);
-
   } catch (e) {
-    return res
-      .status(e?.status || 500)
-      .send(`OAuth error: ${String(e?.message || e)}`);
+    return res.status(e?.status || 500).send(`OAuth error: ${String(e?.message || e)}`);
   }
 });
 
@@ -631,10 +611,10 @@ router.get("/list", async (req, res) => {
     const { accessToken, email } = await getValidYahooAccessToken(userId);
 
     if (!email) {
-  return res.status(400).json({
-    error: "Yahoo connected but email missing. Reconnect Yahoo (userinfo did not return email)."
-  });
-}
+      return res.status(400).json({
+        error: "Yahoo connected but email missing. Reconnect Yahoo (userinfo did not return email).",
+      });
+    }
 
     const xoauth2 = buildXOAuth2(email, accessToken);
 
@@ -714,26 +694,22 @@ router.get("/list", async (req, res) => {
         });
       });
 
-      // ✅ THIS is the error your widget needs (AUTH, scope, token, etc.)
       imap.once("error", (err) => fail(err));
-
       imap.connect();
     });
 
+    // newest first
     emailsOut.sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
     return res.json({ ok: true, q: "INBOX", emails: emailsOut });
-
   } catch (e) {
     const msg = String(e?.message || e);
-
-    // Make auth failures NOT show as “500”
     const looksAuth =
       /AUTH|authentication|Invalid credentials|NO \[AUTHENTICATIONFAILED\]|LOGIN failed|oauth/i.test(msg);
 
     return res.status(looksAuth ? 401 : 500).json({
       error: msg,
       hint: looksAuth
-        ? "Yahoo IMAP OAuth2 auth failed. This usually means your Yahoo app/token does not have Mail/IMAP permission. Disconnect + reconnect, and ensure Yahoo Developer app has mail access enabled."
+        ? "Yahoo IMAP OAuth2 auth failed. Your Yahoo app likely does NOT have Mail/IMAP permission enabled. You must enable Yahoo Mail scopes in Yahoo Developer Console OR use Yahoo App Password IMAP."
         : null,
     });
   }
