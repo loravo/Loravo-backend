@@ -48,7 +48,10 @@ const CLIENT_SECRET = String(process.env.YAHOO_CLIENT_SECRET || "").trim();
 const REDIRECT_URI = String(process.env.YAHOO_REDIRECT_URI || "").trim();
 
 const STATE_SECRET = String(process.env.YAHOO_STATE_SECRET || "loravo_yahoo_state_secret_change_me").trim();
-const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email").trim();
+// ✅ Yahoo Mail IMAP needs mail scopes + you want refresh tokens
+const SCOPES = String(
+  process.env.YAHOO_SCOPES || "openid profile email mail-r mail-w offline_access"
+).trim();
 
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
 const DB_ENABLED = Boolean(DATABASE_URL);
@@ -616,9 +619,10 @@ router.get("/list", async (req, res) => {
     const { accessToken, email } = await getValidYahooAccessToken(userId);
 
     if (!email) {
-      // Don’t error the widget; just show empty
-      return res.json({ ok: true, q: "INBOX", emails: [] });
-    }
+  return res.status(400).json({
+    error: "Yahoo connected but email missing. Reconnect Yahoo (userinfo did not return email)."
+  });
+}
 
     const xoauth2 = buildXOAuth2(email, accessToken);
 
