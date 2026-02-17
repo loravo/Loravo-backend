@@ -616,6 +616,7 @@ router.get("/list", async (req, res) => {
     const { accessToken, email } = await getValidYahooAccessToken(userId);
 
     if (!email) {
+      // Don’t error the widget; just show empty
       return res.json({ ok: true, q: "INBOX", emails: [] });
     }
 
@@ -634,14 +635,22 @@ router.get("/list", async (req, res) => {
     const emailsOut = [];
 
     await new Promise((resolve, reject) => {
+      let settled = false;
+
+      const fail = (err) => {
+        if (settled) return;
+        settled = true;
+        try { imap.end(); } catch {}
+        reject(err);
+      };
+
       imap.once("ready", () => {
         imap.openBox("INBOX", true, (err, box) => {
-          if (err) return reject(err);
+          if (err) return fail(err);
 
-          const total = box.messages.total || 0;
-
-          // ✅ FIX: empty inbox -> don't fetch 1:0
+          const total = box?.messages?.total || 0;
           if (!total || total <= 0) {
+            settled = true;
             imap.end();
             return resolve();
           }
@@ -650,7 +659,7 @@ router.get("/list", async (req, res) => {
           const range = `${start}:${total}`;
 
           const f = imap.fetch(range, {
-            bodies: "HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID REFERENCES IN-REPLY-TO)",
+            bodies: "HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID)",
             struct: false,
           });
 
@@ -667,41 +676,50 @@ router.get("/list", async (req, res) => {
             });
 
             msg.once("end", () => {
-              const from = parseHeaderValue(headerBuf, "From");
-              const to = parseHeaderValue(headerBuf, "To");
-              const subject = parseHeaderValue(headerBuf, "Subject");
-              const dateStr = parseHeaderValue(headerBuf, "Date");
-              const messageId = parseHeaderValue(headerBuf, "Message-Id");
-
               emailsOut.push({
                 id: String(attrs?.uid || ""),
-                threadId: null,
-                from: from || "",
-                to: to || "",
-                subject: subject || "",
-                date: dateStr || "",
-                messageId: messageId || "",
+                from: parseHeaderValue(headerBuf, "From") || "",
+                to: parseHeaderValue(headerBuf, "To") || "",
+                subject: parseHeaderValue(headerBuf, "Subject") || "",
+                date: parseHeaderValue(headerBuf, "Date") || "",
+                messageId: parseHeaderValue(headerBuf, "Message-Id") || "",
                 snippet: "",
+                threadId: null,
               });
             });
           });
 
-          f.once("error", reject);
+          f.once("error", fail);
           f.once("end", () => {
+            settled = true;
             imap.end();
             resolve();
           });
         });
       });
 
-      imap.once("error", reject);
+      // ✅ THIS is the error your widget needs (AUTH, scope, token, etc.)
+      imap.once("error", (err) => fail(err));
+
       imap.connect();
     });
 
     emailsOut.sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
-    res.json({ ok: true, q: "INBOX", emails: emailsOut });
+    return res.json({ ok: true, q: "INBOX", emails: emailsOut });
+
   } catch (e) {
-    res.status(e?.status || 500).json({ error: String(e?.message || e) });
+    const msg = String(e?.message || e);
+
+    // Make auth failures NOT show as “500”
+    const looksAuth =
+      /AUTH|authentication|Invalid credentials|NO \[AUTHENTICATIONFAILED\]|LOGIN failed|oauth/i.test(msg);
+
+    return res.status(looksAuth ? 401 : 500).json({
+      error: msg,
+      hint: looksAuth
+        ? "Yahoo IMAP OAuth2 auth failed. This usually means your Yahoo app/token does not have Mail/IMAP permission. Disconnect + reconnect, and ensure Yahoo Developer app has mail access enabled."
+        : null,
+    });
   }
 });
 
