@@ -498,8 +498,14 @@ router.get("/oauth2callback", async (req, res) => {
     const oauthErr = String(req.query.error || "").trim();
     const oauthDesc = String(req.query.error_description || "").trim();
     if (oauthErr) {
-      return res.status(400).send(`Yahoo OAuth error: ${oauthErr}${oauthDesc ? " — " + oauthDesc : ""}`);
-    }
+  const msg = `Yahoo OAuth error: ${oauthErr}${oauthDesc ? " — " + oauthDesc : ""}`;
+  // If we’re in app mode, return JSON so iOS can show it cleanly
+  const state = verifyState(String(req.query.state || "").trim());
+  if (state?.mode === "app") {
+    return res.status(400).json({ ok: false, error: msg });
+  }
+  return res.status(400).send(msg);
+}
 
     requireEnv();
 
