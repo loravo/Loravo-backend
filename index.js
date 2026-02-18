@@ -71,6 +71,9 @@ app.use("/gmail", gmailRoute);
 const yahoo = require("./Emails/yahoo");
 app.use("/yahoo", yahoo);
 
+// ✅ Serve /public at the site root (so /logo.png works)
+app.use(express.static(path.join(__dirname, "public")));
+
 // ================= LEGAL PAGES =================
 app.use("/legal", express.static(path.join(__dirname, "public")));
 
