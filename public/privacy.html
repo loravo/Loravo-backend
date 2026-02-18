@@ -7,363 +7,293 @@
 
   <style>
     :root{
-      --bg: #0b0f14;
-      --card: rgba(255,255,255,.06);
-      --card2: rgba(255,255,255,.08);
-      --border: rgba(255,255,255,.10);
-      --text: rgba(255,255,255,.92);
-      --muted: rgba(255,255,255,.66);
-      --muted2: rgba(255,255,255,.52);
-      --accent: #38d6c8; /* Loravo teal */
-      --shadow: 0 18px 60px rgba(0,0,0,.45);
+      /* Professional dark slate palette (less teal, more premium/clean) */
+      --bg0:#070A0D;
+      --bg1:#0B1118;
+      --card:#0F1722;
+      --card2:#121C2A;
+      --line:rgba(255,255,255,.08);
+      --text:rgba(255,255,255,.92);
+      --muted:rgba(255,255,255,.70);
+      --soft:rgba(255,255,255,.55);
+
+      /* subtle accent */
+      --accent:#56D6C7;
+      --accent2:#2EA7FF;
+
+      --radius:22px;
+      --radius2:16px;
+      --shadow: 0 18px 60px rgba(0,0,0,.55);
     }
 
-    *{ box-sizing:border-box; }
-    html,body{ height:100%; }
+    *{box-sizing:border-box}
+    html,body{height:100%}
     body{
       margin:0;
-      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial, "Helvetica Neue", Helvetica;
-      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      color:var(--text);
       background:
-        radial-gradient(1200px 800px at 15% 10%, rgba(56,214,200,.20), transparent 60%),
-        radial-gradient(1000px 700px at 85% 15%, rgba(80,120,255,.12), transparent 60%),
-        radial-gradient(900px 700px at 50% 90%, rgba(255,255,255,.05), transparent 60%),
-        var(--bg);
-      letter-spacing: .1px;
+        radial-gradient(900px 500px at 20% 10%, rgba(86,214,199,.12), transparent 60%),
+        radial-gradient(900px 600px at 90% 20%, rgba(46,167,255,.10), transparent 55%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
     }
 
     .wrap{
-      max-width: 980px;
+      max-width: 1060px;
       margin: 0 auto;
-      padding: 44px 18px 80px;
+      padding: 34px 18px 80px;
     }
 
-    /* top header */
-    .top{
+    /* Top bar */
+    .topbar{
       display:flex;
       align-items:center;
-      justify-content:space-between;
-      gap:16px;
-      margin-bottom: 22px;
-    }
-    .brand{
-      display:flex;
-      align-items:center;
+      justify-content:flex-start;
       gap:12px;
-      min-width: 240px;
+      padding: 10px 6px 18px;
     }
+
     .logo{
       width: 34px;
       height: 34px;
       border-radius: 10px;
+      object-fit: cover;
+      box-shadow: 0 8px 24px rgba(0,0,0,.35);
+      border:1px solid rgba(255,255,255,.12);
       background: rgba(255,255,255,.06);
-      border: 1px solid rgba(255,255,255,.10);
-      display:flex;
-      align-items:center;
-      justify-content:center;
-      overflow:hidden;
-    }
-    .logo img{
-      width: 26px;
-      height: 26px;
-      object-fit: contain;
-      display:block;
-    }
-    .brandText{
-      display:flex;
-      flex-direction:column;
-      line-height:1.1;
-    }
-    .brandText .name{
-      font-weight: 700;
-      letter-spacing:.18em;
-      font-size: 12px;
-      color: rgba(255,255,255,.70);
-    }
-    .brandText .sub{
-      font-weight: 600;
-      font-size: 13px;
-      color: rgba(255,255,255,.90);
-      margin-top: 4px;
-    }
-    .updated{
-      font-size: 12px;
-      color: var(--muted2);
-      text-align:right;
-      white-space:nowrap;
     }
 
-    /* hero card */
+    .brand{
+      display:flex;
+      flex-direction:column;
+      line-height:1.05;
+    }
+    .brand .name{
+      font-weight: 750;
+      letter-spacing: .12em;
+      font-size: 13px;
+      opacity:.9;
+    }
+    .brand .sub{
+      font-weight: 650;
+      font-size: 14px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    /* Hero card */
     .hero{
-      border: 1px solid var(--border);
-      background: linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.04));
-      border-radius: 22px;
+      background: linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.03));
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
       box-shadow: var(--shadow);
-      padding: 28px 26px;
+      padding: 22px 22px 18px;
       position: relative;
       overflow:hidden;
     }
+
     .hero:before{
       content:"";
-      position:absolute;
-      inset:-2px;
-      background:
-        radial-gradient(900px 500px at 20% 10%, rgba(56,214,200,.22), transparent 55%),
-        radial-gradient(800px 500px at 90% 20%, rgba(255,255,255,.08), transparent 60%);
+      position:absolute; inset:-2px;
+      background: radial-gradient(700px 240px at 20% 0%, rgba(86,214,199,.14), transparent 60%),
+                  radial-gradient(700px 260px at 80% 0%, rgba(46,167,255,.12), transparent 62%);
       pointer-events:none;
-      opacity:.85;
+      opacity:.9;
     }
-    .heroInner{ position:relative; }
+
+    .hero > *{position:relative}
 
     h1{
-      margin: 0 0 10px 0;
-      font-size: 38px;
-      letter-spacing: -.02em;
+      margin: 6px 0 8px;
+      font-size: 44px;
+      letter-spacing: -0.02em;
     }
+
     .lead{
-      margin: 0;
+      margin: 0 0 14px;
       color: var(--muted);
-      font-size: 15.5px;
-      max-width: 72ch;
+      max-width: 820px;
       line-height: 1.55;
+      font-size: 15.5px;
     }
 
-    .divider{
-      height:1px;
-      background: rgba(255,255,255,.10);
-      margin: 22px 0;
+    .promise{
+      margin-top: 12px;
+      padding: 14px 14px;
+      border-radius: 16px;
+      border: 1px solid rgba(86,214,199,.18);
+      background: rgba(86,214,199,.06);
+      color: rgba(255,255,255,.88);
+      font-weight: 600;
+      line-height:1.45;
+      font-size: 14px;
     }
 
-    /* sections */
-    .section{
-      margin-top: 18px;
+    .sectionTitle{
+      margin: 22px 0 10px;
+      font-size: 15px;
+      font-weight: 760;
+      color: rgba(255,255,255,.88);
+      letter-spacing: .02em;
     }
-    .section h2{
-      margin: 0 0 10px 0;
-      font-size: 16px;
-      letter-spacing: .01em;
-    }
-    .section p, .section li{
+
+    .p{
+      margin: 0 0 10px;
       color: var(--muted);
+      line-height: 1.65;
       font-size: 14.5px;
-      line-height: 1.6;
     }
-    ul{ margin: 10px 0 0 0; padding-left: 18px; }
 
-    /* grid cards */
+    /* Grid cards */
     .grid{
       display:grid;
       grid-template-columns: 1fr 1fr;
       gap: 14px;
-      margin-top: 14px;
+      margin-top: 10px;
     }
-    @media (max-width: 760px){
-      .grid{ grid-template-columns: 1fr; }
-      h1{ font-size: 32px; }
-      .updated{ text-align:left; }
-      .top{ flex-direction:column; align-items:flex-start; }
+
+    @media (max-width: 820px){
+      h1{font-size: 36px}
+      .grid{grid-template-columns: 1fr}
     }
+
     .card{
-      border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.05);
-      border-radius: 18px;
-      padding: 16px 16px;
+      background: linear-gradient(180deg, rgba(255,255,255,.05), rgba(255,255,255,.03));
+      border: 1px solid var(--line);
+      border-radius: var(--radius2);
+      padding: 14px 14px 12px;
     }
-    .card .title{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-      margin-bottom: 8px;
-    }
-    .card .title strong{
+
+    .card h3{
+      margin: 0 0 8px;
       font-size: 13.5px;
-      letter-spacing: .01em;
-      color: rgba(255,255,255,.92);
-    }
-    .tag{
-      font-size: 11px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      border: 1px solid rgba(255,255,255,.10);
-      background: rgba(255,255,255,.06);
-      color: rgba(255,255,255,.70);
-      white-space:nowrap;
+      letter-spacing: .02em;
+      text-transform:none;
+      color: rgba(255,255,255,.90);
     }
 
-    /* highlight promise */
-    .promise{
-      margin-top: 14px;
-      border-radius: 18px;
-      border: 1px solid rgba(56,214,200,.25);
-      background: linear-gradient(180deg, rgba(56,214,200,.10), rgba(255,255,255,.04));
-      padding: 14px 16px;
-    }
-    .promise strong{
-      color: rgba(255,255,255,.92);
+    ul{
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+      line-height: 1.65;
+      font-size: 14px;
     }
 
-    /* footer */
     .footer{
       margin-top: 22px;
-      color: var(--muted2);
-      font-size: 12.5px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      color: var(--soft);
+      font-size: 13px;
+      line-height:1.6;
     }
-    a{ color: rgba(56,214,200,.92); text-decoration:none; }
-    a:hover{ text-decoration:underline; }
+
+    a{color: rgba(86,214,199,.95); text-decoration:none}
+    a:hover{text-decoration:underline}
+
+    /* subtle entrance (professional, not flashy) */
+    @keyframes fadeUp { from {opacity:0; transform: translateY(10px)} to {opacity:1; transform: translateY(0)} }
+    .hero{ animation: fadeUp .35s ease-out both; }
   </style>
 </head>
 
 <body>
   <div class="wrap">
-
-    <div class="top">
+    <!-- Top bar (logo + title). NO "Last updated" anywhere. -->
+    <div class="topbar">
+      <!-- Logo file must exist at: public/logo.png -->
+      <img class="logo" src="/logo.png" alt="Loravo logo" />
       <div class="brand">
-        <div class="logo">
-          <!-- ✅ logo file served from /public/logo.png -->
-          <img src="/logo.png" alt="Loravo logo">
-        </div>
-        <div class="brandText">
-          <div class="name">LORAVO</div>
-          <div class="sub">Privacy Policy</div>
-        </div>
+        <div class="name">LORAVO</div>
+        <div class="sub">Privacy Policy</div>
       </div>
-
-      <div class="updated">Last updated: 2026-02-14</div>
     </div>
 
     <div class="hero">
-      <div class="heroInner">
-        <h1>Privacy, by design.</h1>
-        <p class="lead">
-          Loravo helps manage communications through connected services (Gmail, Outlook, Yahoo) and LXT AI features.
-          Data remains user-controlled. Connections can be removed at any time.
-        </p>
+      <h1>Privacy, by design.</h1>
+      <p class="lead">
+        Loravo helps you manage communications through connected services (Gmail, Outlook, Yahoo) and LXT AI features.
+        Your data remains user-controlled — connections can be removed at any time.
+      </p>
 
-        <!-- ✅ Removed the circled bars/pills completely -->
+      <div class="promise">
+        Core promise: Loravo does not sell personal information. Connected email data is not used to build advertising profiles.
+        Provider data is accessed only when you explicitly connect a provider and request a feature that requires it.
+      </div>
 
-        <div class="promise">
-          <strong>Core promise:</strong>
-          Personal information is not sold. Connected email data is not used to build advertising profiles.
-          Provider data is accessed only when a connection is explicitly enabled and a requested feature requires it.
-        </div>
+      <div class="sectionTitle">1) What Loravo is</div>
+      <p class="p">
+        Loravo is an application that can connect to third-party providers you authorize (such as Gmail, Outlook, and Yahoo)
+        to deliver features you request — including inbox viewing, email tools, summaries, organization, and assistant-style workflows using LXT.
+      </p>
 
-        <div class="divider"></div>
-
-        <div class="section">
-          <h2>1) What Loravo is</h2>
-          <p>
-            Loravo is an application that can connect to third-party providers authorized by the user
-            (such as Google/Gmail, Microsoft/Outlook, and Yahoo) to provide requested features —
-            including inbox viewing, email tools, summaries, organization, and assistant-style workflows using LXT.
-          </p>
-        </div>
-
-        <div class="section">
-          <h2>2) Information collected</h2>
-
-          <div class="grid">
-            <div class="card">
-              <div class="title">
-                <strong>Account & identifiers</strong>
-                <span class="tag">Required</span>
-              </div>
-              <ul>
-                <li>Email address and/or phone number (depending on sign-in method).</li>
-                <li>Internal account ID (e.g., Firebase UID) to associate settings and connections.</li>
-              </ul>
-            </div>
-
-            <div class="card">
-              <div class="title">
-                <strong>Connected provider tokens</strong>
-                <span class="tag">OAuth</span>
-              </div>
-              <ul>
-                <li>OAuth access/refresh tokens for Gmail, Outlook, or Yahoo only when a provider is connected.</li>
-                <li>Token expiry timestamps and connection status for reliability.</li>
-              </ul>
-            </div>
-
-            <div class="card">
-              <div class="title">
-                <strong>Content requested for features</strong>
-                <span class="tag">User-initiated</span>
-              </div>
-              <ul>
-                <li>Email metadata/content only when loading inbox, opening a message, or generating a summary.</li>
-                <li>Messages typed into the app for chat or assistant workflows.</li>
-              </ul>
-            </div>
-
-            <div class="card">
-              <div class="title">
-                <strong>Optional context</strong>
-                <span class="tag">Optional</span>
-              </div>
-              <ul>
-                <li>Location used only when enabled for local weather/news features.</li>
-                <li>Preferences (theme, settings) to personalize the experience.</li>
-              </ul>
-            </div>
-          </div>
-        </div>
-
-        <div class="section">
-          <h2>3) How information is used</h2>
+      <div class="sectionTitle">2) Information we collect</div>
+      <div class="grid">
+        <div class="card">
+          <h3>Account & identifiers</h3>
           <ul>
-            <li>Provide features requested in-app (inbox, search, read, send, summaries, organization, alerts).</li>
-            <li>Secure access to connected providers and keep sessions reliable.</li>
-            <li>Maintain service performance, prevent abuse, and diagnose errors.</li>
+            <li>Email address and/or phone number (depending on sign-in method).</li>
+            <li>Internal account ID (e.g., Firebase UID) to associate settings and connections.</li>
           </ul>
         </div>
 
-        <div class="section">
-          <h2>4) LXT AI and processing</h2>
-          <p>
-            LXT is the AI system used to generate summaries, suggested replies, and assistant-style workflows.
-            AI processing runs only when a feature is explicitly triggered (for example: “summarize this email”).
-          </p>
+        <div class="card">
+          <h3>Connected provider tokens</h3>
           <ul>
-            <li>Only the minimum necessary content is processed for the requested feature.</li>
-            <li>Provider tokens are stored securely and are not shared with unrelated parties.</li>
+            <li>OAuth access/refresh tokens for Gmail, Outlook, or Yahoo only when you connect a provider.</li>
+            <li>Token expiry timestamps and connection status for reliability.</li>
           </ul>
         </div>
 
-        <div class="section">
-          <h2>5) Sharing</h2>
-          <p>
-            Personal information is not sold. Data is shared only in these situations:
-          </p>
+        <div class="card">
+          <h3>Content you request Loravo to process</h3>
           <ul>
-            <li>With service infrastructure providers needed to operate the app (hosting, databases).</li>
-            <li>With third-party APIs that are explicitly connected (Gmail, Outlook, Yahoo) to perform requested actions.</li>
+            <li>Email metadata/content only when loading inbox, reading a message, or generating a summary you request.</li>
+            <li>Messages and preferences you choose to submit to the app.</li>
           </ul>
         </div>
 
-        <div class="section">
-          <h2>6) Retention and control</h2>
+        <div class="card">
+          <h3>Optional context</h3>
           <ul>
-            <li>Data is retained only as needed to provide the service.</li>
-            <li>A connected provider can be disconnected at any time, which revokes access for future requests.</li>
-            <li>Deletion requests can be submitted via the contact email below.</li>
+            <li>Location only when enabled for local weather/news features.</li>
+            <li>Device & diagnostics signals for security and performance (limited, non-advertising use).</li>
           </ul>
         </div>
+      </div>
 
-        <div class="section">
-          <h2>7) Contact</h2>
-          <p>
-            Email: <a href="mailto:loravolxt@yahoo.com">loravolxt@yahoo.com</a>
-          </p>
-        </div>
+      <div class="sectionTitle">3) How we use information</div>
+      <ul>
+        <li>To provide app features you request (email tools, summaries, alerts, organization).</li>
+        <li>To operate, secure, and maintain the service.</li>
+        <li>To improve reliability and performance.</li>
+      </ul>
 
-        <div class="footer">
-          This page is provided for transparency and compliance purposes.
-        </div>
+      <div class="sectionTitle">4) Sharing</div>
+      <p class="p">
+        Loravo does not sell your personal information. We only share data with service providers necessary to operate Loravo
+        (hosting, databases) and with third-party APIs you explicitly connect (e.g., Google/Microsoft/Yahoo). We do not share connected
+        mail data for advertising, profiling, or audience targeting.
+      </p>
 
+      <div class="sectionTitle">5) Data retention</div>
+      <p class="p">
+        We retain data as needed to provide the service. You may disconnect providers at any time, which revokes access going forward.
+        You may request deletion by contacting us.
+      </p>
+
+      <div class="sectionTitle">6) Contact</div>
+      <p class="p">
+        Email: <a href="mailto:loravolxt@yahoo.com">loravolxt@yahoo.com</a>
+      </p>
+
+      <div class="footer">
+        Loravo supports sign-in via Apple and Google. Provider connections (Gmail/Outlook/Yahoo) use OAuth where available and are always user-initiated.
       </div>
     </div>
-
   </div>
 </body>
 </html>
