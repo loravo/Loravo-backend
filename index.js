@@ -71,6 +71,9 @@ app.use("/gmail", gmailRoute);
 const yahoo = require("./Emails/yahoo");
 app.use("/yahoo", yahoo);
 
+const outlook = require("./Emails/outlook");
+app.use("/outlook", outlook);
+
 // ✅ Serve /public at the site root (so /logo.png works)
 app.use(express.static(path.join(__dirname, "public")));
 
