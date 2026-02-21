@@ -3,7 +3,10 @@
  *
  * ✅ Uses /services/LXT.js for /chat + /lxt1 (AI brain isolated)
  * ✅ index.js keeps: DB, state/location/weather/news ingest, alert queue, push, prefs
- * ✅ NEW: Gmail (OAuth) routes mounted from /Emails/gmail.js
+ * ✅ Email providers mounted + LXT email services wired:
+ *    - Gmail   ./Emails/gmail   -> exports { router, service }
+ *    - Yahoo   ./Emails/yahoo   -> exports { router, service }
+ *    - Outlook ./Emails/outlook -> exports { router, service }
  *
  * Endpoints:
  *  - GET  /                -> basic root
@@ -12,12 +15,12 @@
  *  - POST /chat            -> { reply, lxt1?, providers meta } (via LXT.js)
  *
  * Stay-Ahead Engine:
- *  - POST /state/location  -> update user location, detect meaningful changes, queue alerts
- *  - POST /state/weather   -> force weather check, detect meaningful changes, queue alerts
- *  - GET  /poll            -> app polls for queued alerts
- *  - GET  /history         -> alert history
- *  - POST /trip/set        -> store active trip context (simple)
- *  - POST /news/ingest     -> ingest your own “news event” and queue if meaningful
+ *  - POST /state/location
+ *  - POST /state/weather
+ *  - GET  /poll
+ *  - GET  /history
+ *  - POST /trip/set
+ *  - POST /news/ingest
  *
  * Push (v1):
  *  - POST /push/register
@@ -26,13 +29,6 @@
  * Prefs:
  *  - POST /prefs/quiet-hours
  *  - GET  /prefs
- *
- * Gmail (OAuth v1):
- *  - (mounted) /gmail/*     -> handled by ./Emails/gmail.js (you create these routes)
- *
- * Query params (for LXT.js):
- *  - provider=openai | gemini | trinity   (default: trinity)
- *  - mode=instant | auto | thinking       (default: auto)
  *************************************************/
 
 require("dotenv").config();
@@ -49,9 +45,10 @@ const http2 = require("http2");
 const weatherRoute = require("./services/weather");
 const newsRoute = require("./services/news");
 
-// ✅ Gmail routes (IMPORTANT: case-sensitive on Render/Linux)
-// Must be EXACT file path: Emails/gmail.js
-const gmailRoute = require("./Emails/gmail");
+// ✅ Email provider packages (must export { router, service })
+const gmailPkg = require("./Emails/gmail");     // { router, service }
+const yahooPkg = require("./Emails/yahoo");     // { router, service }
+const outlookPkg = require("./Emails/outlook"); // { router, service }
 
 // ✅ MOVED: LXT engine lives in /services now
 const { createLXT } = require("./services/LXT"); // file: /services/LXT.js
@@ -64,15 +61,10 @@ app.use(cors({ origin: "*" }));
 app.use("/", weatherRoute);
 app.use("/", newsRoute);
 
-// Mount Gmail routes under /gmail
-// Your ./Emails/gmail.js must export an express.Router()
-app.use("/gmail", gmailRoute);
-
-const yahoo = require("./Emails/yahoo");
-app.use("/yahoo", yahoo);
-
-const outlook = require("./Emails/outlook");
-app.use("/outlook", outlook);
+// Mount email routes
+app.use("/gmail", gmailPkg.router);
+app.use("/yahoo", yahooPkg.router);
+app.use("/outlook", outlookPkg.router);
 
 // ✅ Serve /public at the site root (so /logo.png works)
 app.use(express.static(path.join(__dirname, "public")));
@@ -90,10 +82,6 @@ app.get("/terms", (req, res) => {
 // ===============================================
 
 /* ===================== DB (OPTIONAL) ===================== */
-/**
- * Local Postgres often has NO SSL -> do NOT force SSL locally.
- * Render Postgres requires SSL -> do SSL in production / non-local URLs.
- */
 function isLocalDbUrl(url) {
   if (!url) return true;
   const u = String(url);
@@ -151,6 +139,24 @@ async function initDb() {
       last_alert_at TIMESTAMPTZ,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+  `);
+
+  // ✅ Common extra columns (safe)
+  await pool.query(`
+    ALTER TABLE user_state
+      ADD COLUMN IF NOT EXISTS voice_profile TEXT,
+      ADD COLUMN IF NOT EXISTS voice_profile_updated_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS preferred_email_provider TEXT;
+  `);
+
+  // ✅ CRITICAL: Yahoo router stores tokens in user_state (these columns MUST exist)
+  await pool.query(`
+    ALTER TABLE user_state
+      ADD COLUMN IF NOT EXISTS yahoo_connected BOOLEAN,
+      ADD COLUMN IF NOT EXISTS yahoo_email TEXT,
+      ADD COLUMN IF NOT EXISTS yahoo_access_token TEXT,
+      ADD COLUMN IF NOT EXISTS yahoo_refresh_token TEXT,
+      ADD COLUMN IF NOT EXISTS yahoo_token_expires_at TIMESTAMPTZ;
   `);
 
   await pool.query(`
@@ -221,14 +227,12 @@ async function initDb() {
 }
 
 /* ===================== DB SAFE WRAPPERS ===================== */
-
 async function dbQuery(sql, params) {
   if (!pool || !dbReady) return { rows: [] };
   return pool.query(sql, params);
 }
 
 /* ===================== HELPERS ===================== */
-
 function clamp(n, a, b) {
   const x = Number(n);
   if (!Number.isFinite(x)) return a;
@@ -256,7 +260,6 @@ function minutesFromHHMM(hhmm) {
 }
 
 /* ===================== USER MEMORY ===================== */
-
 async function loadUserMemory(userId) {
   if (!userId) return "";
   const { rows } = await dbQuery(
@@ -272,7 +275,6 @@ async function saveUserMemory(userId, text) {
 }
 
 /* ===================== USER STATE ===================== */
-
 async function loadUserState(userId) {
   if (!userId) return null;
   const { rows } = await dbQuery(`SELECT * FROM user_state WHERE user_id=$1 LIMIT 1`, [userId]);
@@ -300,7 +302,6 @@ async function upsertUserState(userId, patch) {
 }
 
 /* ===================== PREFS ===================== */
-
 async function loadUserPrefs(userId) {
   if (!userId || !dbReady) return null;
   const { rows } = await dbQuery(`SELECT * FROM user_prefs WHERE user_id=$1 LIMIT 1`, [userId]);
@@ -343,7 +344,6 @@ function isNowInQuietHours(prefs) {
 }
 
 /* ===================== WEATHER (Stay-ahead only) ===================== */
-
 async function getWeather(lat, lon) {
   if (typeof lat !== "number" || typeof lon !== "number" || !process.env.OPENWEATHER_API_KEY) return null;
 
@@ -357,7 +357,6 @@ async function getWeather(lat, lon) {
 }
 
 /* ===================== ALERT QUEUE ===================== */
-
 const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 
 async function enqueueAlert({ userId, alertType, message, payload }) {
@@ -410,7 +409,6 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
 }
 
 /* ===================== ALERT COMPOSERS ===================== */
-
 function formatC(n) {
   if (typeof n !== "number") return null;
   return `${Math.round(n)}°C`;
@@ -484,7 +482,6 @@ function isMeaningfulLocationChange(prevLat, prevLon, nowLat, nowLon) {
 }
 
 /* ===================== STAY-AHEAD ENGINE ===================== */
-
 async function updateLocationAndMaybeAlert({ userId, lat, lon, city, country, timezone }) {
   if (!userId || typeof lat !== "number" || typeof lon !== "number") return;
 
@@ -561,25 +558,7 @@ async function updateWeatherAndMaybeAlert({ userId, lat, lon }) {
   }
 }
 
-/* ===================== NEWS (DB helper) ===================== */
-
-async function getRecentNewsForUser(userId, limit = 6) {
-  if (!dbReady || !userId) return [];
-  const { rows } = await dbQuery(
-    `
-    SELECT title, summary, region, severity, action, created_at
-    FROM news_events
-    WHERE user_id=$1
-    ORDER BY created_at DESC
-    LIMIT $2
-    `,
-    [userId, limit]
-  );
-  return rows || [];
-}
-
 /* ===================== PUSH (APNs) ===================== */
-
 function base64urlBuffer(buf) {
   return Buffer.from(buf).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
@@ -616,18 +595,13 @@ function getApnsConfig() {
 
 function makeApnsJwt() {
   const { keyId, teamId, keyObject } = getApnsConfig();
-
   const header = { alg: "ES256", kid: keyId, typ: "JWT" };
   const payload = { iss: teamId, iat: Math.floor(Date.now() / 1000) };
-
   const unsigned = `${base64urlJson(header)}.${base64urlJson(payload)}`;
 
   let sig;
   try {
-    sig = crypto.sign(null, Buffer.from(unsigned), {
-      key: keyObject,
-      dsaEncoding: "ieee-p1363",
-    });
+    sig = crypto.sign(null, Buffer.from(unsigned), { key: keyObject, dsaEncoding: "ieee-p1363" });
   } catch (e) {
     throw new Error(`JWT sign failed: ${e?.message || e}`);
   }
@@ -643,14 +617,10 @@ function normalizeEnv(e) {
 async function apnsSendStrict({ deviceToken, title, body, payload, environment }) {
   const { topic } = getApnsConfig();
   const jwt = makeApnsJwt();
-
   const host = normalizeEnv(environment) === "sandbox" ? "api.sandbox.push.apple.com" : "api.push.apple.com";
 
   const notification = {
-    aps: {
-      alert: { title: title || "Loravo", body: body || "" },
-      sound: "default",
-    },
+    aps: { alert: { title: title || "Loravo", body: body || "" }, sound: "default" },
     ...(payload || {}),
   };
 
@@ -674,11 +644,7 @@ async function apnsSendStrict({ deviceToken, title, body, payload, environment }
       req.on("data", (chunk) => (respData += chunk));
       req.on("end", () => {
         client.close();
-        resolve({
-          ok: Number(status) >= 200 && Number(status) < 300,
-          status: Number(status),
-          body: respData || "",
-        });
+        resolve({ ok: Number(status) >= 200 && Number(status) < 300, status: Number(status), body: respData || "" });
       });
     });
 
@@ -693,7 +659,6 @@ async function apnsSendStrict({ deviceToken, title, body, payload, environment }
 }
 
 /* ===================== PUSH DB HELPERS ===================== */
-
 async function getUserDevices(userId) {
   if (!dbReady) return [];
   const { rows } = await dbQuery(
@@ -711,7 +676,6 @@ async function registerDevice({ userId, deviceToken, environment, platform = "io
   const token = String(deviceToken || "").trim();
   if (!token) throw new Error("Missing device_token");
 
-  // matches YOUR constraint: UNIQUE(user_id, environment)
   await dbQuery(
     `
     INSERT INTO push_devices (user_id, device_token, environment, platform)
@@ -728,7 +692,6 @@ async function registerDevice({ userId, deviceToken, environment, platform = "io
 }
 
 /* ===================== AUTO PUSH (best-effort) ===================== */
-
 async function maybeSendPushForAlert({ userId, alertType, message, payload }) {
   if (!dbReady) return;
 
@@ -739,12 +702,7 @@ async function maybeSendPushForAlert({ userId, alertType, message, payload }) {
   const devices = await getUserDevices(userId);
   if (!devices.length) return;
 
-  const pushPayload = {
-    kind: alertType,
-    user_id: userId,
-    message,
-    ...(payload || {}),
-  };
+  const pushPayload = { kind: alertType, user_id: userId, message, ...(payload || {}) };
 
   for (const d of devices) {
     const r = await apnsSendStrict({
@@ -754,15 +712,11 @@ async function maybeSendPushForAlert({ userId, alertType, message, payload }) {
       payload: pushPayload,
       environment: normalizeEnv(d.environment),
     });
-
-    if (!r.ok) {
-      console.error("⚠️ APNs send failed:", r.status, r.body);
-    }
+    if (!r.ok) console.error("⚠️ APNs send failed:", r.status, r.body);
   }
 }
 
 /* ===================== ALERT POLLING ===================== */
-
 async function pollAlerts(userId, limit = 5) {
   if (!dbReady) return [];
 
@@ -801,7 +755,6 @@ async function pollAlerts(userId, limit = 5) {
 
 async function getAlertHistory(userId, limit = 50, offset = 0) {
   if (!dbReady) return [];
-
   const { rows } = await dbQuery(
     `
     SELECT id, alert_type, message, payload, created_at, delivered_at
@@ -812,19 +765,101 @@ async function getAlertHistory(userId, limit = 50, offset = 0) {
     `,
     [userId, limit, offset]
   );
-
   return rows || [];
 }
 
-/* ===================== LXT INSTANCE ===================== */
+/* ===================== EMAIL SERVICE (MAXED) ===================== */
+// Provider resolution: if provider not supplied, pick preferred if connected else first connected.
+async function resolveEmailProvider({ userId, provider }) {
+  const wanted = String(provider || "").trim().toLowerCase();
 
+  const providers = [];
+  try {
+    const g = await gmailPkg.service.getConnectedProviders({ userId });
+    (g || []).forEach((p) => providers.push(p));
+  } catch {}
+  try {
+    const y = await yahooPkg.service.getConnectedProviders({ userId });
+    (y || []).forEach((p) => providers.push(p));
+  } catch {}
+  try {
+    const o = await outlookPkg.service.getConnectedProviders({ userId });
+    (o || []).forEach((p) => providers.push(p));
+  } catch {}
+
+  const unique = Array.from(new Set(providers));
+
+  if (wanted) {
+    if (!unique.includes(wanted)) {
+      throw new Error(`Email provider "${wanted}" is not connected (connected: ${unique.join(", ") || "none"})`);
+    }
+    return { provider: wanted, connected: unique };
+  }
+
+  // Preferred provider stored in user_state (optional)
+  const st = await loadUserState(userId);
+  const preferred = String(st?.preferred_email_provider || "").trim().toLowerCase();
+  if (preferred && unique.includes(preferred)) return { provider: preferred, connected: unique };
+
+  // Otherwise first connected
+  if (unique.length) return { provider: unique[0], connected: unique };
+
+  return { provider: null, connected: [] };
+}
+
+const services = {
+  email: {
+    getConnectedProviders: async ({ userId }) => {
+      const r = await resolveEmailProvider({ userId, provider: null });
+      return r.connected;
+    },
+
+    list: async ({ provider, userId, q, max }) => {
+      const r = await resolveEmailProvider({ userId, provider });
+      if (!r.provider) throw new Error("No email provider connected");
+      if (r.provider === "gmail") return gmailPkg.service.list({ userId, q, max });
+      if (r.provider === "yahoo") return yahooPkg.service.list({ userId, q, max });
+      if (r.provider === "outlook") return outlookPkg.service.list({ userId, q, max });
+      throw new Error("Unsupported provider");
+    },
+
+    send: async ({ provider, userId, to, subject, body, threadId }) => {
+      const r = await resolveEmailProvider({ userId, provider });
+      if (!r.provider) throw new Error("No email provider connected");
+      if (r.provider === "gmail") return gmailPkg.service.send({ userId, to, subject, body, threadId });
+      if (r.provider === "yahoo") return yahooPkg.service.send({ userId, to, subject, body, threadId });
+      if (r.provider === "outlook") return outlookPkg.service.send({ userId, to, subject, body, threadId });
+      throw new Error("Unsupported provider");
+    },
+
+    replyLatest: async ({ provider, userId, body }) => {
+      const r = await resolveEmailProvider({ userId, provider });
+      if (!r.provider) throw new Error("No email provider connected");
+      if (r.provider === "gmail") return gmailPkg.service.replyLatest({ userId, body });
+      if (r.provider === "yahoo") return yahooPkg.service.replyLatest({ userId, body });
+      if (r.provider === "outlook") return outlookPkg.service.replyLatest({ userId, body });
+      throw new Error("Unsupported provider");
+    },
+
+    replyById: async ({ provider, userId, messageId, body }) => {
+      const r = await resolveEmailProvider({ userId, provider });
+      if (!r.provider) throw new Error("No email provider connected");
+      if (r.provider === "gmail") return gmailPkg.service.replyById({ userId, messageId, body });
+      if (r.provider === "yahoo") return yahooPkg.service.replyById({ userId, messageId, body });
+      if (r.provider === "outlook") return outlookPkg.service.replyById({ userId, messageId, body });
+      throw new Error("Unsupported provider");
+    },
+  },
+};
+
+/* ===================== LXT INSTANCE ===================== */
 const lxt = createLXT({
   pool,
   getDbReady: () => dbReady,
+  services,
 });
 
 /* ===================== HEALTH + ROOT ===================== */
-
 app.get("/", (_, res) => {
   res.json({
     service: "Loravo backend",
@@ -845,6 +880,8 @@ app.get("/", (_, res) => {
       "/prefs/quiet-hours",
       "/prefs",
       "/gmail/*",
+      "/yahoo/*",
+      "/outlook/*",
     ],
   });
 });
@@ -852,10 +889,8 @@ app.get("/", (_, res) => {
 app.get("/health", (_, res) => res.json({ ok: true, db: dbReady }));
 
 /* ===================== AI ENDPOINTS (LXT.js) ===================== */
-
 app.post("/lxt1", async (req, res) => {
   try {
-    // ✅ forceDecision makes sure lxt1 is never null
     const result = await lxt.runLXT({ req, forceDecision: true });
     res.json({
       ...result.lxt1,
@@ -871,14 +906,11 @@ app.post("/lxt1", async (req, res) => {
 app.post("/chat", async (req, res) => {
   try {
     const result = await lxt.runLXT({ req });
-
     res.json({
       reply: result.reply,
-      lxt1: result.lxt1, // may be null for chat_fast/news_fast paths (by design)
+      lxt1: result.lxt1,
       _providers: result.providers,
-      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply
-        ? { _errors: result._errors }
-        : {}),
+      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply ? { _errors: result._errors } : {}),
     });
   } catch (e) {
     res.status(500).json({ error: "server error", detail: String(e?.message || e) });
@@ -886,7 +918,6 @@ app.post("/chat", async (req, res) => {
 });
 
 /* ===================== STAY-AHEAD ENDPOINTS ===================== */
-
 app.post("/state/location", async (req, res) => {
   try {
     const { user_id, lat, lon, city, country, timezone } = req.body || {};
@@ -966,13 +997,7 @@ app.post("/trip/set", async (req, res) => {
         notes=EXCLUDED.notes,
         updated_at=NOW()
     `,
-      [
-        user_id,
-        Boolean(active),
-        destination || null,
-        depart_at ? new Date(depart_at).toISOString() : null,
-        notes || null,
-      ]
+      [user_id, Boolean(active), destination || null, depart_at ? new Date(depart_at).toISOString() : null, notes || null]
     );
 
     if (active && destination) {
@@ -998,18 +1023,14 @@ app.post("/news/ingest", async (req, res) => {
 
     const sev = String(severity || "low").toLowerCase();
 
-    // store ingested news (even low)
     if (dbReady) {
       await dbQuery(
-        `
-        INSERT INTO news_events (user_id, title, summary, region, severity, action)
-        VALUES ($1,$2,$3,$4,$5,$6)
-        `,
+        `INSERT INTO news_events (user_id, title, summary, region, severity, action)
+         VALUES ($1,$2,$3,$4,$5,$6)`,
         [user_id, title, summary || null, region || null, sev, action || null]
       );
     }
 
-    // queue alert only if meaningful
     const meaningful = ["medium", "high", "critical"].includes(sev);
 
     if (meaningful && dbReady) {
@@ -1036,23 +1057,15 @@ app.post("/news/ingest", async (req, res) => {
 });
 
 /* ===================== PUSH ENDPOINTS ===================== */
-
 app.post("/push/register", async (req, res) => {
   try {
     const { user_id, device_token, environment } = req.body || {};
-
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (!device_token) return res.status(400).json({ error: "Missing device_token" });
     if (!environment) return res.status(400).json({ error: "Missing environment" });
     if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled" });
 
-    await registerDevice({
-      userId: String(user_id),
-      deviceToken: String(device_token),
-      environment: String(environment),
-      platform: "ios",
-    });
-
+    await registerDevice({ userId: String(user_id), deviceToken: String(device_token), environment: String(environment), platform: "ios" });
     return res.json({ ok: true, db: true });
   } catch (e) {
     console.error("❌ /push/register error:", e);
@@ -1066,23 +1079,15 @@ app.post("/push/send-test", async (req, res) => {
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    if (!dbReady) {
-      return res.status(200).json({ ok: true, db: false, note: "DB disabled — cannot send test push." });
-    }
+    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — cannot send test push." });
 
     const envWanted = environment ? normalizeEnv(environment) : null;
-
     let devices = await getUserDevices(String(user_id));
     if (envWanted) devices = devices.filter((d) => normalizeEnv(d.environment) === envWanted);
-
-    if (!devices.length) {
-      return res.status(400).json({ error: "No device registered for this user_id (and environment)" });
-    }
+    if (!devices.length) return res.status(400).json({ error: "No device registered for this user_id (and environment)" });
 
     const prefs = await loadUserPrefs(String(user_id));
-    if (!force && isNowInQuietHours(prefs)) {
-      return res.json({ ok: true, db: true, skipped: true, reason: "quiet_hours" });
-    }
+    if (!force && isNowInQuietHours(prefs)) return res.json({ ok: true, db: true, skipped: true, reason: "quiet_hours" });
 
     const results = [];
     for (const d of devices) {
@@ -1103,7 +1108,6 @@ app.post("/push/send-test", async (req, res) => {
 });
 
 /* ===================== PREFS ENDPOINTS ===================== */
-
 app.post("/prefs/quiet-hours", async (req, res) => {
   try {
     const { user_id, enabled, start, end, timezone } = req.body || {};
@@ -1160,7 +1164,6 @@ app.get("/prefs", async (req, res) => {
 });
 
 /* ===================== START ===================== */
-
 const PORT = process.env.PORT || 3000;
 
 (async () => {

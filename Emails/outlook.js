@@ -11,8 +11,8 @@
 // ✅ Friendly GET routes for quick testing
 //
 // Mount in index.js:
-//   const outlook = require("./Emails/outlook");
-//   app.use("/outlook", outlook);
+//   const outlookPkg = require("./Emails/outlook");
+//   app.use("/outlook", outlookPkg.router);
 //
 // Required env:
 //   OUTLOOK_CLIENT_ID
@@ -236,7 +236,6 @@ async function ensureFreshAccessToken(userId) {
   const accessToken = tokens.access_token;
   const refreshToken = tokens.refresh_token;
 
-  // If no expiry info, just try with current access_token.
   const expiresAt = tokens.expires_at ? Number(tokens.expires_at) : null;
   const expiresOn = tokens.expires_on ? Number(tokens.expires_on) : null;
   const expMs = expiresAt ? expiresAt : expiresOn ? expiresOn * 1000 : null;
@@ -251,7 +250,6 @@ async function ensureFreshAccessToken(userId) {
     throw err;
   }
 
-  // Refresh via token endpoint (x-www-form-urlencoded)
   const body = new URLSearchParams();
   body.set("client_id", CLIENT_ID);
   body.set("client_secret", CLIENT_SECRET);
@@ -259,7 +257,6 @@ async function ensureFreshAccessToken(userId) {
   body.set("refresh_token", refreshToken);
   body.set("redirect_uri", REDIRECT_URI);
 
-  // Recommended scopes for refresh: include the same ones you requested
   body.set(
     "scope",
     [
@@ -286,18 +283,13 @@ async function ensureFreshAccessToken(userId) {
     throw err;
   }
 
-  const refreshed = {
-    ...tokens,
-    ...json,
-  };
+  const refreshed = { ...tokens, ...json };
 
-  // Compute expires_at (ms) for easy checks
   if (typeof json.expires_in === "number" || /^\d+$/.test(String(json.expires_in || ""))) {
     const sec = Number(json.expires_in);
     refreshed.expires_at = Date.now() + sec * 1000;
   }
 
-  // If refresh response did not include refresh_token, keep existing one
   if (!refreshed.refresh_token && refreshToken) refreshed.refresh_token = refreshToken;
 
   await saveTokens(userId, refreshed, record.email || null);
@@ -348,7 +340,6 @@ async function graphRequest(userId, method, path, { query, body, headers } = {})
 }
 
 function pickSender(item) {
-  // Graph messages: from.emailAddress.address, sender.emailAddress.address
   const from = item?.from?.emailAddress?.address || null;
   const fromName = item?.from?.emailAddress?.name || null;
   const sender = item?.sender?.emailAddress?.address || null;
@@ -424,7 +415,6 @@ router.get("/auth-url", async (req, res) => {
       exp: Date.now() + 10 * 60 * 1000,
     });
 
-    // v2 scopes must include "offline_access" to get refresh_token
     const scope = [
       "openid",
       "profile",
@@ -442,7 +432,6 @@ router.get("/auth-url", async (req, res) => {
     u.searchParams.set("response_mode", "query");
     u.searchParams.set("scope", scope);
     u.searchParams.set("state", state);
-    // This forces a consent prompt so you get refresh_token reliably
     u.searchParams.set("prompt", "consent");
 
     res.json({ ok: true, url: u.toString() });
@@ -494,15 +483,12 @@ router.get("/oauth2callback", async (req, res) => {
     const userId = String(state.user_id);
     const mode = String(state.mode || "").trim();
 
-    // Exchange code for tokens
     const body = new URLSearchParams();
     body.set("client_id", CLIENT_ID);
     body.set("client_secret", CLIENT_SECRET);
     body.set("grant_type", "authorization_code");
     body.set("code", code);
     body.set("redirect_uri", REDIRECT_URI);
-
-    // Must match what you asked in authorize
     body.set(
       "scope",
       [
@@ -529,28 +515,16 @@ router.get("/oauth2callback", async (req, res) => {
 
     const tokens = { ...json };
 
-    // Compute expires_at (ms)
     if (typeof tokens.expires_in === "number" || /^\d+$/.test(String(tokens.expires_in || ""))) {
       tokens.expires_at = Date.now() + Number(tokens.expires_in) * 1000;
     }
 
-    // Fetch user email from Graph
     let email = null;
     try {
-      const me = await (async () => {
-        const url = `${GRAPH_BASE}/me`;
-        const rr = await fetch(url, {
-          headers: { Authorization: `Bearer ${tokens.access_token}` },
-        });
-        const t = await rr.text();
-        const j = t ? JSON.parse(t) : null;
-        return j;
-      })();
-
-      // Most common fields:
-      // - mail (work/school)
-      // - userPrincipalName (work/school)
-      // - For personal accounts, sometimes mail is null; still UPN-ish exists.
+      const url = `${GRAPH_BASE}/me`;
+      const rr = await fetch(url, { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+      const t = await rr.text();
+      const me = t ? JSON.parse(t) : null;
       email = me?.mail || me?.userPrincipalName || null;
     } catch {
       email = null;
@@ -558,7 +532,6 @@ router.get("/oauth2callback", async (req, res) => {
 
     await saveTokens(userId, tokens, email);
 
-    // iOS auto-close
     if (mode === "app") {
       const deeplink = `loravo://connected?provider=outlook&user_id=${encodeURIComponent(
         userId
@@ -566,7 +539,6 @@ router.get("/oauth2callback", async (req, res) => {
       return res.redirect(deeplink);
     }
 
-    // Desktop/manual testing
     const successPage = `${SUCCESS_WEB_BASE}/outlook/connected?user_id=${encodeURIComponent(
       userId
     )}&email=${encodeURIComponent(email || "")}`;
@@ -614,18 +586,14 @@ router.post("/list", async (req, res) => {
     const folder = String(req.body?.folder || "inbox").toLowerCase();
     const search = req.body?.search ? String(req.body.search) : null;
 
-    // Build request
-    // Using /me/mailFolders/{id}/messages for folder support
-    // If you want focused inbox later, you can use /me/mailFolders/inbox/messages?$orderby=receivedDateTime desc
     const path = `/me/mailFolders/${encodeURIComponent(folder)}/messages`;
     const query = {
       $top: top,
       $orderby: "receivedDateTime desc",
-      $select: "id,subject,bodyPreview,from,receivedDateTime,isRead,conversationId",
+      $select: "id,subject,bodyPreview,from,receivedDateTime,isRead,conversationId,internetMessageId",
     };
 
     const headers = {};
-    // Graph $search requires ConsistencyLevel: eventual and uses AQS
     if (search) {
       query.$search = `"${search.replace(/"/g, '\\"')}"`;
       headers.ConsistencyLevel = "eventual";
@@ -662,7 +630,8 @@ router.post("/read", async (req, res) => {
 
     const msg = await graphRequest(userId, "GET", `/me/messages/${encodeURIComponent(id)}`, {
       query: {
-        $select: "id,subject,body,bodyPreview,from,toRecipients,ccRecipients,receivedDateTime,conversationId,internetMessageId",
+        $select:
+          "id,subject,body,bodyPreview,from,toRecipients,ccRecipients,receivedDateTime,conversationId,internetMessageId",
       },
     });
 
@@ -671,7 +640,6 @@ router.post("/read", async (req, res) => {
       .map((r) => r?.emailAddress?.address || null)
       .filter(Boolean);
 
-    // Body is HTML usually; we return both preview and body HTML
     res.json({
       ok: true,
       email: {
@@ -705,7 +673,6 @@ router.post("/send", async (req, res) => {
     if (!to) return res.status(400).json({ error: "Missing to" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    // Graph sendMail
     const payload = {
       message: {
         subject: subject || "",
@@ -776,4 +743,98 @@ router.get("/send", async (req, res) => {
   }
 });
 
-module.exports = router;
+// ===================== SERVICE API (for LXT / index.js) =====================
+// ✅ Exposes a stable interface for your LXT services.email
+
+async function svcGetConnectedProviders({ userId }) {
+  const rec = await loadTokens(userId);
+  return rec?.tokens ? ["outlook"] : [];
+}
+
+async function svcList({ userId, q = null, max = 10 }) {
+  const top = Math.min(Number(max || 10), 25);
+
+  // Outlook Graph $search uses AQS. If q is a Gmail-style query, you might pass a simpler keyword.
+  const search = q ? String(q) : null;
+
+  const data = await graphRequest(userId, "GET", `/me/mailFolders/inbox/messages`, {
+    query: {
+      $top: top,
+      $orderby: "receivedDateTime desc",
+      $select: "id,subject,bodyPreview,from,receivedDateTime,isRead,conversationId,internetMessageId",
+      ...(search ? { $search: `"${search.replace(/"/g, '\\"')}"` } : {}),
+    },
+    headers: search ? { ConsistencyLevel: "eventual" } : {},
+  });
+
+  return (data?.value || []).map((m) => {
+    const who = pickSender(m);
+    return {
+      id: m.id,
+      threadId: m.conversationId || null,
+      messageId: m.internetMessageId || null,
+      subject: m.subject || "",
+      from: who.from || who.sender || null,
+      date: m.receivedDateTime || null,
+      snippet: m.bodyPreview || "",
+    };
+  });
+}
+
+async function svcGetBody({ userId, messageId }) {
+  const msg = await graphRequest(userId, "GET", `/me/messages/${encodeURIComponent(messageId)}`, {
+    query: {
+      $select: "id,subject,body,bodyPreview,from,receivedDateTime,conversationId,internetMessageId",
+    },
+  });
+
+  const who = pickSender(msg);
+
+  return {
+    id: msg?.id || messageId,
+    threadId: msg?.conversationId || null,
+    messageId: msg?.internetMessageId || null,
+    from: who.from || who.sender || null,
+    subject: msg?.subject || "",
+    date: msg?.receivedDateTime || null,
+    snippet: msg?.bodyPreview || "",
+    // Graph often returns HTML. Keep as-is (you can strip later in UI).
+    body: msg?.body?.content || "",
+  };
+}
+
+async function svcSend({ userId, to, subject, body, threadId = null }) {
+  // threadId not used yet for Outlook send
+  const payload = {
+    message: {
+      subject: subject || "",
+      body: { contentType: "Text", content: body || "" },
+      toRecipients: [{ emailAddress: { address: to } }],
+    },
+    saveToSentItems: true,
+  };
+
+  await graphRequest(userId, "POST", "/me/sendMail", { body: payload });
+  return { id: null, threadId: threadId || null };
+}
+
+// Proper Outlook replies use Graph reply endpoints; not wired yet.
+async function svcReplyById() {
+  throw new Error("Outlook replyById not implemented yet (Graph reply endpoint not wired).");
+}
+async function svcReplyLatest() {
+  throw new Error("Outlook replyLatest not implemented yet (Graph reply endpoint not wired).");
+}
+
+// ✅ Export BOTH router + service (matches your Gmail pattern)
+module.exports = {
+  router,
+  service: {
+    getConnectedProviders: svcGetConnectedProviders,
+    list: svcList,
+    getBody: svcGetBody,
+    send: svcSend,
+    replyLatest: svcReplyLatest,
+    replyById: svcReplyById,
+  },
+};

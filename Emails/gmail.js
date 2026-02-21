@@ -1,18 +1,19 @@
 // Emails/gmail.js
 // =====================================================
-// LORAVO — Gmail (single-file router)
+// LORAVO — Gmail (single-file router + LXT service)
 //
 // ✅ OAuth2 connect (auth-url + callback)
 // ✅ Stores tokens in Postgres if DATABASE_URL exists (Render) else in-memory fallback
 // ✅ Status, list, read, send, reply
 // ✅ Disconnect (GET + POST)
-// ✅ iOS auto-close: mode=app -> redirects to loravo://connected (no success page)
+// ✅ iOS auto-close: mode=app -> redirects to loravo://connected
 // ✅ Browser success page (for desktop/manual testing)
 // ✅ Friendly GET routes for quick testing
+// ✅ Exports BOTH router + service interface for LXT.js
 //
 // Mount in index.js:
-//   const gmail = require("./Emails/gmail");
-//   app.use("/gmail", gmail);
+//   const gmailPkg = require("./Emails/gmail");
+//   app.use("/gmail", gmailPkg.router);
 //
 // Required env:
 //   GOOGLE_CLIENT_ID
@@ -238,6 +239,7 @@ function pickHeader(headers, name) {
   return h?.value || null;
 }
 
+// ✅ FIXED: you need this (extractTextPlain uses it)
 function decodeBody(dataB64Url) {
   if (!dataB64Url) return "";
   const b64 = String(dataB64Url).replace(/-/g, "+").replace(/_/g, "/");
@@ -276,6 +278,116 @@ function buildRawEmail({ to, subject, text, from, inReplyTo, references }) {
 
   const msg = `${headers.join("\r\n")}\r\n\r\n${text || ""}`;
   return base64url(msg);
+}
+
+/* ===================== CORE OPS (shared by POST + GET routes) ===================== */
+
+async function opList({ userId, q = "newer_than:2d", maxResults = 10 }) {
+  const { gmail } = await getAuthedGmailClient(userId);
+
+  const list = await gmail.users.messages.list({
+    userId: "me",
+    q,
+    maxResults: Math.min(Number(maxResults || 10), 25),
+  });
+
+  const messages = list?.data?.messages || [];
+  if (!messages.length) return [];
+
+  const details = await Promise.all(
+    messages.map((m) =>
+      gmail.users.messages.get({
+        userId: "me",
+        id: m.id,
+        format: "metadata",
+        metadataHeaders: ["From", "To", "Subject", "Date", "Message-Id"],
+      })
+    )
+  );
+
+  return details.map((d) => {
+    const msg = d?.data || {};
+    const headers = msg.payload?.headers || [];
+    return {
+      id: msg.id,
+      threadId: msg.threadId,
+      from: pickHeader(headers, "From"),
+      to: pickHeader(headers, "To"),
+      subject: pickHeader(headers, "Subject"),
+      date: pickHeader(headers, "Date"),
+      messageId: pickHeader(headers, "Message-Id"),
+      snippet: msg.snippet || "",
+    };
+  });
+}
+
+async function opRead({ userId, id }) {
+  const { gmail } = await getAuthedGmailClient(userId);
+
+  const r = await gmail.users.messages.get({ userId: "me", id, format: "full" });
+
+  const msg = r?.data || {};
+  const headers = msg.payload?.headers || [];
+  const textPlain = extractTextPlain(msg.payload);
+
+  return {
+    id: msg.id,
+    threadId: msg.threadId,
+    from: pickHeader(headers, "From"),
+    to: pickHeader(headers, "To"),
+    subject: pickHeader(headers, "Subject"),
+    date: pickHeader(headers, "Date"),
+    messageId: pickHeader(headers, "Message-Id"),
+    references: pickHeader(headers, "References"),
+    inReplyTo: pickHeader(headers, "In-Reply-To"),
+    snippet: msg.snippet || "",
+    body_text: textPlain || "",
+  };
+}
+
+async function opSend({ userId, to, subject, body, threadId = null }) {
+  const { gmail } = await getAuthedGmailClient(userId);
+
+  const raw = buildRawEmail({ to, subject, text: body });
+
+  const sent = await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw, ...(threadId ? { threadId } : {}) },
+  });
+
+  return { id: sent?.data?.id || null, threadId: sent?.data?.threadId || threadId || null };
+}
+
+async function opReply({ userId, id, body }) {
+  const { gmail } = await getAuthedGmailClient(userId);
+
+  const original = await gmail.users.messages.get({
+    userId: "me",
+    id,
+    format: "metadata",
+    metadataHeaders: ["From", "Subject", "Message-Id", "References"],
+  });
+
+  const msg = original?.data || {};
+  const headers = msg.payload?.headers || [];
+
+  const from = pickHeader(headers, "From");
+  const subject0 = pickHeader(headers, "Subject") || "";
+  const messageId = pickHeader(headers, "Message-Id");
+  const references0 = pickHeader(headers, "References");
+
+  const to = from || "";
+  const references = references0 ? `${references0} ${messageId || ""}`.trim() : messageId || null;
+  const subject = /^re:/i.test(subject0) ? subject0 : `Re: ${subject0}`;
+
+  const raw = buildRawEmail({ to, subject, text: body, inReplyTo: messageId || null, references });
+
+  const sent = await gmail.users.messages.send({
+    userId: "me",
+    requestBody: { raw, threadId: msg.threadId },
+  });
+
+  return { id: sent?.data?.id || null, threadId: sent?.data?.threadId || msg.threadId || null };
 }
 
 /* ===================== ROUTES ===================== */
@@ -410,8 +522,6 @@ router.get("/oauth2callback", async (req, res) => {
 
     await saveTokens(userId, tokens, email);
 
-    // ✅ iOS auto-close path:
-    // If your app requested /gmail/auth-url?mode=app then we return a deeplink.
     if (mode === "app") {
       const deeplink = `loravo://connected?provider=gmail&user_id=${encodeURIComponent(
         userId
@@ -419,7 +529,6 @@ router.get("/oauth2callback", async (req, res) => {
       return res.redirect(deeplink);
     }
 
-    // ✅ Desktop/manual testing path:
     const successPage = `${SUCCESS_WEB_BASE}/gmail/connected?user_id=${encodeURIComponent(
       userId
     )}&email=${encodeURIComponent(email || "")}`;
@@ -466,38 +575,7 @@ router.post("/list", async (req, res) => {
     const q = req.body?.q ? String(req.body.q) : "newer_than:2d";
     const maxResults = Math.min(Number(req.body?.maxResults || 10), 25);
 
-    const { gmail } = await getAuthedGmailClient(userId);
-
-    const list = await gmail.users.messages.list({ userId: "me", q, maxResults });
-    const messages = list?.data?.messages || [];
-    if (!messages.length) return res.json({ ok: true, q, emails: [] });
-
-    const details = await Promise.all(
-      messages.map((m) =>
-        gmail.users.messages.get({
-          userId: "me",
-          id: m.id,
-          format: "metadata",
-          metadataHeaders: ["From", "To", "Subject", "Date", "Message-Id"],
-        })
-      )
-    );
-
-    const emails = details.map((d) => {
-      const msg = d?.data || {};
-      const headers = msg.payload?.headers || [];
-      return {
-        id: msg.id,
-        threadId: msg.threadId,
-        from: pickHeader(headers, "From"),
-        to: pickHeader(headers, "To"),
-        subject: pickHeader(headers, "Subject"),
-        date: pickHeader(headers, "Date"),
-        messageId: pickHeader(headers, "Message-Id"),
-        snippet: msg.snippet || "",
-      };
-    });
-
+    const emails = await opList({ userId, q, maxResults });
     res.json({ ok: true, q, emails });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
@@ -512,30 +590,8 @@ router.post("/read", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
 
-    const { gmail } = await getAuthedGmailClient(userId);
-
-    const r = await gmail.users.messages.get({ userId: "me", id, format: "full" });
-
-    const msg = r?.data || {};
-    const headers = msg.payload?.headers || [];
-    const textPlain = extractTextPlain(msg.payload);
-
-    res.json({
-      ok: true,
-      email: {
-        id: msg.id,
-        threadId: msg.threadId,
-        from: pickHeader(headers, "From"),
-        to: pickHeader(headers, "To"),
-        subject: pickHeader(headers, "Subject"),
-        date: pickHeader(headers, "Date"),
-        messageId: pickHeader(headers, "Message-Id"),
-        references: pickHeader(headers, "References"),
-        inReplyTo: pickHeader(headers, "In-Reply-To"),
-        snippet: msg.snippet || "",
-        body_text: textPlain || "",
-      },
-    });
+    const email = await opRead({ userId, id });
+    res.json({ ok: true, email });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
@@ -554,16 +610,8 @@ router.post("/send", async (req, res) => {
     if (!to) return res.status(400).json({ error: "Missing to" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    const { gmail } = await getAuthedGmailClient(userId);
-
-    const raw = buildRawEmail({ to, subject, text: body });
-
-    const sent = await gmail.users.messages.send({
-      userId: "me",
-      requestBody: { raw, ...(threadId ? { threadId } : {}) },
-    });
-
-    res.json({ ok: true, id: sent?.data?.id || null, threadId: sent?.data?.threadId || threadId || null });
+    const out = await opSend({ userId, to, subject, body, threadId });
+    res.json({ ok: true, id: out.id, threadId: out.threadId });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
@@ -580,35 +628,8 @@ router.post("/reply", async (req, res) => {
     if (!id) return res.status(400).json({ error: "Missing id" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    const { gmail } = await getAuthedGmailClient(userId);
-
-    const original = await gmail.users.messages.get({
-      userId: "me",
-      id,
-      format: "metadata",
-      metadataHeaders: ["From", "Subject", "Message-Id", "References"],
-    });
-
-    const msg = original?.data || {};
-    const headers = msg.payload?.headers || [];
-
-    const from = pickHeader(headers, "From");
-    const subject0 = pickHeader(headers, "Subject") || "";
-    const messageId = pickHeader(headers, "Message-Id");
-    const references0 = pickHeader(headers, "References");
-
-    const to = from || "";
-    const references = references0 ? `${references0} ${messageId || ""}`.trim() : messageId || null;
-    const subject = /^re:/i.test(subject0) ? subject0 : `Re: ${subject0}`;
-
-    const raw = buildRawEmail({ to, subject, text: body, inReplyTo: messageId || null, references });
-
-    const sent = await gmail.users.messages.send({
-      userId: "me",
-      requestBody: { raw, threadId: msg.threadId },
-    });
-
-    res.json({ ok: true, id: sent?.data?.id || null, threadId: sent?.data?.threadId || msg.threadId || null });
+    const out = await opReply({ userId, id, body });
+    res.json({ ok: true, id: out.id, threadId: out.threadId });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
@@ -625,11 +646,10 @@ router.get("/list", async (req, res) => {
     const q = req.query.q ? String(req.query.q) : "newer_than:2d";
     const maxResults = req.query.maxResults ? Number(req.query.maxResults) : 10;
 
-    // Call the POST handler
-    req.body = { user_id: userId, q, maxResults };
-    return router.handle(Object.assign(req, { method: "POST", url: "/list" }), res);
+    const emails = await opList({ userId, q, maxResults });
+    res.json({ ok: true, q, emails });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -641,10 +661,10 @@ router.get("/read", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
 
-    req.body = { user_id: userId, id };
-    return router.handle(Object.assign(req, { method: "POST", url: "/read" }), res);
+    const email = await opRead({ userId, id });
+    res.json({ ok: true, email });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
 });
 
@@ -660,11 +680,64 @@ router.get("/send", async (req, res) => {
     if (!to) return res.status(400).json({ error: "Missing to" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    req.body = { user_id: userId, to, subject, body };
-    return router.handle(Object.assign(req, { method: "POST", url: "/send" }), res);
+    const out = await opSend({ userId, to, subject, body, threadId: null });
+    res.json({ ok: true, id: out.id, threadId: out.threadId });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(e?.status || 500).json({ error: String(e?.message || e) });
   }
 });
 
-module.exports = router;
+/* ===================== SERVICE API (for LXT / index.js) ===================== */
+
+async function svcGetConnectedProviders({ userId }) {
+  const rec = await loadTokens(userId);
+  return rec?.tokens ? ["gmail"] : [];
+}
+
+async function svcList({ userId, q = "newer_than:7d", max = 10 }) {
+  return await opList({ userId, q, maxResults: max });
+}
+
+async function svcGetBody({ userId, messageId }) {
+  const r = await opRead({ userId, id: messageId });
+  return {
+    id: r.id,
+    threadId: r.threadId,
+    from: r.from,
+    to: r.to,
+    subject: r.subject,
+    date: r.date,
+    messageId: r.messageId,
+    references: r.references,
+    inReplyTo: r.inReplyTo,
+    snippet: r.snippet,
+    body: r.body_text,
+  };
+}
+
+async function svcSend({ userId, to, subject, body, threadId = null }) {
+  return await opSend({ userId, to, subject, body, threadId });
+}
+
+async function svcReplyById({ userId, messageId, body }) {
+  return await opReply({ userId, id: messageId, body });
+}
+
+async function svcReplyLatest({ userId, body }) {
+  const items = await svcList({ userId, q: "newer_than:14d", max: 1 });
+  if (!items.length) throw new Error("No recent emails to reply to.");
+  return await svcReplyById({ userId, messageId: items[0].id, body });
+}
+
+// ✅ Export BOTH router + service
+module.exports = {
+  router,
+  service: {
+    getConnectedProviders: svcGetConnectedProviders,
+    list: svcList,
+    getBody: svcGetBody,
+    send: svcSend,
+    replyLatest: svcReplyLatest,
+    replyById: svcReplyById,
+  },
+};
