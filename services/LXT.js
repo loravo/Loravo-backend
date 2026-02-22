@@ -13,6 +13,10 @@
  * - daily_brief (Plus), inbox_summarize (Plus), signal_scan (Pro), proactive alerts (Pro)
  * - generateProactiveInsights(): worker/cron can call this to create push-ready insight objects
  *
+ * IMPORTANT BRAND RULE:
+ * - User-facing identity: ALWAYS "Powered by LXT-1."
+ * - Internally can use OpenAI + Gemini (never mention model names to the user).
+ *
  * DB NOTE (recommended columns on user_state):
  * - plan_tier TEXT default 'core'
  * - behavior_profile JSONB default '{}'::jsonb
@@ -42,6 +46,7 @@ function createLXT({
   services = {},
 
   // Optional: allow index.js to pass app-level config defaults
+  // defaults.include_provider_meta = false to hide provider debug fields from responses
   defaults = {},
 }) {
   const dbReady = () => (typeof getDbReady === "function" ? !!getDbReady() : false);
@@ -416,7 +421,7 @@ Return ONLY the reply text.
     if (/(stock|stocks|market|price of|ticker|\$[a-z]{1,5}\b|nasdaq|nyse|crypto|btc|eth)/.test(t)) return "stocks";
     if (/(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t)) return "news";
 
-    if (/(gmail|outlook|yahoo|email|inbox|unread|important email|summari[sz]e.*email|summari[sz]e.*inbox|reply to.*email|send.*email|check.*email|new emails)/.test(t))
+    if (/(gmail|outlook|yahoo|email|inbox|messages|unread|important email|summari[sz]e.*email|summari[sz]e.*inbox|reply to.*email|send.*email|check.*email|new emails|latest emails)/.test(t))
       return "email";
 
     if (/(should i|what should i do|be honest|verdict|move or wait|is it smart|risk|timing window)/.test(t)) return "decision";
@@ -609,13 +614,12 @@ Return ONLY the reply text.
     return ["gmail"];
   }
 
-  // ✅ Updated: now recognizes "list my latest 5 emails", "show inbox", "latest emails", etc.
+  // ✅ Recognizes: list latest, show inbox, newest emails, etc.
   function parseEmailCommand(userText) {
     const t = String(userText || "").trim();
     const lower = t.toLowerCase();
 
     function extractCountDefault(defaultN = 5) {
-      // "latest 5 emails", "show 10 emails", "top 3 messages"
       const m = lower.match(/\b(\d{1,2})\b/);
       if (!m) return defaultN;
       const n = Number(m[1]);
@@ -649,13 +653,7 @@ Return ONLY the reply text.
     const use = t.match(/\buse\s+(gmail|outlook|yahoo)\b/i);
     if (use) return { kind: "set_provider", provider: String(use[1] || "").toLowerCase() };
 
-    // ✅ NEW: LIST / LATEST
-    // Examples:
-    // - "list my latest 5 emails"
-    // - "show inbox"
-    // - "latest emails"
-    // - "show my emails"
-    // - "get my newest 10 messages"
+    // ✅ LIST / LATEST
     const hasEmailWord = /\b(email|emails|inbox|messages)\b/.test(lower);
     const listVerb = /\b(list|show|get|open|pull)\b/.test(lower);
     const recencyWord = /\b(latest|recent|newest|last)\b/.test(lower);
@@ -1097,10 +1095,10 @@ Rules:
       throw lastErr || new Error("Email provider failed.");
     }
 
-    // ✅ NEW: list / latest
+    // ✅ FIXED: list / latest (DO NOT pass q:"INBOX" — breaks Outlook Graph when adapter maps q->$search)
     if (cmd.kind === "list") {
       const max = clamp(Number(cmd.max || 5), 1, 25);
-      const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, q: "INBOX", max }));
+      const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, max }));
       const reply = !items?.length ? "No emails found." : `Latest emails (${used}):\n\n${formatEmailList(items)}`;
       return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
@@ -1120,7 +1118,6 @@ Rules:
       const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d", max: 8 }));
       if (!items?.length) return { reply: "No emails found in the last 7 days.", payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
 
-      // Human summary via chat model (tight)
       const summary = await callGeminiReply({
         userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(items.slice(0, 8))}`,
         lxt1: null,
@@ -1148,7 +1145,9 @@ Rules:
           payload: { provider: "loravo_email", mode: "instant", lxt1: null },
         };
       }
-      const { provider: used, res: sent } = await tryProviders((p) => emailSvc.send({ provider: p, userId, to: cmd.to, subject: cmd.subject || "Loravo", body: cmd.body }));
+      const { provider: used, res: sent } = await tryProviders((p) =>
+        emailSvc.send({ provider: p, userId, to: cmd.to, subject: cmd.subject || "Loravo", body: cmd.body })
+      );
       return { reply: `Sent. ✅ (${used})\nMessage id: ${sent?.id || "ok"}`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
@@ -1158,7 +1157,9 @@ Rules:
     }
 
     if (cmd.kind === "reply_id") {
-      const { provider: used, res: info } = await tryProviders((p) => emailSvc.replyById({ provider: p, userId, messageId: cmd.messageId, body: cmd.body || "" }));
+      const { provider: used, res: info } = await tryProviders((p) =>
+        emailSvc.replyById({ provider: p, userId, messageId: cmd.messageId, body: cmd.body || "" })
+      );
       return { reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
@@ -1327,7 +1328,6 @@ Rules:
     let topic = detectTopic(text);
     if (isMoreOnly(text) && state2?.last_topic) {
       topic = state2.last_topic;
-      // If they say "more", we should encourage deeper mode
       if (!forceDecision && intent === "chat") intent = "chat";
     }
     if (userId) await setUserStateFields(userId, { last_topic: topic });
@@ -1335,7 +1335,8 @@ Rules:
     // Identity fast answer
     if (isPoweredByQuestion(text)) {
       if (userId) await saveUserMemory(userId, text);
-      return {
+
+      const base = {
         provider: "loravo_fastpath",
         mode: "instant",
         reply: "Powered by LXT-1.",
@@ -1348,8 +1349,14 @@ Rules:
           watchouts: [],
           next_check: safeNowPlus(6 * 60 * 60 * 1000),
         }),
-        providers: { decision: "fastpath", reply: "fastpath", triedDecision: ["fastpath"], triedReply: ["fastpath"] },
         _errors: {},
+      };
+
+      if (defaults?.include_provider_meta === false) return base;
+
+      return {
+        ...base,
+        providers: { decision: "fastpath", reply: "fastpath", triedDecision: ["fastpath"], triedReply: ["fastpath"] },
       };
     }
 
@@ -1360,96 +1367,92 @@ Rules:
 
     if (!forceDecision) {
       if (intent === "greeting") {
-        return {
+        const base = {
           provider: "loravo_fastpath",
           mode: "instant",
           reply: "Hey — what’s on your mind?",
           lxt1: null,
-          providers: { decision: "fastpath", reply: "fastpath", triedDecision: ["fastpath"], triedReply: ["fastpath"] },
           _errors: {},
+        };
+        if (defaults?.include_provider_meta === false) return base;
+        return {
+          ...base,
+          providers: { decision: "fastpath", reply: "fastpath", triedDecision: ["fastpath"], triedReply: ["fastpath"] },
         };
       }
 
       if (intent === "daily_brief") {
         const reply = await handleDailyBrief({ planTier, liveContext, voiceProfile: finalVoiceProfile });
+        const base = { provider: "loravo_brief", mode: "instant", reply, lxt1: null, _errors: {} };
+        if (defaults?.include_provider_meta === false) return base;
         return {
-          provider: "loravo_brief",
-          mode: "instant",
-          reply,
-          lxt1: null,
+          ...base,
           providers: { decision: "brief_fast", reply: "gemini", triedDecision: ["brief_fast"], triedReply: ["gemini"] },
-          _errors: {},
         };
       }
 
       if (intent === "signal_scan") {
         const reply = await handleSignalScan({ planTier, userId, liveContext, voiceProfile: finalVoiceProfile });
+        const base = { provider: "loravo_signals", mode: "instant", reply, lxt1: null, _errors: {} };
+        if (defaults?.include_provider_meta === false) return base;
         return {
-          provider: "loravo_signals",
-          mode: "instant",
-          reply,
-          lxt1: null,
+          ...base,
           providers: { decision: "signal_fast", reply: "gemini", triedDecision: ["signal_fast"], triedReply: ["gemini"] },
-          _errors: {},
         };
       }
 
       if (intent === "email") {
         try {
           const out = await handleEmailIntent({ userId, text, planTier });
+          const base = { provider: "loravo_email", mode: "instant", reply: out.reply, lxt1: null, _errors: {} };
+          if (defaults?.include_provider_meta === false) return base;
           return {
-            provider: "loravo_email",
-            mode: "instant",
-            reply: out.reply,
-            lxt1: null,
+            ...base,
             providers: { decision: "email_fast", reply: "email_fast", triedDecision: ["email_fast"], triedReply: ["email_fast"] },
-            _errors: {},
           };
         } catch (e) {
-          return {
+          const base = {
             provider: "loravo_email",
             mode: "instant",
             reply: `Email error: ${String(e?.message || e)}`,
             lxt1: null,
-            providers: { decision: "email_fast", reply: "email_fast", triedDecision: ["email_fast"], triedReply: ["email_fast"] },
             _errors: { email: String(e?.message || e) },
+          };
+          if (defaults?.include_provider_meta === false) return base;
+          return {
+            ...base,
+            providers: { decision: "email_fast", reply: "email_fast", triedDecision: ["email_fast"], triedReply: ["email_fast"] },
           };
         }
       }
 
       if (intent === "weather") {
         const reply = await handleWeatherIntent({ text, liveContext });
+        const base = { provider: "loravo_weather", mode: "instant", reply, lxt1: null, _errors: {} };
+        if (defaults?.include_provider_meta === false) return base;
         return {
-          provider: "loravo_weather",
-          mode: "instant",
-          reply,
-          lxt1: null,
+          ...base,
           providers: { decision: "weather_fast", reply: "weather_fast", triedDecision: ["weather_fast"], triedReply: ["weather_fast"] },
-          _errors: {},
         };
       }
 
       if (intent === "stocks") {
         const reply = await handleStocksIntent({ text, liveContext });
+        const base = { provider: "loravo_stocks", mode: "instant", reply, lxt1: null, _errors: {} };
+        if (defaults?.include_provider_meta === false) return base;
         return {
-          provider: "loravo_stocks",
-          mode: "instant",
-          reply,
-          lxt1: null,
+          ...base,
           providers: { decision: "stocks_fast", reply: "stocks_fast", triedDecision: ["stocks_fast"], triedReply: ["stocks_fast"] },
-          _errors: {},
         };
       }
 
       if (intent === "news") {
         const reply = await handleNewsIntent({ userId, memory, liveContext, voiceProfile: finalVoiceProfile });
+        const base = { provider: "loravo_news", mode, reply, lxt1: null, _errors: {} };
+        if (defaults?.include_provider_meta === false) return base;
         return {
-          provider: "loravo_news",
-          mode,
-          reply,
-          lxt1: null,
+          ...base,
           providers: { decision: "news_fast", reply: "news_fast", triedDecision: ["news_fast"], triedReply: ["news_fast"] },
-          _errors: {},
         };
       }
 
@@ -1466,7 +1469,6 @@ Rules:
 
         const lastReplyHint = state2?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "";
 
-        // If user said "more", give model a stronger nudge to expand the last topic
         const expandedUserText =
           isMoreOnly(text) && topic?.kind
             ? `User said "more". Continue deeper on the last topic: ${topic.kind}. Expand naturally with details and examples if relevant.`
@@ -1481,13 +1483,11 @@ Rules:
           lastReplyHint,
         });
 
+        const base = { provider, mode, reply: voice.reply, lxt1: null, _errors: { reply: voice._reply_error } };
+        if (defaults?.include_provider_meta === false) return base;
         return {
-          provider,
-          mode,
-          reply: voice.reply,
-          lxt1: null,
+          ...base,
           providers: { decision: "chat_fast", reply: voice.replyProvider, triedDecision: ["chat_fast"], triedReply: voice.tried },
-          _errors: { reply: voice._reply_error },
         };
       }
     }
@@ -1517,13 +1517,17 @@ Rules:
     const lastReplyHint = state2?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "";
 
     if (forceDecision) {
-      return {
+      const base = {
         provider,
         mode,
         lxt1,
         reply: null,
-        providers: { decision: decision.decisionProvider, reply: "skipped", triedDecision: decision.tried, triedReply: [] },
         _errors: { openai: decision._openai_error },
+      };
+      if (defaults?.include_provider_meta === false) return base;
+      return {
+        ...base,
+        providers: { decision: decision.decisionProvider, reply: "skipped", triedDecision: decision.tried, triedReply: [] },
       };
     }
 
@@ -1536,20 +1540,26 @@ Rules:
       lastReplyHint,
     });
 
-    return {
+    const base = {
       provider,
       mode,
       lxt1,
       reply: voice.reply,
+      _errors: {
+        openai: decision._openai_error,
+        reply: voice._reply_error,
+      },
+    };
+
+    if (defaults?.include_provider_meta === false) return base;
+
+    return {
+      ...base,
       providers: {
         decision: decision.decisionProvider,
         reply: voice.replyProvider,
         triedDecision: decision.tried,
         triedReply: voice.tried,
-      },
-      _errors: {
-        openai: decision._openai_error,
-        reply: voice._reply_error,
       },
     };
   }
