@@ -603,78 +603,101 @@ Return ONLY the reply text.
 
   /* ===================== EMAIL (plug-in friendly) ===================== */
 
-  async function getConnectedEmailProviders(userId) {
-    if (services?.email?.getConnectedProviders) {
-      try {
-        return await services.email.getConnectedProviders({ userId });
-      } catch {
-        return [];
-      }
+async function getConnectedEmailProviders(userId) {
+  if (services?.email?.getConnectedProviders) {
+    try {
+      return await services.email.getConnectedProviders({ userId });
+    } catch {
+      return [];
     }
-    return ["gmail"];
+  }
+  return ["gmail"];
+}
+
+// ✅ Recognizes: list latest, show inbox, newest emails, etc.
+function parseEmailCommand(userText) {
+  const t = String(userText || "").trim();
+  const lower = t.toLowerCase();
+
+  function extractCountDefault(defaultN = 5) {
+    const m = lower.match(/\b(\d{1,2})\b/);
+    if (!m) return defaultN;
+    const n = Number(m[1]);
+    if (!Number.isFinite(n)) return defaultN;
+    return clamp(n, 1, 25);
   }
 
-  // ✅ Recognizes: list latest, show inbox, newest emails, etc.
-  function parseEmailCommand(userText) {
-    const t = String(userText || "").trim();
-    const lower = t.toLowerCase();
+  const sendMatch =
+    t.match(/send (an )?email to\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i) ||
+    t.match(/email\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i);
 
-    function extractCountDefault(defaultN = 5) {
-      const m = lower.match(/\b(\d{1,2})\b/);
-      if (!m) return defaultN;
-      const n = Number(m[1]);
-      if (!Number.isFinite(n)) return defaultN;
-      return clamp(n, 1, 25);
-    }
-
-    const sendMatch =
-      t.match(/send (an )?email to\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i) ||
-      t.match(/email\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i);
-
-    if (sendMatch) {
-      const to = sendMatch[2] || sendMatch[1];
-      const subject = (sendMatch[3] || sendMatch[2] || "").trim();
-      const body = (sendMatch[4] || sendMatch[3] || "").trim();
-      return { kind: "send", to, subject, body };
-    }
-
-    const replyLatest = t.match(/reply to (the )?(latest|last) email[:\-]?\s*([\s\S]+)/i);
-    if (replyLatest) return { kind: "reply_latest", body: String(replyLatest[3] || "").trim() };
-
-    const replyId = t.match(/reply to (message )?id\s+([a-zA-Z0-9_\-]+)[:\-]?\s*([\s\S]+)/i);
-    if (replyId) return { kind: "reply_id", messageId: String(replyId[2] || "").trim(), body: String(replyId[3] || "").trim() };
-
-    if (/(summari[sz]e).*(inbox|emails|email)/i.test(t)) return { kind: "summarize" };
-    if (/(important|urgent).*(email|emails)|new important emails|unread emails|check my inbox/i.test(lower)) return { kind: "important" };
-
-    const search = t.match(/search (my )?(email|gmail|inbox) for\s+([\s\S]+)/i);
-    if (search) return { kind: "search", query: String(search[3] || "").trim() };
-
-    const use = t.match(/\buse\s+(gmail|outlook|yahoo)\b/i);
-    if (use) return { kind: "set_provider", provider: String(use[1] || "").toLowerCase() };
-
-    // ✅ LIST / LATEST
-    const hasEmailWord = /\b(email|emails|inbox|messages)\b/.test(lower);
-    const listVerb = /\b(list|show|get|open|pull)\b/.test(lower);
-    const recencyWord = /\b(latest|recent|newest|last)\b/.test(lower);
-
-    if (hasEmailWord && (listVerb || recencyWord)) {
-      return { kind: "list", max: extractCountDefault(5) };
-    }
-
-    return { kind: "unknown" };
+  if (sendMatch) {
+    const to = sendMatch[2] || sendMatch[1];
+    const subject = (sendMatch[3] || sendMatch[2] || "").trim();
+    const body = (sendMatch[4] || sendMatch[3] || "").trim();
+    return { kind: "send", to, subject, body };
   }
 
-  function formatEmailList(items) {
-    if (!items?.length) return "No emails found.";
-    const lines = items.slice(0, 6).map((m, i) => {
-      const subj = m.subject ? m.subject : "(no subject)";
-      const from = m.from ? m.from : "(unknown sender)";
-      const snip = m.snippet ? ` — ${String(m.snippet).slice(0, 120)}` : "";
-      return `${i + 1}) ${subj}\n   From: ${from}\n   id: ${m.id}${snip}`;
-    });
-    return lines.join("\n");
+  const replyLatest = t.match(/reply to (the )?(latest|last) email[:\-]?\s*([\s\S]+)/i);
+  if (replyLatest) return { kind: "reply_latest", body: String(replyLatest[3] || "").trim() };
+
+  const replyId = t.match(/reply to (message )?id\s+([a-zA-Z0-9_\-]+)[:\-]?\s*([\s\S]+)/i);
+  if (replyId)
+    return {
+      kind: "reply_id",
+      messageId: String(replyId[2] || "").trim(),
+      body: String(replyId[3] || "").trim(),
+    };
+
+  if (/(summari[sz]e).*(inbox|emails|email)/i.test(t)) return { kind: "summarize" };
+  if (/(important|urgent).*(email|emails)|new important emails|unread emails|check my inbox/i.test(lower)) return { kind: "important" };
+
+  const search = t.match(/search (my )?(email|gmail|inbox) for\s+([\s\S]+)/i);
+  if (search) return { kind: "search", query: String(search[3] || "").trim() };
+
+  const use = t.match(/\buse\s+(gmail|outlook|yahoo)\b/i);
+  if (use) return { kind: "set_provider", provider: String(use[1] || "").toLowerCase() };
+
+  // ✅ LIST / LATEST
+  const hasEmailWord = /\b(email|emails|inbox|messages)\b/.test(lower);
+  const listVerb = /\b(list|show|get|open|pull)\b/.test(lower);
+  const recencyWord = /\b(latest|recent|newest|last)\b/.test(lower);
+
+  if (hasEmailWord && (listVerb || recencyWord)) {
+    return { kind: "list", max: extractCountDefault(5) };
   }
+
+  return { kind: "unknown" };
+}
+
+/**
+ * Outlook snippets can contain \r\n + weird spacing.
+ * ✅ This cleans it so it looks like Gmail style.
+ */
+function cleanSnippet(s) {
+  return String(s || "")
+    .replace(/\r/g, "")
+    .replace(/\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function formatEmailList(items) {
+  if (!items?.length) return "No emails found.";
+
+  const lines = items.slice(0, 6).map((m, i) => {
+    const subj = m?.subject ? String(m.subject).trim() : "(no subject)";
+    const from = m?.from ? String(m.from).trim() : "(unknown sender)";
+    const snip = m?.snippet ? ` — ${cleanSnippet(m.snippet).slice(0, 120)}` : "";
+
+    // Keep ID (needed for reply-by-id flows), but show it clean
+    const idLine = m?.id ? `\n   id: ${String(m.id).trim()}` : "";
+
+    return `${i + 1}) ${subj}\n   From: ${from}${idLine}${snip}`;
+  });
+
+  return lines.join("\n");
+}
 
   /* ===================== LIVE CONTEXT (news + weather + stocks) ===================== */
 
