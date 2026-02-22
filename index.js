@@ -6,7 +6,7 @@
  * ✅ Email providers mounted + LXT email services wired:
  *    - Gmail   ./Emails/gmail   -> exports { router, service }
  *    - Yahoo   ./Emails/yahoo   -> exports { router, service }
- *    - Outlook ./Emails/outlook -> exports { router, service }
+ *    - Outlook ./Emails/outlook -> exports { router, service } OR router only (fallback supported)
  *
  * Endpoints:
  *  - GET  /                -> basic root
@@ -46,9 +46,10 @@ const weatherRoute = require("./services/weather");
 const newsRoute = require("./services/news");
 
 // ✅ Email provider packages (must export { router, service })
+// NOTE: Outlook may currently export router only — we support both.
 const gmailPkg = require("./Emails/gmail");     // { router, service }
 const yahooPkg = require("./Emails/yahoo");     // { router, service }
-const outlookPkg = require("./Emails/outlook"); // { router, service }
+const outlookMod = require("./Emails/outlook"); // { router, service } OR router
 
 // ✅ MOVED: LXT engine lives in /services now
 const { createLXT } = require("./services/LXT"); // file: /services/LXT.js
@@ -60,6 +61,12 @@ app.use(cors({ origin: "*" }));
 // Mount route modules
 app.use("/", weatherRoute);
 app.use("/", newsRoute);
+
+// Normalize Outlook module shape
+const outlookPkg =
+  outlookMod && typeof outlookMod === "object" && outlookMod.router
+    ? outlookMod
+    : { router: outlookMod, service: null };
 
 // Mount email routes
 app.use("/gmail", gmailPkg.router);
@@ -366,7 +373,6 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
   const prefs = await loadUserPrefs(userId);
   const quiet = isNowInQuietHours(prefs);
 
-  // Loravo restraint: drop non-urgent alerts entirely during quiet hours
   const NON_URGENT = ["weather", "location", "news"];
   if (quiet && NON_URGENT.includes(alertType)) return;
 
@@ -380,10 +386,7 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
 
   if (sameAsLast && inCooldown) return;
 
-  const mergedPayload = {
-    ...(payload || {}),
-    quiet_hours_active: Boolean(quiet),
-  };
+  const mergedPayload = { ...(payload || {}), quiet_hours_active: Boolean(quiet) };
 
   await dbQuery(
     `INSERT INTO alert_queue (user_id, alert_type, message, payload) VALUES ($1,$2,$3,$4)`,
@@ -395,14 +398,8 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
     last_alert_at: new Date().toISOString(),
   });
 
-  // Auto-send push (best effort)
   try {
-    await maybeSendPushForAlert({
-      userId,
-      alertType,
-      message,
-      payload: mergedPayload,
-    });
+    await maybeSendPushForAlert({ userId, alertType, message, payload: mergedPayload });
   } catch (e) {
     console.error("⚠️ auto-push failed:", e?.message || e);
   }
@@ -573,7 +570,9 @@ function getApnsConfig() {
   const p8b64 = String(process.env.APNS_KEY_P8_B64 || "").trim();
 
   if (!keyId || !teamId || !topic || !p8b64) {
-    throw new Error("Missing APNS env vars (APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC/APNS_BUNDLE_ID, APNS_KEY_P8_B64)");
+    throw new Error(
+      "Missing APNS env vars (APNS_KEY_ID, APNS_TEAM_ID, APNS_TOPIC/APNS_BUNDLE_ID, APNS_KEY_P8_B64)"
+    );
   }
 
   let pem = Buffer.from(p8b64, "base64").toString("utf8").trim();
@@ -644,7 +643,11 @@ async function apnsSendStrict({ deviceToken, title, body, payload, environment }
       req.on("data", (chunk) => (respData += chunk));
       req.on("end", () => {
         client.close();
-        resolve({ ok: Number(status) >= 200 && Number(status) < 300, status: Number(status), body: respData || "" });
+        resolve({
+          ok: Number(status) >= 200 && Number(status) < 300,
+          status: Number(status),
+          body: respData || "",
+        });
       });
     });
 
@@ -768,23 +771,49 @@ async function getAlertHistory(userId, limit = 50, offset = 0) {
   return rows || [];
 }
 
-/* ===================== EMAIL SERVICE (MAXED) ===================== */
+/* ===================== EMAIL SERVICE (MAXED + OUTLOOK FALLBACK) ===================== */
+async function outlookIsConnectedViaHttp(userId) {
+  try {
+    const r = await fetch(`http://localhost:${PORT}/outlook/status?user_id=${encodeURIComponent(userId)}`);
+    const j = r.ok ? await r.json() : null;
+    return Boolean(j?.connected);
+  } catch {
+    return false;
+  }
+}
+
 // Provider resolution: if provider not supplied, pick preferred if connected else first connected.
 async function resolveEmailProvider({ userId, provider }) {
   const wanted = String(provider || "").trim().toLowerCase();
 
   const providers = [];
+
+  // Gmail
   try {
-    const g = await gmailPkg.service.getConnectedProviders({ userId });
-    (g || []).forEach((p) => providers.push(p));
+    if (gmailPkg?.service?.getConnectedProviders) {
+      const g = await gmailPkg.service.getConnectedProviders({ userId });
+      (g || []).forEach((p) => providers.push(String(p).toLowerCase()));
+    }
   } catch {}
+
+  // Yahoo
   try {
-    const y = await yahooPkg.service.getConnectedProviders({ userId });
-    (y || []).forEach((p) => providers.push(p));
+    if (yahooPkg?.service?.getConnectedProviders) {
+      const y = await yahooPkg.service.getConnectedProviders({ userId });
+      (y || []).forEach((p) => providers.push(String(p).toLowerCase()));
+    }
   } catch {}
+
+  // Outlook
   try {
-    const o = await outlookPkg.service.getConnectedProviders({ userId });
-    (o || []).forEach((p) => providers.push(p));
+    if (outlookPkg?.service?.getConnectedProviders) {
+      const o = await outlookPkg.service.getConnectedProviders({ userId });
+      (o || []).forEach((p) => providers.push(String(p).toLowerCase()));
+    } else {
+      // fallback: check status endpoint (works even if outlook exports router only)
+      const ok = await outlookIsConnectedViaHttp(userId);
+      if (ok) providers.push("outlook");
+    }
   } catch {}
 
   const unique = Array.from(new Set(providers));
@@ -796,14 +825,11 @@ async function resolveEmailProvider({ userId, provider }) {
     return { provider: wanted, connected: unique };
   }
 
-  // Preferred provider stored in user_state (optional)
   const st = await loadUserState(userId);
   const preferred = String(st?.preferred_email_provider || "").trim().toLowerCase();
   if (preferred && unique.includes(preferred)) return { provider: preferred, connected: unique };
 
-  // Otherwise first connected
   if (unique.length) return { provider: unique[0], connected: unique };
-
   return { provider: null, connected: [] };
 }
 
@@ -817,36 +843,60 @@ const services = {
     list: async ({ provider, userId, q, max }) => {
       const r = await resolveEmailProvider({ userId, provider });
       if (!r.provider) throw new Error("No email provider connected");
+
       if (r.provider === "gmail") return gmailPkg.service.list({ userId, q, max });
       if (r.provider === "yahoo") return yahooPkg.service.list({ userId, q, max });
-      if (r.provider === "outlook") return outlookPkg.service.list({ userId, q, max });
+
+      if (r.provider === "outlook") {
+        if (outlookPkg?.service?.list) return outlookPkg.service.list({ userId, q, max });
+        throw new Error("Outlook connected, but outlookPkg.service.list is missing. Export service from ./Emails/outlook.");
+      }
+
       throw new Error("Unsupported provider");
     },
 
     send: async ({ provider, userId, to, subject, body, threadId }) => {
       const r = await resolveEmailProvider({ userId, provider });
       if (!r.provider) throw new Error("No email provider connected");
+
       if (r.provider === "gmail") return gmailPkg.service.send({ userId, to, subject, body, threadId });
       if (r.provider === "yahoo") return yahooPkg.service.send({ userId, to, subject, body, threadId });
-      if (r.provider === "outlook") return outlookPkg.service.send({ userId, to, subject, body, threadId });
+
+      if (r.provider === "outlook") {
+        if (outlookPkg?.service?.send) return outlookPkg.service.send({ userId, to, subject, body, threadId });
+        throw new Error("Outlook connected, but outlookPkg.service.send is missing. Export service from ./Emails/outlook.");
+      }
+
       throw new Error("Unsupported provider");
     },
 
     replyLatest: async ({ provider, userId, body }) => {
       const r = await resolveEmailProvider({ userId, provider });
       if (!r.provider) throw new Error("No email provider connected");
+
       if (r.provider === "gmail") return gmailPkg.service.replyLatest({ userId, body });
       if (r.provider === "yahoo") return yahooPkg.service.replyLatest({ userId, body });
-      if (r.provider === "outlook") return outlookPkg.service.replyLatest({ userId, body });
+
+      if (r.provider === "outlook") {
+        if (outlookPkg?.service?.replyLatest) return outlookPkg.service.replyLatest({ userId, body });
+        throw new Error("Outlook connected, but outlookPkg.service.replyLatest is missing. Export service from ./Emails/outlook.");
+      }
+
       throw new Error("Unsupported provider");
     },
 
     replyById: async ({ provider, userId, messageId, body }) => {
       const r = await resolveEmailProvider({ userId, provider });
       if (!r.provider) throw new Error("No email provider connected");
+
       if (r.provider === "gmail") return gmailPkg.service.replyById({ userId, messageId, body });
       if (r.provider === "yahoo") return yahooPkg.service.replyById({ userId, messageId, body });
-      if (r.provider === "outlook") return outlookPkg.service.replyById({ userId, messageId, body });
+
+      if (r.provider === "outlook") {
+        if (outlookPkg?.service?.replyById) return outlookPkg.service.replyById({ userId, messageId, body });
+        throw new Error("Outlook connected, but outlookPkg.service.replyById is missing. Export service from ./Emails/outlook.");
+      }
+
       throw new Error("Unsupported provider");
     },
   },
@@ -910,7 +960,9 @@ app.post("/chat", async (req, res) => {
       reply: result.reply,
       lxt1: result.lxt1,
       _providers: result.providers,
-      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply ? { _errors: result._errors } : {}),
+      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply
+        ? { _errors: result._errors }
+        : {}),
     });
   } catch (e) {
     res.status(500).json({ error: "server error", detail: String(e?.message || e) });
@@ -997,7 +1049,13 @@ app.post("/trip/set", async (req, res) => {
         notes=EXCLUDED.notes,
         updated_at=NOW()
     `,
-      [user_id, Boolean(active), destination || null, depart_at ? new Date(depart_at).toISOString() : null, notes || null]
+      [
+        user_id,
+        Boolean(active),
+        destination || null,
+        depart_at ? new Date(depart_at).toISOString() : null,
+        notes || null,
+      ]
     );
 
     if (active && destination) {
@@ -1025,8 +1083,10 @@ app.post("/news/ingest", async (req, res) => {
 
     if (dbReady) {
       await dbQuery(
-        `INSERT INTO news_events (user_id, title, summary, region, severity, action)
-         VALUES ($1,$2,$3,$4,$5,$6)`,
+        `
+        INSERT INTO news_events (user_id, title, summary, region, severity, action)
+        VALUES ($1,$2,$3,$4,$5,$6)
+        `,
         [user_id, title, summary || null, region || null, sev, action || null]
       );
     }
@@ -1065,7 +1125,13 @@ app.post("/push/register", async (req, res) => {
     if (!environment) return res.status(400).json({ error: "Missing environment" });
     if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled" });
 
-    await registerDevice({ userId: String(user_id), deviceToken: String(device_token), environment: String(environment), platform: "ios" });
+    await registerDevice({
+      userId: String(user_id),
+      deviceToken: String(device_token),
+      environment: String(environment),
+      platform: "ios",
+    });
+
     return res.json({ ok: true, db: true });
   } catch (e) {
     console.error("❌ /push/register error:", e);
@@ -1079,15 +1145,23 @@ app.post("/push/send-test", async (req, res) => {
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    if (!dbReady) return res.status(200).json({ ok: true, db: false, note: "DB disabled — cannot send test push." });
+    if (!dbReady) {
+     	return res.status(200).json({ ok: true, db: false, note: "DB disabled — cannot send test push." });
+    }
 
     const envWanted = environment ? normalizeEnv(environment) : null;
+
     let devices = await getUserDevices(String(user_id));
     if (envWanted) devices = devices.filter((d) => normalizeEnv(d.environment) === envWanted);
-    if (!devices.length) return res.status(400).json({ error: "No device registered for this user_id (and environment)" });
+
+    if (!devices.length) {
+      return res.status(400).json({ error: "No device registered for this user_id (and environment)" });
+    }
 
     const prefs = await loadUserPrefs(String(user_id));
-    if (!force && isNowInQuietHours(prefs)) return res.json({ ok: true, db: true, skipped: true, reason: "quiet_hours" });
+    if (!force && isNowInQuietHours(prefs)) {
+      return res.json({ ok: true, db: true, skipped: true, reason: "quiet_hours" });
+    }
 
     const results = [];
     for (const d of devices) {
