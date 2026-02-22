@@ -421,7 +421,11 @@ Return ONLY the reply text.
     if (/(stock|stocks|market|price of|ticker|\$[a-z]{1,5}\b|nasdaq|nyse|crypto|btc|eth)/.test(t)) return "stocks";
     if (/(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t)) return "news";
 
-    if (/(gmail|outlook|yahoo|email|inbox|messages|unread|important email|summari[sz]e.*email|summari[sz]e.*inbox|reply to.*email|send.*email|check.*email|new emails|latest emails)/.test(t))
+    if (
+      /(gmail|outlook|yahoo|email|inbox|messages|unread|important email|summari[sz]e.*email|summari[sz]e.*inbox|reply to.*email|send.*email|check.*email|new emails|latest emails)/.test(
+        t
+      )
+    )
       return "email";
 
     if (/(should i|what should i do|be honest|verdict|move or wait|is it smart|risk|timing window)/.test(t)) return "decision";
@@ -517,7 +521,8 @@ Return ONLY the reply text.
     const t = String(text || "").trim();
     const m1 = t.match(/\$([A-Za-z]{1,6})\b/);
     if (m1) return m1[1].toUpperCase();
-    const m2 = t.match(/\bprice of\s+([A-Za-z]{1,6})\b/i) || t.match(/\b([A-Za-z]{1,6})\s+(stock|shares|ticker)\b/i);
+    const m2 =
+      t.match(/\bprice of\s+([A-Za-z]{1,6})\b/i) || t.match(/\b([A-Za-z]{1,6})\s+(stock|shares|ticker)\b/i);
     if (m2) return String(m2[1] || "").toUpperCase();
     return null;
   }
@@ -603,101 +608,107 @@ Return ONLY the reply text.
 
   /* ===================== EMAIL (plug-in friendly) ===================== */
 
-async function getConnectedEmailProviders(userId) {
-  if (services?.email?.getConnectedProviders) {
-    try {
-      return await services.email.getConnectedProviders({ userId });
-    } catch {
-      return [];
+  async function getConnectedEmailProviders(userId) {
+    if (services?.email?.getConnectedProviders) {
+      try {
+        return await services.email.getConnectedProviders({ userId });
+      } catch {
+        return [];
+      }
     }
-  }
-  return ["gmail"];
-}
-
-// ✅ Recognizes: list latest, show inbox, newest emails, etc.
-function parseEmailCommand(userText) {
-  const t = String(userText || "").trim();
-  const lower = t.toLowerCase();
-
-  function extractCountDefault(defaultN = 5) {
-    const m = lower.match(/\b(\d{1,2})\b/);
-    if (!m) return defaultN;
-    const n = Number(m[1]);
-    if (!Number.isFinite(n)) return defaultN;
-    return clamp(n, 1, 25);
+    return ["gmail"];
   }
 
-  const sendMatch =
-    t.match(/send (an )?email to\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i) ||
-    t.match(/email\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i);
+  // ✅ Recognizes: list latest, show inbox, newest emails, etc.
+  function parseEmailCommand(userText) {
+    const t = String(userText || "").trim();
+    const lower = t.toLowerCase();
 
-  if (sendMatch) {
-    const to = sendMatch[2] || sendMatch[1];
-    const subject = (sendMatch[3] || sendMatch[2] || "").trim();
-    const body = (sendMatch[4] || sendMatch[3] || "").trim();
-    return { kind: "send", to, subject, body };
+    // ✅ NEW: scope detection (all inboxes)
+    const wantsAll =
+      /\b(all|every|all my|all of my|across all|across)\b/.test(lower) &&
+      /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(lower);
+
+    function extractCountDefault(defaultN = 5) {
+      const m = lower.match(/\b(\d{1,2})\b/);
+      if (!m) return defaultN;
+      const n = Number(m[1]);
+      if (!Number.isFinite(n)) return defaultN;
+      return clamp(n, 1, 25);
+    }
+
+    const sendMatch =
+      t.match(/send (an )?email to\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i) ||
+      t.match(/email\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i);
+
+    if (sendMatch) {
+      const to = sendMatch[2] || sendMatch[1];
+      const subject = (sendMatch[3] || sendMatch[2] || "").trim();
+      const body = (sendMatch[4] || sendMatch[3] || "").trim();
+      return { kind: "send", to, subject, body };
+    }
+
+    const replyLatest = t.match(/reply to (the )?(latest|last) email[:\-]?\s*([\s\S]+)/i);
+    if (replyLatest) return { kind: "reply_latest", body: String(replyLatest[3] || "").trim() };
+
+    const replyId = t.match(/reply to (message )?id\s+([a-zA-Z0-9_\-]+)[:\-]?\s*([\s\S]+)/i);
+    if (replyId)
+      return {
+        kind: "reply_id",
+        messageId: String(replyId[2] || "").trim(),
+        body: String(replyId[3] || "").trim(),
+      };
+
+    if (/(summari[sz]e).*(inbox|emails|email)/i.test(t)) return { kind: "summarize", scope: wantsAll ? "all" : "one" };
+    if (/(important|urgent).*(email|emails)|new important emails|unread emails|check my inbox/i.test(lower))
+      return { kind: "important", scope: wantsAll ? "all" : "one" };
+
+    const search = t.match(/search (my )?(email|gmail|inbox) for\s+([\s\S]+)/i);
+    if (search) return { kind: "search", query: String(search[3] || "").trim(), scope: wantsAll ? "all" : "one" };
+
+    const use = t.match(/\buse\s+(gmail|outlook|yahoo)\b/i);
+    if (use) return { kind: "set_provider", provider: String(use[1] || "").toLowerCase() };
+
+    // ✅ LIST / LATEST
+    const hasEmailWord = /\b(email|emails|inbox|messages)\b/.test(lower);
+    const listVerb = /\b(list|show|get|open|pull)\b/.test(lower);
+    const recencyWord = /\b(latest|recent|newest|last)\b/.test(lower);
+
+    if (hasEmailWord && (listVerb || recencyWord)) {
+      return { kind: "list", max: extractCountDefault(5), scope: wantsAll ? "all" : "one" };
+    }
+
+    return { kind: "unknown", scope: wantsAll ? "all" : "one" };
   }
 
-  const replyLatest = t.match(/reply to (the )?(latest|last) email[:\-]?\s*([\s\S]+)/i);
-  if (replyLatest) return { kind: "reply_latest", body: String(replyLatest[3] || "").trim() };
-
-  const replyId = t.match(/reply to (message )?id\s+([a-zA-Z0-9_\-]+)[:\-]?\s*([\s\S]+)/i);
-  if (replyId)
-    return {
-      kind: "reply_id",
-      messageId: String(replyId[2] || "").trim(),
-      body: String(replyId[3] || "").trim(),
-    };
-
-  if (/(summari[sz]e).*(inbox|emails|email)/i.test(t)) return { kind: "summarize" };
-  if (/(important|urgent).*(email|emails)|new important emails|unread emails|check my inbox/i.test(lower)) return { kind: "important" };
-
-  const search = t.match(/search (my )?(email|gmail|inbox) for\s+([\s\S]+)/i);
-  if (search) return { kind: "search", query: String(search[3] || "").trim() };
-
-  const use = t.match(/\buse\s+(gmail|outlook|yahoo)\b/i);
-  if (use) return { kind: "set_provider", provider: String(use[1] || "").toLowerCase() };
-
-  // ✅ LIST / LATEST
-  const hasEmailWord = /\b(email|emails|inbox|messages)\b/.test(lower);
-  const listVerb = /\b(list|show|get|open|pull)\b/.test(lower);
-  const recencyWord = /\b(latest|recent|newest|last)\b/.test(lower);
-
-  if (hasEmailWord && (listVerb || recencyWord)) {
-    return { kind: "list", max: extractCountDefault(5) };
+  /**
+   * Outlook snippets can contain \r\n + weird spacing.
+   * ✅ This cleans it so it looks like Gmail style.
+   */
+  function cleanSnippet(s) {
+    return String(s || "")
+      .replace(/\r/g, "")
+      .replace(/\n+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
   }
 
-  return { kind: "unknown" };
-}
+  function formatEmailList(items) {
+    if (!items?.length) return "No emails found.";
 
-/**
- * Outlook snippets can contain \r\n + weird spacing.
- * ✅ This cleans it so it looks like Gmail style.
- */
-function cleanSnippet(s) {
-  return String(s || "")
-    .replace(/\r/g, "")
-    .replace(/\n+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+    const lines = items.slice(0, 6).map((m, i) => {
+      const subj = m?.subject ? String(m.subject).trim() : "(no subject)";
+      const from = m?.from ? String(m.from).trim() : "(unknown sender)";
+      const snip = m?.snippet ? ` — ${cleanSnippet(m.snippet).slice(0, 120)}` : "";
 
-function formatEmailList(items) {
-  if (!items?.length) return "No emails found.";
+      // Keep ID (needed for reply-by-id flows), but show it clean
+      const idLine = m?.id ? `\n   id: ${String(m.id).trim()}` : "";
 
-  const lines = items.slice(0, 6).map((m, i) => {
-    const subj = m?.subject ? String(m.subject).trim() : "(no subject)";
-    const from = m?.from ? String(m.from).trim() : "(unknown sender)";
-    const snip = m?.snippet ? ` — ${cleanSnippet(m.snippet).slice(0, 120)}` : "";
+      return `${i + 1}) ${subj}\n   From: ${from}${idLine}${snip}`;
+    });
 
-    // Keep ID (needed for reply-by-id flows), but show it clean
-    const idLine = m?.id ? `\n   id: ${String(m.id).trim()}` : "";
-
-    return `${i + 1}) ${subj}\n   From: ${from}${idLine}${snip}`;
-  });
-
-  return lines.join("\n");
-}
+    return lines.join("\n");
+  }
 
   /* ===================== LIVE CONTEXT (news + weather + stocks) ===================== */
 
@@ -1057,7 +1068,12 @@ Rules:
       return { reply, replyProvider: "gemini", tried: ["gemini"] };
     } catch (e) {
       const reply = await callOpenAIReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
-      return { reply, replyProvider: "openai_fallback", tried: ["gemini", "openai"], _reply_error: String(e?.message || e) };
+      return {
+        reply,
+        replyProvider: "openai_fallback",
+        tried: ["gemini", "openai"],
+        _reply_error: String(e?.message || e),
+      };
     }
   }
 
@@ -1075,7 +1091,10 @@ Rules:
 
     if (cmd.kind === "set_provider") {
       await setUserStateFields(userId, { preferred_email_provider: cmd.provider });
-      return { reply: `Got it — I’ll use ${cmd.provider} for email.`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      return {
+        reply: `Got it — I’ll use ${cmd.provider} for email.`,
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
     // Plus gate: inbox summarize
@@ -1085,7 +1104,9 @@ Rules:
         feature: "inbox_summarize",
         tease: "I can summarize your inbox and pull out what matters — that’s Plus. Want me to unlock it?",
       });
-      if (!gate.ok) return { reply: gate.reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      if (!gate.ok) {
+        return { reply: gate.reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      }
     }
 
     const connected = await getConnectedEmailProviders(userId);
@@ -1098,11 +1119,15 @@ Rules:
 
     const st = await loadUserState(userId);
     const preferred = String(st?.preferred_email_provider || "").toLowerCase();
-    const providers = preferred && connected.includes(preferred) ? [preferred, ...connected.filter((x) => x !== preferred)] : connected;
+    const providers =
+      preferred && connected.includes(preferred) ? [preferred, ...connected.filter((x) => x !== preferred)] : connected;
 
     const emailSvc = services?.email;
     if (!emailSvc) {
-      return { reply: "Email service isn’t wired in services.email yet.", payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      return {
+        reply: "Email service isn’t wired in services.email yet.",
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
     async function tryProviders(fn) {
@@ -1118,28 +1143,124 @@ Rules:
       throw lastErr || new Error("Email provider failed.");
     }
 
+    // ✅ NEW: fetch all providers (one command returns Gmail + Outlook + Yahoo)
+    async function fetchAllProviders(fn) {
+      const out = [];
+      for (const p of providers) {
+        try {
+          const res = await fn(p);
+          out.push({ provider: p, ok: true, res });
+        } catch (e) {
+          out.push({ provider: p, ok: false, err: String(e?.message || e) });
+        }
+      }
+      return out;
+    }
+
+    // Now parseEmailCommand sets scope, but keep fallback detection too
+    function wantsAllInboxesFromText(t) {
+      const s = String(t || "").toLowerCase();
+      return /\b(all|every|all my|all of my|across all|across)\b/.test(s) && /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(s);
+    }
+
+    const allMode = cmd?.scope === "all" || wantsAllInboxesFromText(text);
+
+    function joinBlocks(title, blocks) {
+      return `${title}\n\n${blocks.join("\n\n")}`.trim();
+    }
+
+    /* ---------------- LIST / LATEST ---------------- */
     // ✅ FIXED: list / latest (DO NOT pass q:"INBOX" — breaks Outlook Graph when adapter maps q->$search)
     if (cmd.kind === "list") {
       const max = clamp(Number(cmd.max || 5), 1, 25);
+
+      if (allMode) {
+        const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, max }));
+
+        const blocks = all.map((x) => {
+          if (!x.ok) return `=== ${x.provider} ===\nError: ${x.err}`;
+          const items = x.res || [];
+          return `=== ${x.provider} ===\n${items.length ? formatEmailList(items) : "No emails found."}`;
+        });
+
+        return {
+          reply: joinBlocks("Latest emails (all inboxes):", blocks),
+          payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+        };
+      }
+
       const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, max }));
       const reply = !items?.length ? "No emails found." : `Latest emails (${used}):\n\n${formatEmailList(items)}`;
       return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
+    /* ---------------- IMPORTANT / UNREAD ---------------- */
     if (cmd.kind === "important") {
+      if (allMode) {
+        const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 }));
+
+        const blocks = all.map((x) => {
+          if (!x.ok) return `=== ${x.provider} ===\nError: ${x.err}`;
+          const items = x.res || [];
+          return `=== ${x.provider} ===\n${items.length ? formatEmailList(items) : "No unread emails in the last 7 days."}`;
+        });
+
+        return {
+          reply: joinBlocks("Top unread (all inboxes):", blocks),
+          payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+        };
+      }
+
       const { provider: used, res: items } = await tryProviders((p) =>
         emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 })
       );
+
       const reply =
         !items?.length
           ? "No unread emails in the last 7 days."
           : `Here are your top unread emails (${used}):\n\n${formatEmailList(items)}\n\nSay: “summarize my inbox” or “reply to latest email: …”`;
+
       return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
+    /* ---------------- SUMMARIZE ---------------- */
     if (cmd.kind === "summarize") {
+      if (allMode) {
+        const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d", max: 8 }));
+
+        const compact = all
+          .filter((x) => x.ok && Array.isArray(x.res) && x.res.length)
+          .map((x) => ({ provider: x.provider, items: x.res.slice(0, 8) }));
+
+        if (!compact.length) {
+          return {
+            reply: "No emails found in the last 7 days across your connected inboxes.",
+            payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+          };
+        }
+
+        const summary = await callGeminiReply({
+          userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(compact)}`,
+          lxt1: null,
+          voiceProfile: "Calm, human, direct. Bullet-friendly. No robotic phrasing.",
+          liveContext: {},
+          lastReplyHint: "",
+        });
+
+        return {
+          reply: `${summary}\n\n(Providers: ${compact.map((x) => x.provider).join(", ")})`,
+          payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+        };
+      }
+
       const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d", max: 8 }));
-      if (!items?.length) return { reply: "No emails found in the last 7 days.", payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+
+      if (!items?.length) {
+        return {
+          reply: "No emails found in the last 7 days.",
+          payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+        };
+      }
 
       const summary = await callGeminiReply({
         userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(items.slice(0, 8))}`,
@@ -1152,38 +1273,77 @@ Rules:
       return { reply: `${summary}\n\n(Provider: ${used})`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
+    /* ---------------- SEARCH ---------------- */
     if (cmd.kind === "search") {
       const q = cmd.query || "";
-      const { provider: used, res: items } = await tryProviders((p) =>
-        emailSvc.list({ provider: p, userId, q: q ? `newer_than:180d ${q}` : "newer_than:30d", max: 6 })
-      );
+
+      // ✅ IMPORTANT: tell adapters to avoid $orderBy when using $search (Outlook)
+      const listArgs = {
+        userId,
+        q: q ? `newer_than:180d ${q}` : "newer_than:30d",
+        max: 6,
+        disable_orderby: true,
+      };
+
+      if (allMode) {
+        const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, ...listArgs }));
+
+        const blocks = all.map((x) => {
+          if (!x.ok) return `=== ${x.provider} ===\nError: ${x.err}`;
+          const items = x.res || [];
+          return `=== ${x.provider} ===\n${items.length ? formatEmailList(items) : `No matches for: "${q}".`}`;
+        });
+
+        return {
+          reply: joinBlocks(`Search results (all inboxes) for "${q}":`, blocks),
+          payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+        };
+      }
+
+      const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, ...listArgs }));
       const reply = !items?.length ? `No matches for: "${q}".` : `Top matches (${used}):\n\n${formatEmailList(items)}`;
       return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
+    /* ---------------- SEND ---------------- */
     if (cmd.kind === "send") {
       if (!cmd.to || !cmd.body) {
         return {
-          reply: 'Send format: `send email to someone@email.com subject Your subject body Your message`',
+          reply: "Send format: `send email to someone@email.com subject Your subject body Your message`",
           payload: { provider: "loravo_email", mode: "instant", lxt1: null },
         };
       }
+
+      // Sending is always single-provider (preferred first)
       const { provider: used, res: sent } = await tryProviders((p) =>
         emailSvc.send({ provider: p, userId, to: cmd.to, subject: cmd.subject || "Loravo", body: cmd.body })
       );
-      return { reply: `Sent. ✅ (${used})\nMessage id: ${sent?.id || "ok"}`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+
+      return {
+        reply: `Sent. ✅ (${used})\nMessage id: ${sent?.id || "ok"}`,
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
+    /* ---------------- REPLY ---------------- */
     if (cmd.kind === "reply_latest") {
-      const { provider: used, res: info } = await tryProviders((p) => emailSvc.replyLatest({ provider: p, userId, body: cmd.body || "" }));
-      return { reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      const { provider: used, res: info } = await tryProviders((p) =>
+        emailSvc.replyLatest({ provider: p, userId, body: cmd.body || "" })
+      );
+      return {
+        reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`,
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
     if (cmd.kind === "reply_id") {
       const { provider: used, res: info } = await tryProviders((p) =>
         emailSvc.replyById({ provider: p, userId, messageId: cmd.messageId, body: cmd.body || "" })
       );
-      return { reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      return {
+        reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`,
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
     const hint =
@@ -1194,7 +1354,8 @@ Rules:
       "- “send email to a@b.com subject Hi body Hello…”\n" +
       "- “reply to latest email: …”\n" +
       "- “use outlook” / “use gmail” / “use yahoo”\n" +
-      "- “list my latest 5 emails”";
+      "- “list my latest 5 emails”\n" +
+      "- “list my latest 5 emails across all inboxes”";
 
     return { reply: hint, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
   }
@@ -1205,7 +1366,9 @@ Rules:
       return one || "I can pull your weather — do you want current conditions or the next 24 hours?";
     }
     const city = extractCityFromWeatherText(text);
-    return city ? `I can pull it — current conditions in ${city}, or the next 24 hours?` : "Which city are you in (or allow location), and do you want current conditions or the next 24 hours?";
+    return city
+      ? `I can pull it — current conditions in ${city}, or the next 24 hours?`
+      : "Which city are you in (or allow location), and do you want current conditions or the next 24 hours?";
   }
 
   async function handleStocksIntent({ text, liveContext }) {
@@ -1218,7 +1381,8 @@ Rules:
       const chg = q?.change_pct != null ? q.change_pct : q?.dp ?? null;
       const asof = q?.asof || q?.t || null;
 
-      if (price != null && chg != null) return `${ticker} is around ${price} (${chg >= 0 ? "+" : ""}${Math.round(chg * 100) / 100}%).${asof ? ` (${asof})` : ""}`;
+      if (price != null && chg != null)
+        return `${ticker} is around ${price} (${chg >= 0 ? "+" : ""}${Math.round(chg * 100) / 100}%).${asof ? ` (${asof})` : ""}`;
       if (price != null) return `${ticker} is around ${price}.`;
       return `I pulled data for ${ticker}, but it’s incomplete.`;
     }
@@ -1236,7 +1400,9 @@ Rules:
     if (!items.length) return "Nothing urgent on your radar right now.";
 
     return await callGeminiReply({
-      userText: `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(items.slice(0, 5))}`,
+      userText: `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(
+        items.slice(0, 5)
+      )}`,
       lxt1: null,
       voiceProfile,
       liveContext: {},
