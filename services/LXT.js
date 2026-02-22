@@ -609,9 +609,19 @@ Return ONLY the reply text.
     return ["gmail"];
   }
 
+  // ✅ Updated: now recognizes "list my latest 5 emails", "show inbox", "latest emails", etc.
   function parseEmailCommand(userText) {
     const t = String(userText || "").trim();
     const lower = t.toLowerCase();
+
+    function extractCountDefault(defaultN = 5) {
+      // "latest 5 emails", "show 10 emails", "top 3 messages"
+      const m = lower.match(/\b(\d{1,2})\b/);
+      if (!m) return defaultN;
+      const n = Number(m[1]);
+      if (!Number.isFinite(n)) return defaultN;
+      return clamp(n, 1, 25);
+    }
 
     const sendMatch =
       t.match(/send (an )?email to\s+([^\s]+@[^\s]+)\s+subject\s+(.+?)\s+body\s+([\s\S]+)/i) ||
@@ -638,6 +648,21 @@ Return ONLY the reply text.
 
     const use = t.match(/\buse\s+(gmail|outlook|yahoo)\b/i);
     if (use) return { kind: "set_provider", provider: String(use[1] || "").toLowerCase() };
+
+    // ✅ NEW: LIST / LATEST
+    // Examples:
+    // - "list my latest 5 emails"
+    // - "show inbox"
+    // - "latest emails"
+    // - "show my emails"
+    // - "get my newest 10 messages"
+    const hasEmailWord = /\b(email|emails|inbox|messages)\b/.test(lower);
+    const listVerb = /\b(list|show|get|open|pull)\b/.test(lower);
+    const recencyWord = /\b(latest|recent|newest|last)\b/.test(lower);
+
+    if (hasEmailWord && (listVerb || recencyWord)) {
+      return { kind: "list", max: extractCountDefault(5) };
+    }
 
     return { kind: "unknown" };
   }
@@ -1072,6 +1097,14 @@ Rules:
       throw lastErr || new Error("Email provider failed.");
     }
 
+    // ✅ NEW: list / latest
+    if (cmd.kind === "list") {
+      const max = clamp(Number(cmd.max || 5), 1, 25);
+      const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, q: "INBOX", max }));
+      const reply = !items?.length ? "No emails found." : `Latest emails (${used}):\n\n${formatEmailList(items)}`;
+      return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+    }
+
     if (cmd.kind === "important") {
       const { provider: used, res: items } = await tryProviders((p) =>
         emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 })
@@ -1136,7 +1169,8 @@ Rules:
       "- “search my email for paypal”\n" +
       "- “send email to a@b.com subject Hi body Hello…”\n" +
       "- “reply to latest email: …”\n" +
-      "- “use outlook” / “use gmail” / “use yahoo”";
+      "- “use outlook” / “use gmail” / “use yahoo”\n" +
+      "- “list my latest 5 emails”";
 
     return { reply: hint, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
   }
