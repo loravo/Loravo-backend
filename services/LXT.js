@@ -18,11 +18,16 @@
  * - Internally can use OpenAI + Gemini (never mention model names to the user).
  *
  * DB NOTE (recommended columns on user_state):
+ * - user_id TEXT PRIMARY KEY
  * - plan_tier TEXT default 'core'
  * - behavior_profile JSONB default '{}'::jsonb
  * - last_topic JSONB default '{}'::jsonb
+ * - voice_profile TEXT
  * - voice_profile_updated_at TIMESTAMPTZ
  * - behavior_updated_at TIMESTAMPTZ
+ * - preferred_email_provider TEXT
+ * - last_city TEXT, last_country TEXT, last_timezone TEXT
+ * - updated_at TIMESTAMPTZ default NOW()
  *************************************************/
 
 const fetch = require("node-fetch"); // node-fetch@2
@@ -71,7 +76,10 @@ function createLXT({
 
     if (t.length < 40 || /^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)) return "instant";
     if (/^(what|when|where|who|is|are|do|does|can|should)\b/.test(t) && t.length < 130) return "instant";
-    if (/(analyze|plan|compare|strategy|explain|forecast|should i|pros and cons|step by step|break it down)/.test(t) || t.length > 220)
+    if (
+      /(analyze|plan|compare|strategy|explain|forecast|should i|pros and cons|step by step|break it down)/.test(t) ||
+      t.length > 220
+    )
       return "thinking";
     return "instant";
   }
@@ -336,8 +344,7 @@ Return ONLY the reply text.
     const likesBullets = /\b(bullets|bullet points|list it|list)\b/.test(lower);
     const hatesRobotic = /\b(robotic|gray|strict|corporate|stiff)\b/.test(lower);
 
-    const frustration =
-      /\b(no|stop|wrong|nah|not that|you didn’t|you are not listening|hate|trash)\b/.test(lower) ? 1 : 0;
+    const frustration = /\b(no|stop|wrong|nah|not that|you didn’t|you are not listening|hate|trash)\b/.test(lower) ? 1 : 0;
 
     const directness = /\b(do this|make it|fix it|send|give me|now|copy paste)\b/.test(lower) ? 0.65 : 0.5;
 
@@ -379,8 +386,7 @@ Return ONLY the reply text.
 
   function behaviorToVoiceLine(bp) {
     if (!bp) return "";
-    const depth =
-      bp.depth_pref > 0.6 ? "Give depth when asked; otherwise keep it tight." : "Keep it short-first, expand only on request.";
+    const depth = bp.depth_pref > 0.6 ? "Give depth when asked; otherwise keep it tight." : "Keep it short-first, expand only on request.";
     const bullets = bp.bullet_pref > 0.6 ? "When explaining, use bullets naturally." : "Prefer short paragraphs unless asked for lists.";
     const direct = bp.directness > 0.6 ? "Be direct. Minimal fluff." : "Be friendly and calm.";
     const anti = bp.anti_robotic > 0.65 ? "Avoid robotic phrasing; keep it human." : "Keep it calm and clear.";
@@ -397,7 +403,8 @@ Return ONLY the reply text.
     if (/(stock|ticker|\$[a-z]{1,5}\b|nasdaq|crypto|btc|eth)/.test(t)) return { kind: "stocks" };
     if (/(news|headlines|breaking|what happened)/.test(t)) return { kind: "news" };
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return { kind: "daily_brief" };
-    if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t)) return { kind: "signal_scan" };
+    if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t))
+      return { kind: "signal_scan" };
     if (/(plan|strategy|roadmap|steps|launch)/.test(t)) return { kind: "plan" };
     return { kind: "chat" };
   }
@@ -419,7 +426,8 @@ Return ONLY the reply text.
 
     if (/(weather|temperature|temp\b|forecast|rain|snow|wind)/.test(t)) return "weather";
     if (/(stock|stocks|market|price of|ticker|\$[a-z]{1,5}\b|nasdaq|nyse|crypto|btc|eth)/.test(t)) return "stocks";
-    if (/(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t)) return "news";
+    if (/(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t))
+      return "news";
 
     if (
       /(gmail|outlook|yahoo|email|inbox|messages|unread|important email|summari[sz]e.*email|summari[sz]e.*inbox|reply to.*email|send.*email|check.*email|new emails|latest emails)/.test(
@@ -521,8 +529,7 @@ Return ONLY the reply text.
     const t = String(text || "").trim();
     const m1 = t.match(/\$([A-Za-z]{1,6})\b/);
     if (m1) return m1[1].toUpperCase();
-    const m2 =
-      t.match(/\bprice of\s+([A-Za-z]{1,6})\b/i) || t.match(/\b([A-Za-z]{1,6})\s+(stock|shares|ticker)\b/i);
+    const m2 = t.match(/\bprice of\s+([A-Za-z]{1,6})\b/i) || t.match(/\b([A-Za-z]{1,6})\s+(stock|shares|ticker)\b/i);
     if (m2) return String(m2[1] || "").toUpperCase();
     return null;
   }
@@ -551,15 +558,16 @@ Return ONLY the reply text.
     return rows?.[0] || null;
   }
 
+  // ✅ UPDATED: safe UPSERT (so first-time users actually get a row)
   async function setUserStateFields(userId, patch = {}) {
     if (!userId) return;
     const keys = Object.keys(patch || {});
     if (!keys.length) return;
 
-    // JSONB columns in user_state that we want to cast safely
     const JSONB_COLS = new Set(["behavior_profile", "last_topic"]);
 
     const cols = [];
+    const setCols = [];
     const vals = [String(userId)];
     let idx = 2;
 
@@ -567,21 +575,32 @@ Return ONLY the reply text.
       const v = patch[k];
       const isJsonb = JSONB_COLS.has(k);
 
+      cols.push(k);
+
       if (isJsonb) {
         const s = typeof v === "string" ? v : JSON.stringify(v ?? {});
-        cols.push(`${k}=$${idx++}::jsonb`);
         vals.push(s);
+        setCols.push(`${k}=EXCLUDED.${k}::jsonb`);
       } else {
-        cols.push(`${k}=$${idx++}`);
         vals.push(v);
+        setCols.push(`${k}=EXCLUDED.${k}`);
       }
+      idx++;
     }
 
-    const sql = `UPDATE user_state SET ${cols.join(", ")}, updated_at=NOW() WHERE user_id=$1`;
+    const placeholders = cols.map((_, i) => `$${i + 2}`).join(", ");
+
+    const sql = `
+      INSERT INTO user_state (user_id, ${cols.join(", ")}, updated_at)
+      VALUES ($1, ${placeholders}, NOW())
+      ON CONFLICT (user_id)
+      DO UPDATE SET ${setCols.join(", ")}, updated_at=NOW()
+    `;
+
     try {
       await dbQuery(sql, vals);
     } catch {
-      // ignore if schema doesn’t match
+      // ignore if schema doesn’t match (keeps engine resilient while you migrate DB)
     }
   }
 
@@ -624,10 +643,8 @@ Return ONLY the reply text.
     const t = String(userText || "").trim();
     const lower = t.toLowerCase();
 
-    // ✅ NEW: scope detection (all inboxes)
     const wantsAll =
-      /\b(all|every|all my|all of my|across all|across)\b/.test(lower) &&
-      /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(lower);
+      /\b(all|every|all my|all of my|across all|across)\b/.test(lower) && /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(lower);
 
     function extractCountDefault(defaultN = 5) {
       const m = lower.match(/\b(\d{1,2})\b/);
@@ -669,7 +686,6 @@ Return ONLY the reply text.
     const use = t.match(/\buse\s+(gmail|outlook|yahoo)\b/i);
     if (use) return { kind: "set_provider", provider: String(use[1] || "").toLowerCase() };
 
-    // ✅ LIST / LATEST
     const hasEmailWord = /\b(email|emails|inbox|messages)\b/.test(lower);
     const listVerb = /\b(list|show|get|open|pull)\b/.test(lower);
     const recencyWord = /\b(latest|recent|newest|last)\b/.test(lower);
@@ -681,10 +697,6 @@ Return ONLY the reply text.
     return { kind: "unknown", scope: wantsAll ? "all" : "one" };
   }
 
-  /**
-   * Outlook snippets can contain \r\n + weird spacing.
-   * ✅ This cleans it so it looks like Gmail style.
-   */
   function cleanSnippet(s) {
     return String(s || "")
       .replace(/\r/g, "")
@@ -700,10 +712,7 @@ Return ONLY the reply text.
       const subj = m?.subject ? String(m.subject).trim() : "(no subject)";
       const from = m?.from ? String(m.from).trim() : "(unknown sender)";
       const snip = m?.snippet ? ` — ${cleanSnippet(m.snippet).slice(0, 120)}` : "";
-
-      // Keep ID (needed for reply-by-id flows), but show it clean
       const idLine = m?.id ? `\n   id: ${String(m.id).trim()}` : "";
-
       return `${i + 1}) ${subj}\n   From: ${from}${idLine}${snip}`;
     });
 
@@ -842,6 +851,10 @@ Return ONLY the reply text.
     return process.env.OPENAI_MODEL_DECISION || process.env.OPENAI_MODEL || "gpt-4o-mini";
   }
 
+  function openAIBaseUrl() {
+    return String(process.env.OPENAI_BASE_URL || "https://api.openai.com").replace(/\/+$/, "");
+  }
+
   async function callOpenAIDecision_JSONinText({ text, memory, liveContextCompact, maxTokens }) {
     const model = getOpenAIModelDecision();
     const apiKey = process.env.OPENAI_API_KEY;
@@ -867,7 +880,7 @@ Rules:
       if (liveContextCompact) inputs.push({ role: "system", content: `Live context:\n${JSON.stringify(liveContextCompact)}` });
       inputs.push({ role: "user", content: String(text || "") });
 
-      const resp = await fetch("https://api.openai.com/v1/responses", {
+      const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
         method: "POST",
         signal: controller.signal,
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
@@ -937,6 +950,7 @@ Rules:
 
     const { controller, cancel } = withTimeout(Number(process.env.GEMINI_TIMEOUT_MS || 20000));
     try {
+      // NOTE: You can swap this URL if your adapter uses a different Gemini gateway.
       const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
         method: "POST",
         signal: controller.signal,
@@ -988,7 +1002,7 @@ Rules:
       last_reply_hint: lastReplyHint || "",
     };
 
-    const resp = await fetch("https://api.openai.com/v1/responses", {
+    const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1097,7 +1111,6 @@ Rules:
       };
     }
 
-    // Plus gate: inbox summarize
     if (cmd.kind === "summarize") {
       const gate = requireFeatureOrTease({
         tier: planTier,
@@ -1119,8 +1132,7 @@ Rules:
 
     const st = await loadUserState(userId);
     const preferred = String(st?.preferred_email_provider || "").toLowerCase();
-    const providers =
-      preferred && connected.includes(preferred) ? [preferred, ...connected.filter((x) => x !== preferred)] : connected;
+    const providers = preferred && connected.includes(preferred) ? [preferred, ...connected.filter((x) => x !== preferred)] : connected;
 
     const emailSvc = services?.email;
     if (!emailSvc) {
@@ -1143,7 +1155,6 @@ Rules:
       throw lastErr || new Error("Email provider failed.");
     }
 
-    // ✅ NEW: fetch all providers (one command returns Gmail + Outlook + Yahoo)
     async function fetchAllProviders(fn) {
       const out = [];
       for (const p of providers) {
@@ -1157,7 +1168,6 @@ Rules:
       return out;
     }
 
-    // Now parseEmailCommand sets scope, but keep fallback detection too
     function wantsAllInboxesFromText(t) {
       const s = String(t || "").toLowerCase();
       return /\b(all|every|all my|all of my|across all|across)\b/.test(s) && /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(s);
@@ -1170,13 +1180,11 @@ Rules:
     }
 
     /* ---------------- LIST / LATEST ---------------- */
-    // ✅ FIXED: list / latest (DO NOT pass q:"INBOX" — breaks Outlook Graph when adapter maps q->$search)
     if (cmd.kind === "list") {
       const max = clamp(Number(cmd.max || 5), 1, 25);
 
       if (allMode) {
         const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, max }));
-
         const blocks = all.map((x) => {
           if (!x.ok) return `=== ${x.provider} ===\nError: ${x.err}`;
           const items = x.res || [];
@@ -1211,9 +1219,7 @@ Rules:
         };
       }
 
-      const { provider: used, res: items } = await tryProviders((p) =>
-        emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 })
-      );
+      const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 }));
 
       const reply =
         !items?.length
@@ -1277,7 +1283,6 @@ Rules:
     if (cmd.kind === "search") {
       const q = cmd.query || "";
 
-      // ✅ IMPORTANT: tell adapters to avoid $orderBy when using $search (Outlook)
       const listArgs = {
         userId,
         q: q ? `newer_than:180d ${q}` : "newer_than:30d",
@@ -1314,7 +1319,6 @@ Rules:
         };
       }
 
-      // Sending is always single-provider (preferred first)
       const { provider: used, res: sent } = await tryProviders((p) =>
         emailSvc.send({ provider: p, userId, to: cmd.to, subject: cmd.subject || "Loravo", body: cmd.body })
       );
@@ -1327,9 +1331,7 @@ Rules:
 
     /* ---------------- REPLY ---------------- */
     if (cmd.kind === "reply_latest") {
-      const { provider: used, res: info } = await tryProviders((p) =>
-        emailSvc.replyLatest({ provider: p, userId, body: cmd.body || "" })
-      );
+      const { provider: used, res: info } = await tryProviders((p) => emailSvc.replyLatest({ provider: p, userId, body: cmd.body || "" }));
       return {
         reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`,
         payload: { provider: "loravo_email", mode: "instant", lxt1: null },
@@ -1366,9 +1368,7 @@ Rules:
       return one || "I can pull your weather — do you want current conditions or the next 24 hours?";
     }
     const city = extractCityFromWeatherText(text);
-    return city
-      ? `I can pull it — current conditions in ${city}, or the next 24 hours?`
-      : "Which city are you in (or allow location), and do you want current conditions or the next 24 hours?";
+    return city ? `I can pull it — current conditions in ${city}, or the next 24 hours?` : "Which city are you in (or allow location), and do you want current conditions or the next 24 hours?";
   }
 
   async function handleStocksIntent({ text, liveContext }) {
@@ -1381,8 +1381,7 @@ Rules:
       const chg = q?.change_pct != null ? q.change_pct : q?.dp ?? null;
       const asof = q?.asof || q?.t || null;
 
-      if (price != null && chg != null)
-        return `${ticker} is around ${price} (${chg >= 0 ? "+" : ""}${Math.round(chg * 100) / 100}%).${asof ? ` (${asof})` : ""}`;
+      if (price != null && chg != null) return `${ticker} is around ${price} (${chg >= 0 ? "+" : ""}${Math.round(chg * 100) / 100}%).${asof ? ` (${asof})` : ""}`;
       if (price != null) return `${ticker} is around ${price}.`;
       return `I pulled data for ${ticker}, but it’s incomplete.`;
     }
@@ -1400,9 +1399,7 @@ Rules:
     if (!items.length) return "Nothing urgent on your radar right now.";
 
     return await callGeminiReply({
-      userText: `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(
-        items.slice(0, 5)
-      )}`,
+      userText: `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(items.slice(0, 5))}`,
       lxt1: null,
       voiceProfile,
       liveContext: {},
@@ -1463,19 +1460,15 @@ Rules:
 
     const userId = String(user_id || "").trim() || null;
 
-    // Load state + memory
     const [state, memory] = await Promise.all([
       userId ? loadUserState(userId) : Promise.resolve(null),
       userId ? loadUserMemory(userId) : Promise.resolve(""),
     ]);
 
-    // Plan tier (Level 3)
     const planTier = normalizeTier(state?.plan_tier || defaults.plan_tier || "core");
 
-    // Slow voice profile refresh (Level 1 base)
     if (userId) await maybeUpdateVoiceProfile({ userId, userState: state, memory });
 
-    // Update behavior profile slowly (Level 2)
     if (userId) {
       const sig = inferBehaviorFromText(text);
       const oldBP = state?.behavior_profile || {};
@@ -1486,23 +1479,19 @@ Rules:
       });
     }
 
-    // Reload state for freshest behavior/voice
     const state2 = userId ? await loadUserState(userId) : state;
 
     const behaviorLine = behaviorToVoiceLine(state2?.behavior_profile || null);
     const baseVoice = state2?.voice_profile || defaults.voice_profile || null;
     const finalVoiceProfile = [baseVoice, behaviorLine].filter(Boolean).join(" ").trim() || null;
 
-    // Intent
     let intent = classifyIntent(text);
     if (forceIntent) intent = String(forceIntent);
     if (forceDecision) intent = "decision";
 
-    // Mode
     if (mode === "auto") mode = pickAutoMode(text);
     const maxTokens = TOKEN_LIMITS[mode] || TOKEN_LIMITS.auto;
 
-    // Live context
     const liveContext = await buildLiveContext({
       userId,
       text,
@@ -1513,7 +1502,6 @@ Rules:
 
     const liveCompact = compactLiveContextForDecision(liveContext);
 
-    // MORE MODE topic memory (Level 2)
     let topic = detectTopic(text);
     if (isMoreOnly(text) && state2?.last_topic) {
       topic = state2.last_topic;
@@ -1521,7 +1509,6 @@ Rules:
     }
     if (userId) await setUserStateFields(userId, { last_topic: topic });
 
-    // Identity fast answer
     if (isPoweredByQuestion(text)) {
       if (userId) await saveUserMemory(userId, text);
 
@@ -1549,7 +1536,6 @@ Rules:
       };
     }
 
-    // Save memory (simple)
     if (userId) await saveUserMemory(userId, text);
 
     /* -------- FAST PATHS -------- */
@@ -1693,7 +1679,6 @@ Rules:
 
     let lxt1 = sanitizeToSchema(decision.lxt1 || safeFallbackResult("Temporary issue — try again."));
 
-    // If user asked weather, gently merge it into one_liner
     if (isWeatherQuestion(text) && liveContext?.weather) {
       const w = formatWeatherOneLiner(liveContext.weather, liveContext?.location?.city || null);
       if (w) {
@@ -1754,10 +1739,7 @@ Rules:
   }
 
   /* ===================== PROACTIVE INSIGHTS (WORKER-READY, LEVEL 3) ===================== */
-  /**
-   * This does NOT run by itself. Your worker/cron calls it every X minutes.
-   * It returns insight objects you can enqueue into alert_queue for push.
-   */
+
   async function generateProactiveInsights({ userId, lat = null, lon = null }) {
     const state = await loadUserState(userId);
     const planTier = normalizeTier(state?.plan_tier || "core");
@@ -1773,7 +1755,6 @@ Rules:
       userState: state,
     });
 
-    // If you have a real proactive engine, prefer it
     if (services?.signals?.proactive) {
       try {
         return await services.signals.proactive({ userId, liveContext, state });
@@ -1816,7 +1797,6 @@ ${JSON.stringify(liveContext)}`,
     runLXT,
     generateProactiveInsights,
 
-    // Expose helpers so index.js / worker can reuse them
     _internals: {
       classifyIntent,
       pickAutoMode,
