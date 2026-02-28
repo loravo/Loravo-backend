@@ -27,6 +27,7 @@
  * - behavior_updated_at TIMESTAMPTZ
  * - preferred_email_provider TEXT
  * - last_city TEXT, last_country TEXT, last_timezone TEXT
+ * - last_alert_hash TEXT               -- optional (used to avoid repeated wording)
  * - updated_at TIMESTAMPTZ default NOW()
  *************************************************/
 
@@ -277,28 +278,70 @@ Return ONLY the reply text.
 
   function sanitizeToSchema(o) {
     const conf = typeof o?.confidence === "number" ? o.confidence : 0.62;
+
+    // lightly sanitize nested arrays so you don’t leak weird shapes into clients
+    const signals = Array.isArray(o?.signals)
+      ? o.signals
+          .slice(0, 10)
+          .map((s) => ({
+            name: String(s?.name || "").slice(0, 80),
+            direction: ["up", "down", "neutral"].includes(s?.direction) ? s.direction : "neutral",
+            weight: Number.isFinite(Number(s?.weight)) ? Number(s.weight) : 0.2,
+            why: String(s?.why || "").slice(0, 240),
+          }))
+          .filter((s) => s.name)
+      : [];
+
+    const actions = Array.isArray(o?.actions)
+      ? o.actions
+          .slice(0, 8)
+          .map((a) => ({
+            now: String(a?.now || "").slice(0, 240),
+            time: ["today", "this_week", "this_month"].includes(a?.time) ? a.time : "today",
+            effort: ["low", "med", "high"].includes(a?.effort) ? a.effort : "low",
+          }))
+          .filter((a) => a.now)
+      : [{ now: "Proceed normally", time: "today", effort: "low" }];
+
+    const watchouts = Array.isArray(o?.watchouts) ? o.watchouts.slice(0, 10).map((w) => String(w).slice(0, 200)) : [];
+
     return {
       verdict: ["HOLD", "PREPARE", "MOVE", "AVOID"].includes(o?.verdict) ? o.verdict : "HOLD",
       confidence: clamp(Math.round(conf * 100) / 100, 0, 1),
-      one_liner: String(o?.one_liner || "OK"),
-      signals: Array.isArray(o?.signals) ? o.signals : [],
-      actions: Array.isArray(o?.actions) ? o.actions : [{ now: "Proceed normally", time: "today", effort: "low" }],
-      watchouts: Array.isArray(o?.watchouts) ? o.watchouts : [],
+      one_liner: String(o?.one_liner || "OK").slice(0, 280),
+      signals,
+      actions,
+      watchouts,
       next_check: typeof o?.next_check === "string" ? o?.next_check : safeNowPlus(6 * 60 * 60 * 1000),
     };
   }
 
+  // more robust than "first { ... last }" (handles extra text before/after)
   function extractFirstJSONObject(text) {
     if (!text || typeof text !== "string") return null;
-    const start = text.indexOf("{");
-    const end = text.lastIndexOf("}");
-    if (start === -1 || end === -1 || end <= start) return null;
-    const candidate = text.slice(start, end + 1);
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      return null;
+    const s = text;
+    const start = s.indexOf("{");
+    if (start === -1) return null;
+
+    let depth = 0;
+    for (let i = start; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "{") depth++;
+      if (ch === "}") depth--;
+
+      if (depth === 0) {
+        const candidate = s.slice(start, i + 1);
+        try {
+          return JSON.parse(candidate);
+        } catch {
+          // if parse fails, keep scanning for another object
+          const nextStart = s.indexOf("{", start + 1);
+          if (nextStart === -1) return null;
+          return extractFirstJSONObject(s.slice(nextStart));
+        }
+      }
     }
+    return null;
   }
 
   function isPoweredByQuestion(userText) {
@@ -331,8 +374,9 @@ Return ONLY the reply text.
   function userWantsMore(text) {
     const t = String(text || "").toLowerCase();
     return (
-      /\b(more|more detail|details|go deeper|deeper|why|explain|break it down|step by step|steps|examples|expand|elaborate)\b/.test(t) ||
-      /\bhow exactly\b/.test(t)
+      /\b(more|more detail|details|go deeper|deeper|why|explain|break it down|step by step|steps|examples|expand|elaborate)\b/.test(
+        t
+      ) || /\bhow exactly\b/.test(t)
     );
   }
 
@@ -582,7 +626,6 @@ Return ONLY the reply text.
     const cols = [];
     const setCols = [];
     const vals = [String(userId)];
-    let idx = 2;
 
     for (const k of keys) {
       const v = patch[k];
@@ -598,7 +641,6 @@ Return ONLY the reply text.
         vals.push(v);
         setCols.push(`${k}=EXCLUDED.${k}`);
       }
-      idx++;
     }
 
     const placeholders = cols.map((_, i) => `$${i + 2}`).join(", ");
@@ -868,6 +910,25 @@ Return ONLY the reply text.
     return String(process.env.OPENAI_BASE_URL || "https://api.openai.com").replace(/\/+$/, "");
   }
 
+  function parseOpenAIResponsesText(data) {
+    // supports a few shapes so you don’t randomly break during upgrades
+    const out1 =
+      data?.output
+        ?.flatMap((o) => o?.content || [])
+        ?.map((p) => p?.text)
+        ?.filter(Boolean)
+        ?.join("\n") || "";
+    if (out1.trim()) return out1;
+
+    const out2 = data?.output_text;
+    if (typeof out2 === "string" && out2.trim()) return out2;
+
+    const out3 = data?.choices?.[0]?.message?.content;
+    if (typeof out3 === "string" && out3.trim()) return out3;
+
+    return "";
+  }
+
   async function callOpenAIDecision_JSONinText({ text, memory, liveContextCompact, maxTokens }) {
     const model = getOpenAIModelDecision();
     const apiKey = process.env.OPENAI_API_KEY;
@@ -907,13 +968,7 @@ Rules:
       if (!resp.ok) throw new Error(await resp.text());
       const data = await resp.json();
 
-      const outText =
-        data?.output
-          ?.flatMap((o) => o?.content || [])
-          ?.map((p) => p?.text)
-          ?.filter(Boolean)
-          ?.join("\n") || "";
-
+      const outText = parseOpenAIResponsesText(data);
       const obj = extractFirstJSONObject(outText);
       if (!obj) throw new Error("OpenAI returned no JSON");
       return sanitizeToSchema(obj);
@@ -932,6 +987,17 @@ Rules:
       }
     }
     throw err;
+  }
+
+  // Gemini auth helper: supports either Bearer or x-goog-api-key style
+  function geminiHeaders(apiKey) {
+    const k = String(apiKey || "").trim();
+    const h = { "Content-Type": "application/json" };
+    if (!k) return h;
+    // most Gemini keys look like AIza...
+    if (k.startsWith("AIza")) h["x-goog-api-key"] = k;
+    else h["Authorization"] = `Bearer ${k}`;
+    return h;
   }
 
   // ✅ Gemini reply using MASTER CHAT PROMPT
@@ -963,11 +1029,11 @@ Rules:
 
     const { controller, cancel } = withTimeout(Number(process.env.GEMINI_TIMEOUT_MS || 20000));
     try {
-      // NOTE: You can swap this URL if your adapter uses a different Gemini gateway.
+      // OpenAI-compatible gateway (as you had it)
       const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
         method: "POST",
         signal: controller.signal,
-        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        headers: geminiHeaders(key),
         body: JSON.stringify({
           model,
           messages: [
@@ -1039,12 +1105,7 @@ Rules:
     if (!resp.ok) throw new Error(await resp.text());
 
     const data = await resp.json();
-    const outText =
-      data?.output
-        ?.flatMap((o) => o?.content || [])
-        ?.map((p) => p?.text)
-        ?.filter(Boolean)
-        ?.join("\n") || "";
+    const outText = parseOpenAIResponsesText(data);
 
     return outText.trim() || "Got you — what do you want to do next?";
   }
@@ -1098,6 +1159,7 @@ Rules:
       return { reply, replyProvider: "gemini", tried: ["gemini"] };
     }
 
+    // trinity
     try {
       const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
       return { reply, replyProvider: "gemini", tried: ["gemini"] };
@@ -1240,7 +1302,9 @@ Rules:
         };
       }
 
-      const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 }));
+      const { provider: used, res: items } = await tryProviders((p) =>
+        emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 })
+      );
 
       const reply =
         !items?.length
@@ -1352,7 +1416,9 @@ Rules:
 
     /* ---------------- REPLY ---------------- */
     if (cmd.kind === "reply_latest") {
-      const { provider: used, res: info } = await tryProviders((p) => emailSvc.replyLatest({ provider: p, userId, body: cmd.body || "" }));
+      const { provider: used, res: info } = await tryProviders((p) =>
+        emailSvc.replyLatest({ provider: p, userId, body: cmd.body || "" })
+      );
       return {
         reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`,
         payload: { provider: "loravo_email", mode: "instant", lxt1: null },
@@ -1476,7 +1542,7 @@ Rules:
     const provider = getProvider(req);
     let mode = getMode(req);
 
-    // ✅ UPDATED: allow image-only messages (ChatGPT-style)
+    // ✅ allow image-only messages (ChatGPT-style)
     let { text, user_id, lat, lon, images } = req?.body || {};
     const hasImages = Array.isArray(images) && images.length > 0;
 
