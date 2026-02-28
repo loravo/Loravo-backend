@@ -55,8 +55,31 @@ const outlookMod = require("./Emails/outlook"); // { router, service } OR router
 const { createLXT } = require("./services/LXT"); // file: /services/LXT.js
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+
+/**
+ * ✅ IMAGE UPLOAD FIX:
+ * Base64 image(s) inside JSON can easily exceed 1mb.
+ * We raise the limit + add urlencoded limit.
+ */
+app.use(express.json({ limit: "20mb" }));
+app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 app.use(cors({ origin: "*" }));
+
+/**
+ * ✅ CLEAN 413 HANDLER:
+ * When payload is too large, express/body-parser throws "entity.too.large".
+ * Without this, it returns an HTML error page (what you saw).
+ * With this, the app returns JSON so the iOS app can show a clean message.
+ */
+app.use((err, req, res, next) => {
+  if (err && err.type === "entity.too.large") {
+    return res.status(413).json({
+      error: "payload_too_large",
+      detail: "Payload too large. Try fewer images or smaller size.",
+    });
+  }
+  return next(err);
+});
 
 // Mount route modules
 app.use("/", weatherRoute);
@@ -557,7 +580,11 @@ async function updateWeatherAndMaybeAlert({ userId, lat, lon }) {
 
 /* ===================== PUSH (APNs) ===================== */
 function base64urlBuffer(buf) {
-  return Buffer.from(buf).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return Buffer.from(buf)
+    .toString("base64")
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
 }
 function base64urlJson(obj) {
   return base64urlBuffer(Buffer.from(JSON.stringify(obj)));
@@ -1146,7 +1173,7 @@ app.post("/push/send-test", async (req, res) => {
     if (!body) return res.status(400).json({ error: "Missing body" });
 
     if (!dbReady) {
-     	return res.status(200).json({ ok: true, db: false, note: "DB disabled — cannot send test push." });
+      return res.status(200).json({ ok: true, db: false, note: "DB disabled — cannot send test push." });
     }
 
     const envWanted = environment ? normalizeEnv(environment) : null;
