@@ -56,30 +56,10 @@ const { createLXT } = require("./services/LXT"); // file: /services/LXT.js
 
 const app = express();
 
-/**
- * ✅ IMAGE UPLOAD FIX:
- * Base64 image(s) inside JSON can easily exceed 1mb.
- * We raise the limit + add urlencoded limit.
- */
+// ✅ IMPORTANT: accept larger JSON payloads for base64 images (but we still validate below)
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 app.use(cors({ origin: "*" }));
-
-/**
- * ✅ CLEAN 413 HANDLER:
- * When payload is too large, express/body-parser throws "entity.too.large".
- * Without this, it returns an HTML error page (what you saw).
- * With this, the app returns JSON so the iOS app can show a clean message.
- */
-app.use((err, req, res, next) => {
-  if (err && err.type === "entity.too.large") {
-    return res.status(413).json({
-      error: "payload_too_large",
-      detail: "Payload too large. Try fewer images or smaller size.",
-    });
-  }
-  return next(err);
-});
 
 // Mount route modules
 app.use("/", weatherRoute);
@@ -287,6 +267,93 @@ function minutesFromHHMM(hhmm) {
   const m = String(hhmm || "").match(/^(\d{2}):(\d{2})$/);
   if (!m) return null;
   return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+}
+
+/* ===================== IMAGE UPLOAD GUARDS (NEW) ===================== */
+/**
+ * We accept base64 JPEG strings in req.body.images.
+ * We MUST fail fast, or the request can hang / get killed by infra.
+ *
+ * Tune these if needed:
+ * - max 4 images (matches your UI)
+ * - max ~1.8MB binary each (base64 will be bigger)
+ * - max total ~6MB binary
+ */
+const CHAT_MAX_IMAGES = 4;
+const CHAT_MAX_IMAGE_BYTES_EACH = 1.8 * 1024 * 1024;   // 1.8MB
+const CHAT_MAX_IMAGE_BYTES_TOTAL = 6.0 * 1024 * 1024;  // 6MB
+
+function approxBytesFromBase64(b64) {
+  // base64 length -> bytes (approx)
+  const s = String(b64 || "");
+  if (!s) return 0;
+  // remove whitespace just in case
+  const cleaned = s.replace(/\s+/g, "");
+  // 4 chars -> 3 bytes
+  return Math.floor((cleaned.length * 3) / 4);
+}
+
+function validateChatImages(req, res) {
+  const imgs = req?.body?.images;
+
+  if (!imgs) return true;
+  if (!Array.isArray(imgs)) {
+    res.status(400).json({ error: "images must be an array of base64 strings" });
+    return false;
+  }
+
+  if (imgs.length > CHAT_MAX_IMAGES) {
+    res.status(413).json({
+      error: "too_many_images",
+      detail: `Max ${CHAT_MAX_IMAGES} images allowed.`,
+    });
+    return false;
+  }
+
+  let total = 0;
+  for (let i = 0; i < imgs.length; i++) {
+    const b64 = imgs[i];
+
+    if (typeof b64 !== "string" || b64.trim().length < 20) {
+      res.status(400).json({
+        error: "bad_image",
+        detail: `Image #${i + 1} is not a valid base64 string.`,
+      });
+      return false;
+    }
+
+    // reject data URI prefix if someone sends it
+    if (b64.startsWith("data:")) {
+      res.status(400).json({
+        error: "bad_image",
+        detail: `Image #${i + 1} must be raw base64 (no data:image/... prefix).`,
+      });
+      return false;
+    }
+
+    const bytes = approxBytesFromBase64(b64);
+    total += bytes;
+
+    if (bytes > CHAT_MAX_IMAGE_BYTES_EACH) {
+      res.status(413).json({
+        error: "image_too_large",
+        detail: `Image #${i + 1} is too large. Please compress/resize before upload.`,
+        max_each_bytes: CHAT_MAX_IMAGE_BYTES_EACH,
+      });
+      return false;
+    }
+  }
+
+  if (total > CHAT_MAX_IMAGE_BYTES_TOTAL) {
+    res.status(413).json({
+      error: "images_total_too_large",
+      detail: "Total image payload is too large. Please upload fewer images or compress them.",
+      max_total_bytes: CHAT_MAX_IMAGE_BYTES_TOTAL,
+    });
+    return false;
+  }
+
+  return true;
 }
 
 /* ===================== USER MEMORY ===================== */
@@ -580,11 +647,7 @@ async function updateWeatherAndMaybeAlert({ userId, lat, lon }) {
 
 /* ===================== PUSH (APNs) ===================== */
 function base64urlBuffer(buf) {
-  return Buffer.from(buf)
-    .toString("base64")
-    .replace(/=/g, "")
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_");
+  return Buffer.from(buf).toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
 }
 function base64urlJson(obj) {
   return base64urlBuffer(Buffer.from(JSON.stringify(obj)));
@@ -982,6 +1045,9 @@ app.post("/lxt1", async (req, res) => {
 
 app.post("/chat", async (req, res) => {
   try {
+    // ✅ NEW: fail fast if images are too big (prevents hanging/timeouts)
+    if (!validateChatImages(req, res)) return;
+
     const result = await lxt.runLXT({ req });
     res.json({
       reply: result.reply,
@@ -1264,6 +1330,18 @@ app.get("/prefs", async (req, res) => {
   }
 });
 
+/* ===================== BODY PARSER ERROR HANDLER (NEW) ===================== */
+app.use((err, req, res, next) => {
+  // express.json limit hit -> "entity.too.large"
+  if (err && (err.type === "entity.too.large" || err.status === 413)) {
+    return res.status(413).json({
+      error: "payload_too_large",
+      detail: "Payload Too Large. Please compress/resize images before upload.",
+    });
+  }
+  return next(err);
+});
+
 /* ===================== START ===================== */
 const PORT = process.env.PORT || 3000;
 
@@ -1275,7 +1353,11 @@ const PORT = process.env.PORT || 3000;
     dbReady = false;
   }
 
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`✅ LORAVO running on ${PORT} (dbReady=${dbReady})`);
   });
+
+  // ✅ NEW: let /chat take longer (AI calls + image processing later)
+  server.headersTimeout = 120000; // 120s
+  server.requestTimeout = 120000; // 120s (Node 18+)
 })();
