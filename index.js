@@ -41,9 +41,13 @@ const { Pool } = require("pg");
 const crypto = require("crypto");
 const http2 = require("http2");
 
+// ✅ define PORT early (used by helper funcs too)
+const PORT = process.env.PORT || 3000;
+
 // ✅ MOVED: routes live in /services now
 const weatherRoute = require("./services/weather");
 const newsRoute = require("./services/news");
+const multer = require("multer");
 
 // ✅ Email provider packages (must export { router, service })
 // NOTE: Outlook may currently export router only — we support both.
@@ -56,9 +60,15 @@ const { createLXT } = require("./services/LXT"); // file: /services/LXT.js
 
 const app = express();
 
+// ✅ Multipart image upload (memory)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 }, // 25MB per image
+});
+
 // ✅ IMPORTANT: accept larger JSON payloads for base64 images (but we still validate below)
-app.use(express.json({ limit: "20mb" }));
-app.use(express.urlencoded({ extended: true, limit: "20mb" }));
+app.use(express.json({ limit: "60mb" }));
+app.use(express.urlencoded({ extended: true, limit: "60mb" }));
 app.use(cors({ origin: "*" }));
 
 // Mount route modules
@@ -157,6 +167,15 @@ async function initDb() {
       ADD COLUMN IF NOT EXISTS voice_profile TEXT,
       ADD COLUMN IF NOT EXISTS voice_profile_updated_at TIMESTAMPTZ,
       ADD COLUMN IF NOT EXISTS preferred_email_provider TEXT;
+  `);
+
+  // ✅ LXT Level 2/3 columns (required by /services/LXT.js)
+  await pool.query(`
+    ALTER TABLE user_state
+      ADD COLUMN IF NOT EXISTS plan_tier TEXT DEFAULT 'core',
+      ADD COLUMN IF NOT EXISTS behavior_profile JSONB DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS last_topic JSONB DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS behavior_updated_at TIMESTAMPTZ;
   `);
 
   // ✅ CRITICAL: Yahoo router stores tokens in user_state (these columns MUST exist)
@@ -864,7 +883,9 @@ async function getAlertHistory(userId, limit = 50, offset = 0) {
 /* ===================== EMAIL SERVICE (MAXED + OUTLOOK FALLBACK) ===================== */
 async function outlookIsConnectedViaHttp(userId) {
   try {
-    const r = await fetch(`http://localhost:${PORT}/outlook/status?user_id=${encodeURIComponent(userId)}`);
+    // ✅ avoid hardcoding localhost in production
+    const base = process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`;
+    const r = await fetch(`${base}/outlook/status?user_id=${encodeURIComponent(userId)}`);
     const j = r.ok ? await r.json() : null;
     return Boolean(j?.connected);
   } catch {
@@ -1043,12 +1064,30 @@ app.post("/lxt1", async (req, res) => {
   }
 });
 
-app.post("/chat", async (req, res) => {
+app.post("/chat", upload.array("images", 4), async (req, res) => {
   try {
-    // ✅ NEW: fail fast if images are too big (prevents hanging/timeouts)
+    const files = Array.isArray(req.files) ? req.files : [];
+    req.body = req.body || {};
+
+    // ✅ multer sends fields as strings
+    if (req.body.lat != null) req.body.lat = Number(req.body.lat);
+    if (req.body.lon != null) req.body.lon = Number(req.body.lon);
+
+    // ✅ IMPORTANT: images must be base64 string[] (matches validateChatImages + typical LXT expectations)
+    req.body.images = files.map((f) => f.buffer.toString("base64"));
+
+    // ✅ optional metadata (won't break anything)
+    req.body.image_meta = files.map((f) => ({
+      mime: f.mimetype,
+      size: f.size,
+      name: f.originalname,
+    }));
+
+    // ✅ fail fast if too big / malformed
     if (!validateChatImages(req, res)) return;
 
     const result = await lxt.runLXT({ req });
+
     res.json({
       reply: result.reply,
       lxt1: result.lxt1,
@@ -1343,8 +1382,6 @@ app.use((err, req, res, next) => {
 });
 
 /* ===================== START ===================== */
-const PORT = process.env.PORT || 3000;
-
 (async () => {
   try {
     await initDb();

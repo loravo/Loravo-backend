@@ -313,6 +313,19 @@ Return ONLY the reply text.
     );
   }
 
+  // ✅ Normalize incoming images to OpenAI-friendly data URLs
+  function normalizeImages(images) {
+    if (!Array.isArray(images) || !images.length) return [];
+    const out = [];
+    for (const img of images.slice(0, 4)) {
+      const s = String(img || "").trim();
+      if (!s) continue;
+      if (s.startsWith("data:image")) out.push(s);
+      else out.push(`data:image/jpeg;base64,${s}`);
+    }
+    return out;
+  }
+
   /* ===================== “SHORT FIRST, EXPAND IF ASKED” ===================== */
 
   function userWantsMore(text) {
@@ -977,8 +990,8 @@ Rules:
     }
   }
 
-  // ✅ OpenAI reply using MASTER CHAT PROMPT
-  async function callOpenAIReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint }) {
+  // ✅ OpenAI reply using MASTER CHAT PROMPT (+ optional vision images)
+  async function callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
@@ -1002,6 +1015,14 @@ Rules:
       last_reply_hint: lastReplyHint || "",
     };
 
+    // ✅ Build multimodal input (text + optional images)
+    const userContent = [{ type: "input_text", text: JSON.stringify(payload) }];
+
+    const imgs = normalizeImages(images);
+    for (const url of imgs) {
+      userContent.push({ type: "input_image", image_url: url });
+    }
+
     const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
@@ -1009,7 +1030,7 @@ Rules:
         model,
         input: [
           { role: "system", content: system },
-          { role: "user", content: JSON.stringify(payload) },
+          { role: "user", content: userContent },
         ],
         max_output_tokens: 1200,
       }),
@@ -1066,9 +1087,9 @@ Rules:
     }
   }
 
-  async function getHumanReply({ provider, userText, lxt1, voiceProfile, liveContext, lastReplyHint }) {
+  async function getHumanReply({ provider, userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
     if (provider === "openai") {
-      const reply = await callOpenAIReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
+      const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
       return { reply, replyProvider: "openai", tried: ["openai"] };
     }
 
@@ -1081,7 +1102,7 @@ Rules:
       const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
       return { reply, replyProvider: "gemini", tried: ["gemini"] };
     } catch (e) {
-      const reply = await callOpenAIReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
+      const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
       return {
         reply,
         replyProvider: "openai_fallback",
@@ -1455,7 +1476,18 @@ Rules:
     const provider = getProvider(req);
     let mode = getMode(req);
 
-    const { text, user_id, lat, lon } = req?.body || {};
+    // ✅ UPDATED: allow image-only messages (ChatGPT-style)
+    let { text, user_id, lat, lon, images } = req?.body || {};
+    const hasImages = Array.isArray(images) && images.length > 0;
+
+    // normalize images (limit + data URL format)
+    images = normalizeImages(images);
+
+    // If user sent only images, auto-create a prompt so we don't throw
+    if ((!text || String(text).trim().length === 0) && hasImages) {
+      text = "Describe this image.";
+    }
+
     if (!text) throw new Error("Missing 'text' in body");
 
     const userId = String(user_id || "").trim() || null;
@@ -1652,6 +1684,7 @@ Rules:
         const voice = await getHumanReply({
           provider,
           userText: expandedUserText,
+          images, // ✅ pass images through for OpenAI vision
           lxt1: lxt1ForChat,
           voiceProfile: finalVoiceProfile,
           liveContext,
@@ -1708,6 +1741,7 @@ Rules:
     const voice = await getHumanReply({
       provider,
       userText: text,
+      images, // ✅ pass images through for OpenAI vision
       lxt1,
       voiceProfile: finalVoiceProfile,
       liveContext,
