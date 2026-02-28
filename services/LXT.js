@@ -902,42 +902,42 @@ Return ONLY the reply text.
 
   /* ===================== PROVIDERS: DECISION + REPLY ===================== */
 
-  function getOpenAIModelDecision() {
-    return process.env.OPENAI_MODEL_DECISION || process.env.OPENAI_MODEL || "gpt-4o-mini";
-  }
+function getOpenAIModelDecision() {
+  return process.env.OPENAI_MODEL_DECISION || process.env.OPENAI_MODEL || "gpt-4o-mini";
+}
 
-  function openAIBaseUrl() {
-    return String(process.env.OPENAI_BASE_URL || "https://api.openai.com").replace(/\/+$/, "");
-  }
+function openAIBaseUrl() {
+  return String(process.env.OPENAI_BASE_URL || "https://api.openai.com").replace(/\/+$/, "");
+}
 
-  function parseOpenAIResponsesText(data) {
-    // supports a few shapes so you don’t randomly break during upgrades
-    const out1 =
-      data?.output
-        ?.flatMap((o) => o?.content || [])
-        ?.map((p) => p?.text)
-        ?.filter(Boolean)
-        ?.join("\n") || "";
-    if (out1.trim()) return out1;
+function parseOpenAIResponsesText(data) {
+  // supports a few shapes so you don’t randomly break during upgrades
+  const out1 =
+    data?.output
+      ?.flatMap((o) => o?.content || [])
+      ?.map((p) => p?.text)
+      ?.filter(Boolean)
+      ?.join("\n") || "";
+  if (out1.trim()) return out1;
 
-    const out2 = data?.output_text;
-    if (typeof out2 === "string" && out2.trim()) return out2;
+  const out2 = data?.output_text;
+  if (typeof out2 === "string" && out2.trim()) return out2;
 
-    const out3 = data?.choices?.[0]?.message?.content;
-    if (typeof out3 === "string" && out3.trim()) return out3;
+  const out3 = data?.choices?.[0]?.message?.content;
+  if (typeof out3 === "string" && out3.trim()) return out3;
 
-    return "";
-  }
+  return "";
+}
 
-  async function callOpenAIDecision_JSONinText({ text, memory, liveContextCompact, maxTokens }) {
-    const model = getOpenAIModelDecision();
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
+async function callOpenAIDecision_JSONinText({ text, memory, liveContextCompact, maxTokens }) {
+  const model = getOpenAIModelDecision();
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-    const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 20000);
-    const { controller, cancel } = withTimeout(timeoutMs);
+  const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 20000);
+  const { controller, cancel } = withTimeout(timeoutMs);
 
-    const prompt = `
+  const prompt = `
 You are LXT-1 (Loravo decision engine).
 Return ONLY one JSON object matching the schema EXACTLY. JSON only.
 
@@ -948,167 +948,213 @@ Rules:
 - Keep one_liner human, not robotic.
 `.trim();
 
-    try {
-      const inputs = [{ role: "system", content: prompt }];
-      if (memory) inputs.push({ role: "system", content: `Memory:\n${memory}` });
-      if (liveContextCompact) inputs.push({ role: "system", content: `Live context:\n${JSON.stringify(liveContextCompact)}` });
-      inputs.push({ role: "user", content: String(text || "") });
-
-      const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
-        method: "POST",
-        signal: controller.signal,
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          input: inputs,
-          max_output_tokens: maxTokens,
-        }),
-      });
-
-      if (!resp.ok) throw new Error(await resp.text());
-      const data = await resp.json();
-
-      const outText = parseOpenAIResponsesText(data);
-      const obj = extractFirstJSONObject(outText);
-      if (!obj) throw new Error("OpenAI returned no JSON");
-      return sanitizeToSchema(obj);
-    } finally {
-      cancel();
-    }
-  }
-
-  async function callOpenAIDecisionWithRetry({ text, memory, liveContextCompact, maxTokens, tries = 2 }) {
-    let err;
-    for (let i = 0; i < tries; i++) {
-      try {
-        return await callOpenAIDecision_JSONinText({ text, memory, liveContextCompact, maxTokens });
-      } catch (e) {
-        err = e;
-      }
-    }
-    throw err;
-  }
-
-  // Gemini auth helper: supports either Bearer or x-goog-api-key style
-  function geminiHeaders(apiKey) {
-    const k = String(apiKey || "").trim();
-    const h = { "Content-Type": "application/json" };
-    if (!k) return h;
-    // most Gemini keys look like AIza...
-    if (k.startsWith("AIza")) h["x-goog-api-key"] = k;
-    else h["Authorization"] = `Bearer ${k}`;
-    return h;
-  }
-
-  // ✅ Gemini reply using MASTER CHAT PROMPT
-  async function callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint }) {
-    const key = process.env.GEMINI_API_KEY;
-    if (!key) throw new Error("Missing GEMINI_API_KEY");
-
-    const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
-    const replyTokens = pickReplyTokens(userText);
-
-    if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
-
-    const system = LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile);
-
-    const payload = {
-      userText: String(userText || ""),
-      length_hint: lengthHintForReply(userText),
-      lxt_brief: lxt1
-        ? {
-            verdict: lxt1?.verdict || null,
-            one_liner: lxt1?.one_liner || null,
-            top_actions: Array.isArray(lxt1?.actions) ? lxt1.actions.slice(0, 3) : [],
-            top_watchouts: Array.isArray(lxt1?.watchouts) ? lxt1.watchouts.slice(0, 3) : [],
-          }
-        : null,
-      live_context: liveContext || {},
-      last_reply_hint: lastReplyHint || "",
-    };
-
-    const { controller, cancel } = withTimeout(Number(process.env.GEMINI_TIMEOUT_MS || 20000));
-    try {
-      // OpenAI-compatible gateway (as you had it)
-      const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
-        method: "POST",
-        signal: controller.signal,
-        headers: geminiHeaders(key),
-        body: JSON.stringify({
-          model,
-          messages: [
-            { role: "system", content: system },
-            { role: "user", content: JSON.stringify(payload) },
-          ],
-          max_tokens: replyTokens,
-          temperature: 0.62,
-        }),
-      });
-
-      if (!r.ok) throw new Error(await r.text());
-      const j = await r.json();
-      return (j?.choices?.[0]?.message?.content || "").trim() || "Got you. What do you want to do next?";
-    } catch (e) {
-      if (String(e?.name || "").toLowerCase().includes("abort")) return "One sec — try that again.";
-      throw e;
-    } finally {
-      cancel();
-    }
-  }
-
-  // ✅ OpenAI reply using MASTER CHAT PROMPT (+ optional vision images)
-  async function callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
-
-    const model = process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
-    if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
-
-    const system = LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile);
-
-    const payload = {
-      userText: String(userText || ""),
-      length_hint: lengthHintForReply(userText),
-      lxt_brief: lxt1
-        ? {
-            verdict: lxt1?.verdict || null,
-            one_liner: lxt1?.one_liner || null,
-            top_actions: Array.isArray(lxt1?.actions) ? lxt1.actions.slice(0, 3) : [],
-            top_watchouts: Array.isArray(lxt1?.watchouts) ? lxt1.watchouts.slice(0, 3) : [],
-          }
-        : null,
-      live_context: liveContext || {},
-      last_reply_hint: lastReplyHint || "",
-    };
-
-    // ✅ Build multimodal input (text + optional images)
-    const userContent = [{ type: "input_text", text: JSON.stringify(payload) }];
-
-    const imgs = normalizeImages(images);
-    for (const url of imgs) {
-      userContent.push({ type: "input_image", image_url: url });
-    }
+  try {
+    const inputs = [{ role: "system", content: prompt }];
+    if (memory) inputs.push({ role: "system", content: `Memory:\n${memory}` });
+    if (liveContextCompact) inputs.push({ role: "system", content: `Live context:\n${JSON.stringify(liveContextCompact)}` });
+    inputs.push({ role: "user", content: String(text || "") });
 
     const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
       method: "POST",
+      signal: controller.signal,
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model,
-        input: [
-          { role: "system", content: system },
-          { role: "user", content: userContent },
-        ],
-        max_output_tokens: 1200,
+        input: inputs,
+        max_output_tokens: maxTokens,
       }),
     });
 
     if (!resp.ok) throw new Error(await resp.text());
-
     const data = await resp.json();
-    const outText = parseOpenAIResponsesText(data);
 
-    return outText.trim() || "Got you — what do you want to do next?";
+    const outText = parseOpenAIResponsesText(data);
+    const obj = extractFirstJSONObject(outText);
+    if (!obj) throw new Error("OpenAI returned no JSON");
+    return sanitizeToSchema(obj);
+  } finally {
+    cancel();
   }
+}
+
+async function callOpenAIDecisionWithRetry({ text, memory, liveContextCompact, maxTokens, tries = 2 }) {
+  let err;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await callOpenAIDecision_JSONinText({ text, memory, liveContextCompact, maxTokens });
+    } catch (e) {
+      err = e;
+    }
+  }
+  throw err;
+}
+
+// Gemini auth helper: supports either Bearer or x-goog-api-key style
+function geminiHeaders(apiKey) {
+  const k = String(apiKey || "").trim();
+  const h = { "Content-Type": "application/json" };
+  if (!k) return h;
+  // most Gemini keys look like AIza...
+  if (k.startsWith("AIza")) h["x-goog-api-key"] = k;
+  else h["Authorization"] = `Bearer ${k}`;
+  return h;
+}
+
+// ✅ Gemini reply using MASTER CHAT PROMPT
+async function callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint }) {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) throw new Error("Missing GEMINI_API_KEY");
+
+  const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
+  const replyTokens = pickReplyTokens(userText);
+
+  if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
+
+  const system = LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile);
+
+  const payload = {
+    userText: String(userText || ""),
+    length_hint: lengthHintForReply(userText),
+    lxt_brief: lxt1
+      ? {
+          verdict: lxt1?.verdict || null,
+          one_liner: lxt1?.one_liner || null,
+          top_actions: Array.isArray(lxt1?.actions) ? lxt1.actions.slice(0, 3) : [],
+          top_watchouts: Array.isArray(lxt1?.watchouts) ? lxt1.watchouts.slice(0, 3) : [],
+        }
+      : null,
+    live_context: liveContext || {},
+    last_reply_hint: lastReplyHint || "",
+  };
+
+  const { controller, cancel } = withTimeout(Number(process.env.GEMINI_TIMEOUT_MS || 20000));
+  try {
+    // OpenAI-compatible gateway (as you had it)
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: geminiHeaders(key),
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: JSON.stringify(payload) },
+        ],
+        max_tokens: replyTokens,
+        temperature: 0.62,
+      }),
+    });
+
+    if (!r.ok) throw new Error(await r.text());
+    const j = await r.json();
+    return (j?.choices?.[0]?.message?.content || "").trim() || "Got you. What do you want to do next?";
+  } catch (e) {
+    if (String(e?.name || "").toLowerCase().includes("abort")) return "One sec — try that again.";
+    throw e;
+  } finally {
+    cancel();
+  }
+}
+
+// ✅ OpenAI reply using MASTER CHAT PROMPT (+ optional vision images)
+async function callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
+
+  const model = process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
+  if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
+
+  const system = LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile);
+
+  const imgs = normalizeImages(images);
+  const hasImages = Array.isArray(imgs) && imgs.length > 0;
+
+  // ✅ If images exist: DO NOT send JSON. Send natural text like ChatGPT.
+  const textForModel = (() => {
+    const t = String(userText || "").trim();
+    if (hasImages) {
+      if (!t) return "What is this? Describe what you see in the image clearly and naturally.";
+      return t; // e.g. "What is this"
+    }
+
+    // no images: keep your structured payload
+    return JSON.stringify({
+      userText: t,
+      length_hint: lengthHintForReply(t),
+      lxt_brief: lxt1
+        ? {
+            verdict: lxt1?.verdict || null,
+            one_liner: lxt1?.one_liner || null,
+            top_actions: Array.isArray(lxt1?.actions) ? lxt1.actions.slice(0, 3) : [],
+            top_watchouts: Array.isArray(lxt1?.watchouts) ? lxt1.watchouts.slice(0, 3) : [],
+          }
+        : null,
+      live_context: liveContext || {},
+      last_reply_hint: lastReplyHint || "",
+    });
+  })();
+
+  const userContent = [{ type: "input_text", text: textForModel }];
+
+  for (const url of imgs.slice(0, 4)) {
+    userContent.push({ type: "input_image", image_url: url });
+  }
+
+  const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      input: [
+        { role: "system", content: system },
+        { role: "user", content: userContent },
+      ],
+      max_output_tokens: 1200,
+      temperature: 0.7,
+    }),
+  });
+
+  if (!resp.ok) throw new Error(await resp.text());
+
+  const data = await resp.json();
+  const outText = parseOpenAIResponsesText(data);
+
+  return outText.trim() || "Got you — what do you want to do next?";
+}
+
+async function getHumanReply({ provider, userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
+  const hasImages = Array.isArray(images) && images.length > 0;
+
+  // ✅ If the user sent images, always use OpenAI vision
+  if (hasImages) {
+    const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return { reply, replyProvider: "openai_vision", tried: ["openai_vision"] };
+  }
+
+  if (provider === "openai") {
+    const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return { reply, replyProvider: "openai", tried: ["openai"] };
+  }
+
+  if (provider === "gemini") {
+    const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return { reply, replyProvider: "gemini", tried: ["gemini"] };
+  }
+
+  // trinity (text-only)
+  try {
+    const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return { reply, replyProvider: "gemini", tried: ["gemini"] };
+  } catch (e) {
+    const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return {
+      reply,
+      replyProvider: "openai_fallback",
+      tried: ["gemini", "openai"],
+      _reply_error: String(e?.message || e),
+    };
+  }
+}
 
   /* ===================== TRINITY ORCHESTRATION ===================== */
 
@@ -1149,30 +1195,39 @@ Rules:
   }
 
   async function getHumanReply({ provider, userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
-    if (provider === "openai") {
-      const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
-      return { reply, replyProvider: "openai", tried: ["openai"] };
-    }
+  const hasImages = Array.isArray(images) && images.length > 0;
 
-    if (provider === "gemini") {
-      const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
-      return { reply, replyProvider: "gemini", tried: ["gemini"] };
-    }
-
-    // trinity
-    try {
-      const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
-      return { reply, replyProvider: "gemini", tried: ["gemini"] };
-    } catch (e) {
-      const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
-      return {
-        reply,
-        replyProvider: "openai_fallback",
-        tried: ["gemini", "openai"],
-        _reply_error: String(e?.message || e),
-      };
-    }
+  // ✅ If the user sent images, always use OpenAI vision (Gemini path here has no images attached)
+  if (hasImages) {
+    const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return { reply, replyProvider: "openai_vision", tried: ["openai_vision"] };
   }
+
+  if (provider === "openai") {
+    const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return { reply, replyProvider: "openai", tried: ["openai"] };
+  }
+
+  if (provider === "gemini") {
+    const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return { reply, replyProvider: "gemini", tried: ["gemini"] };
+  }
+
+  // trinity (text-only)
+  try {
+    const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return { reply, replyProvider: "gemini", tried: ["gemini"] };
+  } catch (e) {
+    const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+    return {
+      reply,
+      replyProvider: "openai_fallback",
+      tried: ["gemini", "openai"],
+      _reply_error: String(e?.message || e),
+    };
+  }
+}
+  
 
   /* ===================== FAST PATHS (EMAIL / NEWS / WEATHER / STOCKS / CHAT) ===================== */
 
