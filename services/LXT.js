@@ -147,7 +147,6 @@ function createLXT({
 
   /* ===================== LXT MASTER CHAT PROMPT ===================== */
 
-  // ✅ Paste-once master chat prompt used everywhere (OpenAI + Gemini)
   function LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile) {
     return `
 You are LXT, the intelligence layer inside LORAVO.
@@ -279,7 +278,6 @@ Return ONLY the reply text.
   function sanitizeToSchema(o) {
     const conf = typeof o?.confidence === "number" ? o.confidence : 0.62;
 
-    // lightly sanitize nested arrays so you don’t leak weird shapes into clients
     const signals = Array.isArray(o?.signals)
       ? o.signals
           .slice(0, 10)
@@ -316,7 +314,6 @@ Return ONLY the reply text.
     };
   }
 
-  // more robust than "first { ... last }" (handles extra text before/after)
   function extractFirstJSONObject(text) {
     if (!text || typeof text !== "string") return null;
     const s = text;
@@ -356,11 +353,6 @@ Return ONLY the reply text.
   }
 
   // ✅ Normalize incoming images to OpenAI-friendly data URLs
-  // Supports:
-  // - already "data:image/..." (pass through)
-  // - raw base64 (wrap as jpeg)
-  // - http(s) URL (pass through)
-  // - file path (ignored here; index.js should convert to base64 or presigned url)
   function normalizeImages(images) {
     if (!Array.isArray(images) || !images.length) return [];
     const out = [];
@@ -378,7 +370,6 @@ Return ONLY the reply text.
         continue;
       }
 
-      // looks like base64 (rough check)
       const looksBase64 = /^[A-Za-z0-9+/=\s]+$/.test(s) && s.length > 200;
       if (looksBase64) out.push(`data:image/jpeg;base64,${s.replace(/\s/g, "")}`);
     }
@@ -621,8 +612,9 @@ Return ONLY the reply text.
   }
 
   async function saveUserMemory(userId, text) {
-    if (!userId || !text) return;
-    await dbQuery(`INSERT INTO user_memory (user_id, content) VALUES ($1,$2)`, [userId, text]);
+    const t = String(text || "").trim();
+    if (!userId || !t) return;
+    await dbQuery(`INSERT INTO user_memory (user_id, content) VALUES ($1,$2)`, [userId, t]);
   }
 
   async function loadUserState(userId) {
@@ -709,7 +701,6 @@ Return ONLY the reply text.
     return ["gmail"];
   }
 
-  // ✅ Recognizes: list latest, show inbox, newest emails, etc.
   function parseEmailCommand(userText) {
     const t = String(userText || "").trim();
     const lower = t.toLowerCase();
@@ -825,14 +816,12 @@ Return ONLY the reply text.
     };
     live.location = loc;
 
-    // Weather (prefer services.weather)
     if (services?.weather?.getLive) {
       try {
         live.weather = await services.weather.getLive({ userId, text, lat: loc.lat, lon: loc.lon, state: userState });
       } catch {}
     }
 
-    // Fallback weather (OpenWeather)
     if (!live.weather) {
       let weatherRaw = null;
       let weatherGeo = null;
@@ -857,10 +846,8 @@ Return ONLY the reply text.
       if (weatherGeo?.country && !loc.country) live.location.country = weatherGeo.country;
     }
 
-    // News (prefer services.news)
     live.news = userId ? await getRecentNewsForUser(userId, 5) : [];
 
-    // Stocks (prefer services.stocks)
     const ticker = extractTicker(text);
     if (ticker && services?.stocks?.quote) {
       try {
@@ -1004,7 +991,6 @@ Rules:
     throw err;
   }
 
-  // Gemini auth helper: supports either Bearer or x-goog-api-key style
   function geminiHeaders(apiKey) {
     const k = String(apiKey || "").trim();
     const h = { "Content-Type": "application/json" };
@@ -1014,7 +1000,6 @@ Rules:
     return h;
   }
 
-  // ✅ Gemini reply using MASTER CHAT PROMPT
   async function callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint }) {
     const key = process.env.GEMINI_API_KEY;
     if (!key) throw new Error("Missing GEMINI_API_KEY");
@@ -1070,7 +1055,6 @@ Rules:
   }
 
   // ✅ OpenAI reply using MASTER CHAT PROMPT (+ optional vision images)
-  // KEY FIX: if images exist, DO NOT send your JSON payload as the user text.
   async function callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
@@ -1086,7 +1070,7 @@ Rules:
     const t = String(userText || "").trim();
 
     const textForModel = hasImages
-      ? t || "What is this? Describe what you see in the image clearly and naturally."
+      ? t || "Describe what you see in this image clearly and naturally."
       : JSON.stringify({
           userText: t,
           length_hint: lengthHintForReply(t),
@@ -1105,33 +1089,42 @@ Rules:
     const userContent = [{ type: "input_text", text: textForModel }];
     for (const url of imgs.slice(0, 4)) userContent.push({ type: "input_image", image_url: url });
 
-    const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        input: [
-          { role: "system", content: system },
-          { role: "user", content: userContent },
-        ],
-        max_output_tokens: 1200,
-        temperature: 0.7,
-      }),
-    });
+    const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS_REPLY || process.env.OPENAI_TIMEOUT_MS || 30000);
+    const { controller, cancel } = withTimeout(timeoutMs);
 
-    if (!resp.ok) throw new Error(await resp.text());
+    try {
+      const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
+        method: "POST",
+        signal: controller.signal,
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          input: [
+            { role: "system", content: system },
+            { role: "user", content: userContent },
+          ],
+          max_output_tokens: 1200,
+          temperature: 0.7,
+        }),
+      });
 
-    const data = await resp.json();
-    const outText = parseOpenAIResponsesText(data);
+      if (!resp.ok) throw new Error(await resp.text());
 
-    return outText.trim() || "Got you — what do you want to do next?";
+      const data = await resp.json();
+      const outText = parseOpenAIResponsesText(data);
+
+      return outText.trim() || "Got you — what do you want to do next?";
+    } catch (e) {
+      if (String(e?.name || "").toLowerCase().includes("abort")) return "One sec — try that again.";
+      throw e;
+    } finally {
+      cancel();
+    }
   }
 
-  // ✅ SINGLE getHumanReply (your file had this twice — removed the duplicate)
   async function getHumanReply({ provider, userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
     const hasImages = Array.isArray(images) && images.length > 0;
 
-    // ✅ If images exist, always use OpenAI vision
     if (hasImages) {
       const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
       return { reply, replyProvider: "openai_vision", tried: ["openai_vision"] };
@@ -1147,7 +1140,6 @@ Rules:
       return { reply, replyProvider: "gemini", tried: ["gemini"] };
     }
 
-    // trinity (text-only)
     try {
       const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
       return { reply, replyProvider: "gemini", tried: ["gemini"] };
@@ -1201,7 +1193,7 @@ Rules:
   }
 
   /* ===================== FAST PATHS (EMAIL / NEWS / WEATHER / STOCKS / CHAT) ===================== */
-  // (Everything below is the same as what you pasted — no functional changes except: duplicate getHumanReply removed.)
+  // Everything below remains your logic.
 
   async function handleEmailIntent({ userId, text, planTier }) {
     if (!userId) {
@@ -1293,7 +1285,6 @@ Rules:
       return `${title}\n\n${blocks.join("\n\n")}`.trim();
     }
 
-    /* ---------------- LIST / LATEST ---------------- */
     if (cmd.kind === "list") {
       const max = clamp(Number(cmd.max || 5), 1, 25);
 
@@ -1316,7 +1307,6 @@ Rules:
       return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
-    /* ---------------- IMPORTANT / UNREAD ---------------- */
     if (cmd.kind === "important") {
       if (allMode) {
         const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 }));
@@ -1345,7 +1335,6 @@ Rules:
       return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
-    /* ---------------- SUMMARIZE ---------------- */
     if (cmd.kind === "summarize") {
       if (allMode) {
         const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d", max: 8 }));
@@ -1397,7 +1386,6 @@ Rules:
       return { reply: `${summary}\n\n(Provider: ${used})`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
-    /* ---------------- SEARCH ---------------- */
     if (cmd.kind === "search") {
       const q = cmd.query || "";
 
@@ -1428,7 +1416,6 @@ Rules:
       return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
-    /* ---------------- SEND ---------------- */
     if (cmd.kind === "send") {
       if (!cmd.to || !cmd.body) {
         return {
@@ -1447,7 +1434,6 @@ Rules:
       };
     }
 
-    /* ---------------- REPLY ---------------- */
     if (cmd.kind === "reply_latest") {
       const { provider: used, res: info } = await tryProviders((p) =>
         emailSvc.replyLatest({ provider: p, userId, body: cmd.body || "" })
@@ -1578,19 +1564,31 @@ Rules:
     const provider = getProvider(req);
     let mode = getMode(req);
 
-    // ✅ allow image-only messages (ChatGPT-style)
     let { text, user_id, lat, lon, images } = req?.body || {};
+
+    // ✅ normalize images first (THIS FIXES IMAGE-ONLY)
+    images = normalizeImages(images);
     const hasImages = Array.isArray(images) && images.length > 0;
 
-    // normalize images (limit + data URL format)
-    images = normalizeImages(images);
+    const rawText = String(text || "");
+    const trimmedText = rawText.trim();
 
-    // If user sent only images, auto-create a prompt so we don't throw
-    if ((!text || String(text).trim().length === 0) && hasImages) {
-      text = "Describe this image.";
+    // ✅ If totally empty request, don’t throw — return clean greeting
+    if (!trimmedText && !hasImages) {
+      const base = { provider: "loravo_fastpath", mode: "instant", reply: "Hey — what’s on your mind?", lxt1: null, _errors: {} };
+      if (defaults?.include_provider_meta === false) return base;
+      return {
+        ...base,
+        providers: { decision: "fastpath", reply: "fastpath", triedDecision: ["fastpath"], triedReply: ["fastpath"] },
+      };
     }
 
-    if (!text) throw new Error("Missing 'text' in body");
+    // ✅ If user sent only images, auto-create a prompt so we don't throw
+    if (!trimmedText && hasImages) {
+      text = "Describe this image.";
+    } else {
+      text = trimmedText;
+    }
 
     const userId = String(user_id || "").trim() || null;
 
@@ -1603,7 +1601,7 @@ Rules:
 
     if (userId) await maybeUpdateVoiceProfile({ userId, userState: state, memory });
 
-    if (userId) {
+    if (userId && text) {
       const sig = inferBehaviorFromText(text);
       const oldBP = state?.behavior_profile || {};
       const nextBP = mergeBehavior(oldBP, sig);
@@ -1671,8 +1669,6 @@ Rules:
     }
 
     if (userId) await saveUserMemory(userId, text);
-
-    /* -------- FAST PATHS -------- */
 
     if (!forceDecision) {
       if (intent === "greeting") {
@@ -1802,8 +1798,6 @@ Rules:
       }
     }
 
-    /* -------- DECISION PATH (returns lxt1 + human reply) -------- */
-
     const decision = await getDecision({
       provider,
       text,
@@ -1881,7 +1875,7 @@ Rules:
     const planTier = normalizeTier(state?.plan_tier || "core");
 
     const gate = requireFeatureOrTease({ tier: planTier, feature: "proactive_alerts" });
-    if (!gate.ok) return []; // only Pro
+    if (!gate.ok) return [];
 
     const liveContext = await buildLiveContext({
       userId,

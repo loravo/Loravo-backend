@@ -288,27 +288,26 @@ function minutesFromHHMM(hhmm) {
   return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
 }
 
-/* ===================== IMAGE UPLOAD GUARDS (NEW) ===================== */
+/* ===================== IMAGE UPLOAD GUARDS (PROD) ===================== */
 /**
- * We accept base64 JPEG strings in req.body.images.
- * We MUST fail fast, or the request can hang / get killed by infra.
- *
- * Tune these if needed:
- * - max 4 images (matches your UI)
- * - max ~1.8MB binary each (base64 will be bigger)
- * - max total ~6MB binary
+ * Accept base64 JPEG strings in req.body.images.
+ * ALSO safely accept "data:image/...;base64,..." by stripping prefix.
  */
 const CHAT_MAX_IMAGES = 4;
 const CHAT_MAX_IMAGE_BYTES_EACH = 1.8 * 1024 * 1024;   // 1.8MB
 const CHAT_MAX_IMAGE_BYTES_TOTAL = 6.0 * 1024 * 1024;  // 6MB
 
+function stripDataUrlPrefix(b64) {
+  const s = String(b64 || "").trim();
+  // data:image/jpeg;base64,AAAA...
+  const m = s.match(/^data:.*?;base64,(.+)$/i);
+  return m ? m[1] : s;
+}
+
 function approxBytesFromBase64(b64) {
-  // base64 length -> bytes (approx)
-  const s = String(b64 || "");
+  const s = stripDataUrlPrefix(b64);
   if (!s) return 0;
-  // remove whitespace just in case
   const cleaned = s.replace(/\s+/g, "");
-  // 4 chars -> 3 bytes
   return Math.floor((cleaned.length * 3) / 4);
 }
 
@@ -330,22 +329,17 @@ function validateChatImages(req, res) {
   }
 
   let total = 0;
-  for (let i = 0; i < imgs.length; i++) {
-    const b64 = imgs[i];
+
+  // ✅ normalize to raw base64 (strip data URL) in-place
+  req.body.images = imgs.map(stripDataUrlPrefix);
+
+  for (let i = 0; i < req.body.images.length; i++) {
+    const b64 = req.body.images[i];
 
     if (typeof b64 !== "string" || b64.trim().length < 20) {
       res.status(400).json({
         error: "bad_image",
         detail: `Image #${i + 1} is not a valid base64 string.`,
-      });
-      return false;
-    }
-
-    // reject data URI prefix if someone sends it
-    if (b64.startsWith("data:")) {
-      res.status(400).json({
-        error: "bad_image",
-        detail: `Image #${i + 1} must be raw base64 (no data:image/... prefix).`,
       });
       return false;
     }
@@ -883,7 +877,6 @@ async function getAlertHistory(userId, limit = 50, offset = 0) {
 /* ===================== EMAIL SERVICE (MAXED + OUTLOOK FALLBACK) ===================== */
 async function outlookIsConnectedViaHttp(userId) {
   try {
-    // ✅ avoid hardcoding localhost in production
     const base = process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`;
     const r = await fetch(`${base}/outlook/status?user_id=${encodeURIComponent(userId)}`);
     const j = r.ok ? await r.json() : null;
@@ -896,10 +889,8 @@ async function outlookIsConnectedViaHttp(userId) {
 // Provider resolution: if provider not supplied, pick preferred if connected else first connected.
 async function resolveEmailProvider({ userId, provider }) {
   const wanted = String(provider || "").trim().toLowerCase();
-
   const providers = [];
 
-  // Gmail
   try {
     if (gmailPkg?.service?.getConnectedProviders) {
       const g = await gmailPkg.service.getConnectedProviders({ userId });
@@ -907,7 +898,6 @@ async function resolveEmailProvider({ userId, provider }) {
     }
   } catch {}
 
-  // Yahoo
   try {
     if (yahooPkg?.service?.getConnectedProviders) {
       const y = await yahooPkg.service.getConnectedProviders({ userId });
@@ -915,13 +905,11 @@ async function resolveEmailProvider({ userId, provider }) {
     }
   } catch {}
 
-  // Outlook
   try {
     if (outlookPkg?.service?.getConnectedProviders) {
       const o = await outlookPkg.service.getConnectedProviders({ userId });
       (o || []).forEach((p) => providers.push(String(p).toLowerCase()));
     } else {
-      // fallback: check status endpoint (works even if outlook exports router only)
       const ok = await outlookIsConnectedViaHttp(userId);
       if (ok) providers.push("outlook");
     }
@@ -1064,26 +1052,47 @@ app.post("/lxt1", async (req, res) => {
   }
 });
 
+/**
+ * ✅ PRODUCTION FIX:
+ * /chat now supports BOTH:
+ * - multipart/form-data images (multer)
+ * - JSON body images: { images: [base64...] }
+ *
+ * This fixes: "if I send with empty text (image-only), it never replies"
+ * because we no longer overwrite JSON images with [].
+ */
 app.post("/chat", upload.array("images", 4), async (req, res) => {
   try {
     const files = Array.isArray(req.files) ? req.files : [];
     req.body = req.body || {};
 
-    // ✅ multer sends fields as strings
+    // multer sends fields as strings (when multipart)
     if (req.body.lat != null) req.body.lat = Number(req.body.lat);
     if (req.body.lon != null) req.body.lon = Number(req.body.lon);
 
-    // ✅ IMPORTANT: images must be base64 string[] (matches validateChatImages + typical LXT expectations)
-    req.body.images = files.map((f) => f.buffer.toString("base64"));
+    // ✅ keep JSON images if present
+    const jsonImages = Array.isArray(req.body.images) ? req.body.images : null;
 
-    // ✅ optional metadata (won't break anything)
+    // ✅ use multipart files if present
+    const fileImages = files.length
+      ? files.map((f) => f.buffer.toString("base64"))
+      : null;
+
+    // ✅ choose best source
+    req.body.images = fileImages || jsonImages || [];
+
+    // ✅ normalize text field
+    if (typeof req.body.text !== "string") req.body.text = String(req.body.text || "");
+    req.body.text = req.body.text.trimEnd();
+
+    // optional metadata
     req.body.image_meta = files.map((f) => ({
       mime: f.mimetype,
       size: f.size,
       name: f.originalname,
     }));
 
-    // ✅ fail fast if too big / malformed
+    // fail fast if too big / malformed
     if (!validateChatImages(req, res)) return;
 
     const result = await lxt.runLXT({ req });
@@ -1369,9 +1378,8 @@ app.get("/prefs", async (req, res) => {
   }
 });
 
-/* ===================== BODY PARSER ERROR HANDLER (NEW) ===================== */
+/* ===================== BODY PARSER ERROR HANDLER ===================== */
 app.use((err, req, res, next) => {
-  // express.json limit hit -> "entity.too.large"
   if (err && (err.type === "entity.too.large" || err.status === 413)) {
     return res.status(413).json({
       error: "payload_too_large",
@@ -1394,7 +1402,6 @@ app.use((err, req, res, next) => {
     console.log(`✅ LORAVO running on ${PORT} (dbReady=${dbReady})`);
   });
 
-  // ✅ NEW: let /chat take longer (AI calls + image processing later)
-  server.headersTimeout = 120000; // 120s
-  server.requestTimeout = 120000; // 120s (Node 18+)
+  server.headersTimeout = 120000;
+  server.requestTimeout = 120000;
 })();
