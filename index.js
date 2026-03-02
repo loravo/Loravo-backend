@@ -8,6 +8,12 @@
  *    - Yahoo   ./Emails/yahoo   -> exports { router, service }
  *    - Outlook ./Emails/outlook -> exports { router, service } OR router only (fallback supported)
  *
+ * ✅ IMPORTANT UPGRADE (THIS FILE):
+ * - Weather + News are now wired into LXT services:
+ *   services.weather.getLive(...)
+ *   services.news.getLive(...)
+ *   services.news.summarizeForChat(...)  (optional)
+ *
  * Endpoints:
  *  - GET  /                -> basic root
  *  - GET  /health
@@ -44,9 +50,10 @@ const http2 = require("http2");
 // ✅ define PORT early (used by helper funcs too)
 const PORT = process.env.PORT || 3000;
 
-// ✅ MOVED: routes live in /services now
-const weatherRoute = require("./services/weather");
-const newsRoute = require("./services/news");
+// ✅ Weather + News packages (support router-only OR { router, service })
+const weatherMod = require("./services/weather");
+const newsMod = require("./services/news");
+
 const multer = require("multer");
 
 // ✅ Email provider packages (must export { router, service })
@@ -71,9 +78,28 @@ app.use(express.json({ limit: "60mb" }));
 app.use(express.urlencoded({ extended: true, limit: "60mb" }));
 app.use(cors({ origin: "*" }));
 
-// Mount route modules
-app.use("/", weatherRoute);
-app.use("/", newsRoute);
+/* ===================== ROUTE PACKAGE NORMALIZATION ===================== */
+function normalizePkg(mod) {
+  // supports:
+  // - export router directly (function)
+  // - export { router, service }
+  // - export { router } only
+  if (!mod) return { router: null, service: null };
+  if (typeof mod === "function") return { router: mod, service: null };
+  if (typeof mod === "object") {
+    if (mod.router) return { router: mod.router, service: mod.service || null };
+    // sometimes modules export express router as default
+    if (mod.default && typeof mod.default === "function") return { router: mod.default, service: mod.service || null };
+  }
+  return { router: null, service: null };
+}
+
+const weatherPkg = normalizePkg(weatherMod);
+const newsPkg = normalizePkg(newsMod);
+
+// Mount route modules (if routers exist)
+if (weatherPkg.router) app.use("/", weatherPkg.router);
+if (newsPkg.router) app.use("/", newsPkg.router);
 
 // Normalize Outlook module shape
 const outlookPkg =
@@ -453,7 +479,7 @@ function isNowInQuietHours(prefs) {
   return nowMin >= startMin && nowMin < endMin;
 }
 
-/* ===================== WEATHER (Stay-ahead only) ===================== */
+/* ===================== WEATHER (Stay-ahead only fallback) ===================== */
 async function getWeather(lat, lon) {
   if (typeof lat !== "number" || typeof lon !== "number" || !process.env.OPENWEATHER_API_KEY) return null;
 
@@ -877,7 +903,11 @@ async function getAlertHistory(userId, limit = 50, offset = 0) {
 /* ===================== EMAIL SERVICE (MAXED + OUTLOOK FALLBACK) ===================== */
 async function outlookIsConnectedViaHttp(userId) {
   try {
-    const base = process.env.PUBLIC_BASE_URL || `http://127.0.0.1:${PORT}`;
+    const base =
+      process.env.PUBLIC_BASE_URL ||
+      process.env.RENDER_EXTERNAL_URL ||
+      "https://loravo-backend.onrender.com";
+
     const r = await fetch(`${base}/outlook/status?user_id=${encodeURIComponent(userId)}`);
     const j = r.ok ? await r.json() : null;
     return Boolean(j?.connected);
@@ -932,6 +962,7 @@ async function resolveEmailProvider({ userId, provider }) {
   return { provider: null, connected: [] };
 }
 
+/* ===================== LXT SERVICES (EMAIL + WEATHER + NEWS) ===================== */
 const services = {
   email: {
     getConnectedProviders: async ({ userId }) => {
@@ -999,6 +1030,24 @@ const services = {
       throw new Error("Unsupported provider");
     },
   },
+
+  // ✅ WEATHER wired into LXT.js buildLiveContext()
+  weather: weatherPkg.service
+    ? weatherPkg.service
+    : {
+        // fallback: if your /services/weather doesn't export a service yet,
+        // LXT will still use its OpenWeather fallback (inside LXT.js)
+        getLive: async () => null,
+      },
+
+  // ✅ NEWS wired into LXT.js buildLiveContext()
+  news: newsPkg.service
+    ? newsPkg.service
+    : {
+        // fallback: if your /services/news doesn't export a service yet,
+        // LXT will fall back to DB events (inside LXT.js)
+        getLive: async () => ({ ok: true, articles: [] }),
+      },
 };
 
 /* ===================== LXT INSTANCE ===================== */

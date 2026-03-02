@@ -1,14 +1,15 @@
 // Emails/outlook.js
 // =====================================================
-// LORAVO — Outlook / Microsoft (single-file router)
+// LORAVO — Outlook / Microsoft (single-file router + LXT service)
 //
 // ✅ OAuth2 connect (auth-url + callback) via Microsoft Identity Platform
-// ✅ Uses Microsoft Graph for mail (list/read/send)
+// ✅ Uses Microsoft Graph for mail (list/read/send/reply)
 // ✅ Stores tokens in Postgres if DATABASE_URL exists (Render) else in-memory fallback
 // ✅ Status + Disconnect (GET + POST)
 // ✅ iOS auto-close: mode=app -> redirects to loravo://connected
-// ✅ Browser success page for desktop/manual testing
+// ✅ Browser success page (desktop/manual testing)
 // ✅ Friendly GET routes for quick testing
+// ✅ Exports BOTH router + service interface for LXT.js
 //
 // Mount in index.js:
 //   const outlookPkg = require("./Emails/outlook");
@@ -24,8 +25,7 @@
 //   OUTLOOK_STATE_SECRET
 //   OUTLOOK_SUCCESS_WEB_URL  (default https://loravo-backend.onrender.com)
 //
-// Notes:
-// - Uses delegated permissions (user sign-in). Your Azure API permissions should include:
+// Azure API permissions (Delegated):
 //   openid, profile, email, offline_access, User.Read, Mail.ReadWrite, Mail.Send
 // =====================================================
 
@@ -55,11 +55,21 @@ const SUCCESS_WEB_BASE =
   "https://loravo-backend.onrender.com";
 
 const AUTH_BASE = "https://login.microsoftonline.com";
-const TENANT = "common"; // "common" supports personal + work/school accounts
+const TENANT = "common"; // supports personal + work/school
 const AUTHORIZE_URL = `${AUTH_BASE}/${TENANT}/oauth2/v2.0/authorize`;
 const TOKEN_URL = `${AUTH_BASE}/${TENANT}/oauth2/v2.0/token`;
 
 const GRAPH_BASE = "https://graph.microsoft.com/v1.0";
+
+const OUTLOOK_SCOPES = [
+  "openid",
+  "profile",
+  "email",
+  "offline_access",
+  "User.Read",
+  "Mail.ReadWrite",
+  "Mail.Send",
+].join(" ");
 
 /* ===================== DB SETUP ===================== */
 
@@ -83,8 +93,6 @@ const pool = DB_ENABLED
   : null;
 
 let dbReady = false;
-
-// In-memory fallback (ONLY when DB is off)
 const memTokens = new Map(); // user_id -> { tokens, email, updated_at }
 
 /* ===================== DB INIT ===================== */
@@ -120,8 +128,7 @@ function requireEnv() {
       !CLIENT_SECRET ? "OUTLOOK_CLIENT_SECRET" : null,
       !REDIRECT_URI ? "OUTLOOK_REDIRECT_URI" : null,
     ].filter(Boolean);
-    const msg = `Missing env vars: ${missing.join(", ")} (set them in .env / Render)`;
-    const err = new Error(msg);
+    const err = new Error(`Missing env vars: ${missing.join(", ")} (set them in .env / Render)`);
     err.status = 400;
     throw err;
   }
@@ -170,6 +177,10 @@ async function dbQuery(sql, params) {
   return pool.query(sql, params);
 }
 
+function nowIso() {
+  return new Date().toISOString();
+}
+
 async function saveTokens(userId, tokens, email) {
   if (!userId || !tokens) return;
 
@@ -188,7 +199,7 @@ async function saveTokens(userId, tokens, email) {
     return;
   }
 
-  memTokens.set(String(userId), { tokens, email: email || null, updated_at: new Date().toISOString() });
+  memTokens.set(String(userId), { tokens, email: email || null, updated_at: nowIso() });
 }
 
 async function loadTokens(userId) {
@@ -209,22 +220,16 @@ async function loadTokens(userId) {
 
 async function clearTokens(userId) {
   if (!userId) return;
-  if (dbReady) {
-    await dbQuery(`DELETE FROM outlook_tokens WHERE user_id=$1`, [String(userId)]);
-  } else {
-    memTokens.delete(String(userId));
-  }
-}
-
-function nowIso() {
-  return new Date().toISOString();
+  if (dbReady) await dbQuery(`DELETE FROM outlook_tokens WHERE user_id=$1`, [String(userId)]);
+  else memTokens.delete(String(userId));
 }
 
 /**
- * If access token expired and we have a refresh_token, refresh it.
- * Returns tokens record (possibly updated) with a valid access token.
+ * Ensures we have a valid access token (refresh if needed).
  */
 async function ensureFreshAccessToken(userId) {
+  requireEnv();
+
   const record = await loadTokens(userId);
   if (!record?.tokens) {
     const err = new Error("Outlook not connected for this user_id. Call /outlook/auth first.");
@@ -236,9 +241,10 @@ async function ensureFreshAccessToken(userId) {
   const accessToken = tokens.access_token;
   const refreshToken = tokens.refresh_token;
 
-  const expiresAt = tokens.expires_at ? Number(tokens.expires_at) : null;
-  const expiresOn = tokens.expires_on ? Number(tokens.expires_on) : null;
-  const expMs = expiresAt ? expiresAt : expiresOn ? expiresOn * 1000 : null;
+  const expMs =
+    (tokens.expires_at ? Number(tokens.expires_at) : null) ||
+    (tokens.expires_on ? Number(tokens.expires_on) * 1000 : null) ||
+    null;
 
   const needsRefresh = !accessToken || (expMs && Date.now() > expMs - 60_000);
 
@@ -256,19 +262,7 @@ async function ensureFreshAccessToken(userId) {
   body.set("grant_type", "refresh_token");
   body.set("refresh_token", refreshToken);
   body.set("redirect_uri", REDIRECT_URI);
-
-  body.set(
-    "scope",
-    [
-      "openid",
-      "profile",
-      "email",
-      "offline_access",
-      "User.Read",
-      "Mail.ReadWrite",
-      "Mail.Send",
-    ].join(" ")
-  );
+  body.set("scope", OUTLOOK_SCOPES);
 
   const r = await fetch(TOKEN_URL, {
     method: "POST",
@@ -280,25 +274,25 @@ async function ensureFreshAccessToken(userId) {
   if (!r.ok) {
     const err = new Error(`Token refresh failed: ${json?.error_description || json?.error || r.status}`);
     err.status = 401;
+    err._graph = json;
     throw err;
   }
 
   const refreshed = { ...tokens, ...json };
 
-  if (typeof json.expires_in === "number" || /^\d+$/.test(String(json.expires_in || ""))) {
+  if (json?.expires_in != null && (typeof json.expires_in === "number" || /^\d+$/.test(String(json.expires_in)))) {
     const sec = Number(json.expires_in);
     refreshed.expires_at = Date.now() + sec * 1000;
   }
 
+  // ✅ Microsoft sometimes omits refresh_token on refresh. Preserve the old one.
   if (!refreshed.refresh_token && refreshToken) refreshed.refresh_token = refreshToken;
 
   await saveTokens(userId, refreshed, record.email || null);
-
   return { ...record, tokens: refreshed, updated_at: nowIso() };
 }
 
 async function graphRequest(userId, method, path, { query, body, headers } = {}) {
-  requireEnv();
   const rec = await ensureFreshAccessToken(userId);
   const accessToken = rec.tokens?.access_token;
 
@@ -314,7 +308,7 @@ async function graphRequest(userId, method, path, { query, body, headers } = {})
     method: method || "GET",
     headers: {
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/json",
+      ...(body ? { "Content-Type": "application/json" } : {}),
       ...(headers || {}),
     },
     body: body ? JSON.stringify(body) : undefined,
@@ -350,6 +344,118 @@ function pickSender(item) {
   };
 }
 
+// Simple HTML → text fallback for LXT (not perfect but good)
+function stripHtml(html) {
+  if (!html) return "";
+  const s = String(html);
+  return s
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n\s+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+/* ===================== CORE OPS (shared) ===================== */
+
+async function opList({ userId, top = 10, folder = "inbox", search = null }) {
+  const take = Math.min(Number(top || 10), 25);
+  const folderId = String(folder || "inbox").toLowerCase();
+
+  const path = `/me/mailFolders/${encodeURIComponent(folderId)}/messages`;
+  const query = {
+    $top: take,
+    $orderby: "receivedDateTime desc",
+    $select: "id,subject,bodyPreview,from,receivedDateTime,isRead,conversationId,internetMessageId",
+  };
+
+  const headers = {};
+  if (search) {
+    query.$search = `"${String(search).replace(/"/g, '\\"')}"`;
+    headers.ConsistencyLevel = "eventual";
+  }
+
+  const data = await graphRequest(userId, "GET", path, { query, headers });
+
+  return (data?.value || []).map((m) => {
+    const who = pickSender(m);
+    return {
+      id: m.id,
+      threadId: m.conversationId || null,
+      messageId: m.internetMessageId || null,
+      subject: m.subject || "",
+      from: who.from || who.sender || null,
+      date: m.receivedDateTime || null,
+      isRead: Boolean(m.isRead),
+      snippet: m.bodyPreview || "",
+    };
+  });
+}
+
+async function opRead({ userId, id }) {
+  const msg = await graphRequest(userId, "GET", `/me/messages/${encodeURIComponent(id)}`, {
+    query: {
+      $select:
+        "id,subject,body,bodyPreview,from,toRecipients,ccRecipients,receivedDateTime,conversationId,internetMessageId,inReplyTo",
+    },
+  });
+
+  const who = pickSender(msg);
+
+  const to = (msg?.toRecipients || [])
+    .map((r) => r?.emailAddress?.address || null)
+    .filter(Boolean);
+
+  const contentType = String(msg?.body?.contentType || "").toLowerCase();
+  const content = msg?.body?.content || "";
+
+  const bodyText = contentType === "text" ? content : stripHtml(content);
+  const bodyHtml = contentType === "html" ? content : null;
+
+  return {
+    id: msg?.id || id,
+    threadId: msg?.conversationId || null,
+    messageId: msg?.internetMessageId || null,
+    from: who.from || who.sender || null,
+    to,
+    subject: msg?.subject || "",
+    date: msg?.receivedDateTime || null,
+    snippet: msg?.bodyPreview || "",
+    body_text: bodyText || "",
+    body_html: bodyHtml,
+  };
+}
+
+async function opSend({ userId, to, subject, body, saveToSentItems = true }) {
+  const payload = {
+    message: {
+      subject: subject || "",
+      body: { contentType: "Text", content: body || "" },
+      toRecipients: [{ emailAddress: { address: to } }],
+    },
+    saveToSentItems: Boolean(saveToSentItems),
+  };
+
+  await graphRequest(userId, "POST", "/me/sendMail", { body: payload });
+  return { id: null, threadId: null };
+}
+
+async function opReply({ userId, id, body }) {
+  // Graph: POST /me/messages/{id}/reply
+  // We can pass a comment (simple) OR createReply + send.
+  const payload = { comment: body || "" };
+  await graphRequest(userId, "POST", `/me/messages/${encodeURIComponent(id)}/reply`, { body: payload });
+  return { id: null, threadId: null };
+}
+
 /* ===================== ROUTES ===================== */
 
 router.get("/", (_, res) => {
@@ -367,6 +473,7 @@ router.get("/", (_, res) => {
       "/list",
       "/read",
       "/send",
+      "/reply",
     ],
   });
 });
@@ -405,7 +512,7 @@ router.get("/auth-url", async (req, res) => {
     requireEnv();
 
     const userId = String(req.query.user_id || "").trim();
-    const mode = String(req.query.mode || "").trim(); // "app"
+    const mode = String(req.query.mode || "").trim();
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
 
     const state = signState({
@@ -415,22 +522,12 @@ router.get("/auth-url", async (req, res) => {
       exp: Date.now() + 10 * 60 * 1000,
     });
 
-    const scope = [
-      "openid",
-      "profile",
-      "email",
-      "offline_access",
-      "User.Read",
-      "Mail.ReadWrite",
-      "Mail.Send",
-    ].join(" ");
-
     const u = new URL(AUTHORIZE_URL);
     u.searchParams.set("client_id", CLIENT_ID);
     u.searchParams.set("response_type", "code");
     u.searchParams.set("redirect_uri", REDIRECT_URI);
     u.searchParams.set("response_mode", "query");
-    u.searchParams.set("scope", scope);
+    u.searchParams.set("scope", OUTLOOK_SCOPES);
     u.searchParams.set("state", state);
     u.searchParams.set("prompt", "consent");
 
@@ -454,11 +551,9 @@ router.get("/connected", (req, res) => {
       <body style="font-family: -apple-system, system-ui; padding: 28px; line-height: 1.4;">
         <h1 style="margin:0 0 12px 0;">✅ Outlook Connected</h1>
         <p style="margin:0 0 18px 0;">${email ? `Connected as <b>${email}</b>.` : "Connection saved."}</p>
-
         <p style="margin:0 0 10px 0; opacity:.75;">
           If you’re on iPhone, go back to Loravo. If Loravo didn’t open automatically, tap below.
         </p>
-
         <a href="loravo://connected?provider=outlook&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(email)}"
            style="display:inline-block; padding:12px 16px; border-radius:12px; background:#111; color:#fff; text-decoration:none;">
           Open Loravo
@@ -489,18 +584,7 @@ router.get("/oauth2callback", async (req, res) => {
     body.set("grant_type", "authorization_code");
     body.set("code", code);
     body.set("redirect_uri", REDIRECT_URI);
-    body.set(
-      "scope",
-      [
-        "openid",
-        "profile",
-        "email",
-        "offline_access",
-        "User.Read",
-        "Mail.ReadWrite",
-        "Mail.Send",
-      ].join(" ")
-    );
+    body.set("scope", OUTLOOK_SCOPES);
 
     const r = await fetch(TOKEN_URL, {
       method: "POST",
@@ -514,15 +598,23 @@ router.get("/oauth2callback", async (req, res) => {
     }
 
     const tokens = { ...json };
-
-    if (typeof tokens.expires_in === "number" || /^\d+$/.test(String(tokens.expires_in || ""))) {
+    if (tokens?.expires_in != null && (typeof tokens.expires_in === "number" || /^\d+$/.test(String(tokens.expires_in)))) {
       tokens.expires_at = Date.now() + Number(tokens.expires_in) * 1000;
     }
 
     let email = null;
     try {
-      const url = `${GRAPH_BASE}/me`;
-      const rr = await fetch(url, { headers: { Authorization: `Bearer ${tokens.access_token}` } });
+      const me = await graphRequest(userId, "GET", `/me`, {
+        // temporarily use this new token directly:
+        // easiest: call graph with fetch here
+      });
+      // NOTE: graphRequest uses ensureFreshAccessToken which uses DB tokens,
+      // so we do a direct fetch instead:
+    } catch {}
+
+    // ✅ Direct fetch to /me using new access token:
+    try {
+      const rr = await fetch(`${GRAPH_BASE}/me`, { headers: { Authorization: `Bearer ${tokens.access_token}` } });
       const t = await rr.text();
       const me = t ? JSON.parse(t) : null;
       email = me?.mail || me?.userPrincipalName || null;
@@ -550,7 +642,6 @@ router.get("/oauth2callback", async (req, res) => {
 
 /* ===================== DISCONNECT ===================== */
 
-// POST /outlook/disconnect  { user_id }
 router.post("/disconnect", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -562,7 +653,6 @@ router.post("/disconnect", async (req, res) => {
   }
 });
 
-// GET /outlook/disconnect?user_id=...
 router.get("/disconnect", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -576,7 +666,7 @@ router.get("/disconnect", async (req, res) => {
 
 /* ===================== MAIL API (POST) ===================== */
 
-// POST /outlook/list  body: { user_id, top?, folder?, search? }
+// POST /outlook/list  { user_id, top?, folder?, search? }
 router.post("/list", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -586,41 +676,14 @@ router.post("/list", async (req, res) => {
     const folder = String(req.body?.folder || "inbox").toLowerCase();
     const search = req.body?.search ? String(req.body.search) : null;
 
-    const path = `/me/mailFolders/${encodeURIComponent(folder)}/messages`;
-    const query = {
-      $top: top,
-      $orderby: "receivedDateTime desc",
-      $select: "id,subject,bodyPreview,from,receivedDateTime,isRead,conversationId,internetMessageId",
-    };
-
-    const headers = {};
-    if (search) {
-      query.$search = `"${search.replace(/"/g, '\\"')}"`;
-      headers.ConsistencyLevel = "eventual";
-    }
-
-    const data = await graphRequest(userId, "GET", path, { query, headers });
-
-    const items = (data?.value || []).map((m) => {
-      const who = pickSender(m);
-      return {
-        id: m.id,
-        conversationId: m.conversationId || null,
-        subject: m.subject || "",
-        from: who.from || who.sender || null,
-        date: m.receivedDateTime || null,
-        isRead: Boolean(m.isRead),
-        snippet: m.bodyPreview || "",
-      };
-    });
-
-    res.json({ ok: true, folder, top, emails: items });
+    const emails = await opList({ userId, top, folder, search });
+    res.json({ ok: true, folder, top, emails });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e), detail: e?._graph || null });
   }
 });
 
-// POST /outlook/read  body: { user_id, id }
+// POST /outlook/read  { user_id, id }
 router.post("/read", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -628,39 +691,14 @@ router.post("/read", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
 
-    const msg = await graphRequest(userId, "GET", `/me/messages/${encodeURIComponent(id)}`, {
-      query: {
-        $select:
-          "id,subject,body,bodyPreview,from,toRecipients,ccRecipients,receivedDateTime,conversationId,internetMessageId",
-      },
-    });
-
-    const who = pickSender(msg);
-    const to = (msg?.toRecipients || [])
-      .map((r) => r?.emailAddress?.address || null)
-      .filter(Boolean);
-
-    res.json({
-      ok: true,
-      email: {
-        id: msg?.id || id,
-        conversationId: msg?.conversationId || null,
-        internetMessageId: msg?.internetMessageId || null,
-        from: who.from || who.sender || null,
-        to,
-        subject: msg?.subject || "",
-        date: msg?.receivedDateTime || null,
-        snippet: msg?.bodyPreview || "",
-        body_html: msg?.body?.contentType === "html" ? (msg?.body?.content || "") : null,
-        body_text: msg?.body?.contentType === "text" ? (msg?.body?.content || "") : null,
-      },
-    });
+    const email = await opRead({ userId, id });
+    res.json({ ok: true, email });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e), detail: e?._graph || null });
   }
 });
 
-// POST /outlook/send  body: { user_id, to, subject, body, saveToSentItems? }
+// POST /outlook/send  { user_id, to, subject?, body, saveToSentItems? }
 router.post("/send", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -673,18 +711,26 @@ router.post("/send", async (req, res) => {
     if (!to) return res.status(400).json({ error: "Missing to" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    const payload = {
-      message: {
-        subject: subject || "",
-        body: { contentType: "Text", content: body },
-        toRecipients: [{ emailAddress: { address: to } }],
-      },
-      saveToSentItems,
-    };
+    const out = await opSend({ userId, to, subject, body, saveToSentItems });
+    res.json({ ok: true, ...out, sent: true });
+  } catch (e) {
+    res.status(e?.status || 500).json({ error: String(e?.message || e), detail: e?._graph || null });
+  }
+});
 
-    await graphRequest(userId, "POST", "/me/sendMail", { body: payload });
+// POST /outlook/reply  { user_id, id, body }
+router.post("/reply", async (req, res) => {
+  try {
+    const userId = String(req.body?.user_id || "").trim();
+    const id = String(req.body?.id || "").trim();
+    const body = String(req.body?.body || "").trim();
 
-    res.json({ ok: true, sent: true });
+    if (!userId) return res.status(400).json({ error: "Missing user_id" });
+    if (!id) return res.status(400).json({ error: "Missing id" });
+    if (!body) return res.status(400).json({ error: "Missing body" });
+
+    const out = await opReply({ userId, id, body });
+    res.json({ ok: true, ...out });
   } catch (e) {
     res.status(e?.status || 500).json({ error: String(e?.message || e), detail: e?._graph || null });
   }
@@ -702,10 +748,10 @@ router.get("/list", async (req, res) => {
     const folder = req.query.folder ? String(req.query.folder) : "inbox";
     const search = req.query.search ? String(req.query.search) : null;
 
-    req.body = { user_id: userId, top, folder, search };
-    return router.handle(Object.assign(req, { method: "POST", url: "/list" }), res);
+    const emails = await opList({ userId, top, folder, search });
+    res.json({ ok: true, folder, top: Math.min(Number(top || 10), 25), emails });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(e?.status || 500).json({ error: String(e?.message || e), detail: e?._graph || null });
   }
 });
 
@@ -717,10 +763,10 @@ router.get("/read", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
 
-    req.body = { user_id: userId, id };
-    return router.handle(Object.assign(req, { method: "POST", url: "/read" }), res);
+    const email = await opRead({ userId, id });
+    res.json({ ok: true, email });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(e?.status || 500).json({ error: String(e?.message || e), detail: e?._graph || null });
   }
 });
 
@@ -736,15 +782,32 @@ router.get("/send", async (req, res) => {
     if (!to) return res.status(400).json({ error: "Missing to" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    req.body = { user_id: userId, to, subject, body };
-    return router.handle(Object.assign(req, { method: "POST", url: "/send" }), res);
+    const out = await opSend({ userId, to, subject, body, saveToSentItems: true });
+    res.json({ ok: true, ...out, sent: true });
   } catch (e) {
-    res.status(500).json({ error: String(e?.message || e) });
+    res.status(e?.status || 500).json({ error: String(e?.message || e), detail: e?._graph || null });
   }
 });
 
-// ===================== SERVICE API (for LXT / index.js) =====================
-// ✅ Exposes a stable interface for your LXT services.email
+// GET /outlook/reply?user_id=...&id=...&body=...
+router.get("/reply", async (req, res) => {
+  try {
+    const userId = String(req.query.user_id || "").trim();
+    const id = String(req.query.id || "").trim();
+    const body = String(req.query.body || "").trim();
+
+    if (!userId) return res.status(400).json({ error: "Missing user_id" });
+    if (!id) return res.status(400).json({ error: "Missing id" });
+    if (!body) return res.status(400).json({ error: "Missing body" });
+
+    const out = await opReply({ userId, id, body });
+    res.json({ ok: true, ...out });
+  } catch (e) {
+    res.status(e?.status || 500).json({ error: String(e?.message || e), detail: e?._graph || null });
+  }
+});
+
+/* ===================== SERVICE API (for LXT / index.js) ===================== */
 
 async function svcGetConnectedProviders({ userId }) {
   const rec = await loadTokens(userId);
@@ -754,79 +817,55 @@ async function svcGetConnectedProviders({ userId }) {
 async function svcList({ userId, q = null, max = 10 }) {
   const top = Math.min(Number(max || 10), 25);
 
-  // Outlook Graph $search uses AQS. If q is a Gmail-style query, you might pass a simpler keyword.
+  // q -> Graph search keyword (AQS). If q is Gmail-style, pass simpler keywords.
   const search = q ? String(q) : null;
 
-  const data = await graphRequest(userId, "GET", `/me/mailFolders/inbox/messages`, {
-    query: {
-      $top: top,
-      $orderby: "receivedDateTime desc",
-      $select: "id,subject,bodyPreview,from,receivedDateTime,isRead,conversationId,internetMessageId",
-      ...(search ? { $search: `"${search.replace(/"/g, '\\"')}"` } : {}),
-    },
-    headers: search ? { ConsistencyLevel: "eventual" } : {},
-  });
+  const emails = await opList({ userId, top, folder: "inbox", search });
 
-  return (data?.value || []).map((m) => {
-    const who = pickSender(m);
-    return {
-      id: m.id,
-      threadId: m.conversationId || null,
-      messageId: m.internetMessageId || null,
-      subject: m.subject || "",
-      from: who.from || who.sender || null,
-      date: m.receivedDateTime || null,
-      snippet: m.bodyPreview || "",
-    };
-  });
+  // ✅ normalize to Gmail/Yahoo style
+  return emails.map((m) => ({
+    id: m.id,
+    threadId: m.threadId,
+    from: m.from,
+    subject: m.subject,
+    date: m.date,
+    snippet: m.snippet || "",
+  }));
 }
 
 async function svcGetBody({ userId, messageId }) {
-  const msg = await graphRequest(userId, "GET", `/me/messages/${encodeURIComponent(messageId)}`, {
-    query: {
-      $select: "id,subject,body,bodyPreview,from,receivedDateTime,conversationId,internetMessageId",
-    },
-  });
-
-  const who = pickSender(msg);
-
+  const r = await opRead({ userId, id: String(messageId) });
   return {
-    id: msg?.id || messageId,
-    threadId: msg?.conversationId || null,
-    messageId: msg?.internetMessageId || null,
-    from: who.from || who.sender || null,
-    subject: msg?.subject || "",
-    date: msg?.receivedDateTime || null,
-    snippet: msg?.bodyPreview || "",
-    // Graph often returns HTML. Keep as-is (you can strip later in UI).
-    body: msg?.body?.content || "",
+    id: r.id,
+    threadId: r.threadId,
+    from: r.from,
+    to: r.to,
+    subject: r.subject,
+    date: r.date,
+    messageId: r.messageId,
+    references: null,
+    inReplyTo: null,
+    snippet: r.snippet || "",
+    body: r.body_text || r.body_html || "",
   };
 }
 
 async function svcSend({ userId, to, subject, body, threadId = null }) {
   // threadId not used yet for Outlook send
-  const payload = {
-    message: {
-      subject: subject || "",
-      body: { contentType: "Text", content: body || "" },
-      toRecipients: [{ emailAddress: { address: to } }],
-    },
-    saveToSentItems: true,
-  };
-
-  await graphRequest(userId, "POST", "/me/sendMail", { body: payload });
-  return { id: null, threadId: threadId || null };
+  return await opSend({ userId, to, subject, body, saveToSentItems: true });
 }
 
-// Proper Outlook replies use Graph reply endpoints; not wired yet.
-async function svcReplyById() {
-  throw new Error("Outlook replyById not implemented yet (Graph reply endpoint not wired).");
-}
-async function svcReplyLatest() {
-  throw new Error("Outlook replyLatest not implemented yet (Graph reply endpoint not wired).");
+async function svcReplyById({ userId, messageId, body }) {
+  return await opReply({ userId, id: String(messageId), body });
 }
 
-// ✅ Export BOTH router + service (matches your Gmail pattern)
+async function svcReplyLatest({ userId, body }) {
+  const list = await svcList({ userId, max: 1 });
+  const latest = list?.[0];
+  if (!latest?.id) throw new Error("No Outlook emails found to reply to.");
+  return await svcReplyById({ userId, messageId: latest.id, body });
+}
+
 module.exports = {
   router,
   service: {

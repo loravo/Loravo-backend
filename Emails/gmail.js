@@ -11,10 +11,6 @@
 // ✅ Friendly GET routes for quick testing
 // ✅ Exports BOTH router + service interface for LXT.js
 //
-// Mount in index.js:
-//   const gmailPkg = require("./Emails/gmail");
-//   app.use("/gmail", gmailPkg.router);
-//
 // Required env:
 //   GOOGLE_CLIENT_ID
 //   GOOGLE_CLIENT_SECRET
@@ -49,7 +45,9 @@ const DB_ENABLED = Boolean(DATABASE_URL);
 
 const SUCCESS_WEB_BASE =
   String(process.env.GMAIL_SUCCESS_WEB_URL || "").trim() ||
-  "https://loravo-backend.onrender.com"; // canonical backend URL
+  "https://loravo-backend.onrender.com";
+
+/* ===================== DB ===================== */
 
 function isLocalDbUrl(url) {
   if (!url) return true;
@@ -75,8 +73,6 @@ let dbReady = false;
 // In-memory fallback (ONLY when DB is off)
 const memTokens = new Map(); // user_id -> { tokens, email, updated_at }
 
-/* ===================== DB INIT ===================== */
-
 async function initDbIfPossible() {
   if (!pool) {
     dbReady = false;
@@ -99,6 +95,11 @@ async function initDbIfPossible() {
 }
 initDbIfPossible().catch(() => {});
 
+async function dbQuery(sql, params) {
+  if (!pool || !dbReady) return { rows: [] };
+  return pool.query(sql, params);
+}
+
 /* ===================== HELPERS ===================== */
 
 function requireEnv() {
@@ -108,8 +109,7 @@ function requireEnv() {
       !CLIENT_SECRET ? "GOOGLE_CLIENT_SECRET" : null,
       !REDIRECT_URI ? "GOOGLE_REDIRECT_URI" : null,
     ].filter(Boolean);
-    const msg = `Missing env vars: ${missing.join(", ")} (set them in .env / Render)`;
-    const err = new Error(msg);
+    const err = new Error(`Missing env vars: ${missing.join(", ")} (set them in .env / Render)`);
     err.status = 400;
     throw err;
   }
@@ -158,10 +158,59 @@ function verifyState(state) {
   return obj;
 }
 
-async function dbQuery(sql, params) {
-  if (!pool || !dbReady) return { rows: [] };
-  return pool.query(sql, params);
+function safeStr(x, max = 500) {
+  const s = String(x ?? "").replace(/\r/g, "").trim();
+  if (!s) return "";
+  return s.length > max ? s.slice(0, max) : s;
 }
+
+function pickHeader(headers, name) {
+  const key = String(name || "").toLowerCase();
+  const h = (headers || []).find((x) => String(x?.name || "").toLowerCase() === key);
+  return h?.value || null;
+}
+
+function decodeBody(dataB64Url) {
+  if (!dataB64Url) return "";
+  const b64 = String(dataB64Url).replace(/-/g, "+").replace(/_/g, "/");
+  const pad = b64.length % 4 ? "=".repeat(4 - (b64.length % 4)) : "";
+  return Buffer.from(b64 + pad, "base64").toString("utf8");
+}
+
+function extractTextPlain(payload) {
+  if (!payload) return "";
+  const mimeType = payload.mimeType || "";
+  if (mimeType === "text/plain" && payload.body?.data) return decodeBody(payload.body.data);
+
+  const parts = payload.parts || [];
+  for (const p of parts) {
+    if (p?.mimeType === "text/plain" && p?.body?.data) return decodeBody(p.body.data);
+  }
+
+  for (const p of parts) {
+    const nested = extractTextPlain(p);
+    if (nested) return nested;
+  }
+
+  return "";
+}
+
+function buildRawEmail({ to, subject, text, from, inReplyTo, references }) {
+  const headers = [];
+  headers.push(`To: ${to}`);
+  if (from) headers.push(`From: ${from}`);
+  headers.push(`Subject: ${subject || ""}`);
+  headers.push(`MIME-Version: 1.0`);
+  headers.push(`Content-Type: text/plain; charset="UTF-8"`);
+  headers.push(`Content-Transfer-Encoding: 7bit`);
+  if (inReplyTo) headers.push(`In-Reply-To: ${inReplyTo}`);
+  if (references) headers.push(`References: ${references}`);
+
+  const msg = `${headers.join("\r\n")}\r\n\r\n${text || ""}`;
+  return base64url(msg);
+}
+
+/* ===================== TOKEN STORE ===================== */
 
 async function saveTokens(userId, tokens, email) {
   if (!userId || !tokens) return;
@@ -220,11 +269,14 @@ async function getAuthedGmailClient(userId) {
   const oauth2 = makeOAuthClient();
   oauth2.setCredentials(record.tokens);
 
-  // Persist refreshed tokens
+  // Persist refreshed tokens (best effort)
   oauth2.on("tokens", async (newTokens) => {
     try {
-      const merged = { ...(record.tokens || {}), ...(newTokens || {}) };
-      await saveTokens(userId, merged, record.email || null);
+      if (!newTokens) return;
+      // Reload latest, then merge
+      const latest = await loadTokens(userId);
+      const merged = { ...(latest?.tokens || record.tokens || {}), ...(newTokens || {}) };
+      await saveTokens(userId, merged, latest?.email || record.email || null);
     } catch (e) {
       console.error("⚠️ token refresh save failed:", e?.message || e);
     }
@@ -234,60 +286,15 @@ async function getAuthedGmailClient(userId) {
   return { gmail, oauth2, record };
 }
 
-function pickHeader(headers, name) {
-  const h = (headers || []).find((x) => String(x?.name || "").toLowerCase() === String(name).toLowerCase());
-  return h?.value || null;
-}
+/* ===================== CORE OPS ===================== */
 
-// ✅ FIXED: you need this (extractTextPlain uses it)
-function decodeBody(dataB64Url) {
-  if (!dataB64Url) return "";
-  const b64 = String(dataB64Url).replace(/-/g, "+").replace(/_/g, "/");
-  const pad = b64.length % 4 ? "=".repeat(4 - (b64.length % 4)) : "";
-  return Buffer.from(b64 + pad, "base64").toString("utf8");
-}
-
-function extractTextPlain(payload) {
-  if (!payload) return "";
-  const mimeType = payload.mimeType || "";
-  if (mimeType === "text/plain" && payload.body?.data) return decodeBody(payload.body.data);
-
-  const parts = payload.parts || [];
-  for (const p of parts) {
-    if (p?.mimeType === "text/plain" && p?.body?.data) return decodeBody(p.body.data);
-  }
-
-  for (const p of parts) {
-    const nested = extractTextPlain(p);
-    if (nested) return nested;
-  }
-
-  return "";
-}
-
-function buildRawEmail({ to, subject, text, from, inReplyTo, references }) {
-  const headers = [];
-  headers.push(`To: ${to}`);
-  if (from) headers.push(`From: ${from}`);
-  headers.push(`Subject: ${subject || ""}`);
-  headers.push(`MIME-Version: 1.0`);
-  headers.push(`Content-Type: text/plain; charset="UTF-8"`);
-  headers.push(`Content-Transfer-Encoding: 7bit`);
-  if (inReplyTo) headers.push(`In-Reply-To: ${inReplyTo}`);
-  if (references) headers.push(`References: ${references}`);
-
-  const msg = `${headers.join("\r\n")}\r\n\r\n${text || ""}`;
-  return base64url(msg);
-}
-
-/* ===================== CORE OPS (shared by POST + GET routes) ===================== */
-
-async function opList({ userId, q = "newer_than:2d", maxResults = 10 }) {
+async function opList({ userId, q = "newer_than:2d", maxResults = 10, labelIds = ["INBOX"] }) {
   const { gmail } = await getAuthedGmailClient(userId);
 
   const list = await gmail.users.messages.list({
     userId: "me",
     q,
+    labelIds,
     maxResults: Math.min(Number(maxResults || 10), 25),
   });
 
@@ -300,7 +307,7 @@ async function opList({ userId, q = "newer_than:2d", maxResults = 10 }) {
         userId: "me",
         id: m.id,
         format: "metadata",
-        metadataHeaders: ["From", "To", "Subject", "Date", "Message-Id"],
+        metadataHeaders: ["From", "Reply-To", "To", "Subject", "Date", "Message-Id", "References", "In-Reply-To"],
       })
     )
   );
@@ -308,15 +315,26 @@ async function opList({ userId, q = "newer_than:2d", maxResults = 10 }) {
   return details.map((d) => {
     const msg = d?.data || {};
     const headers = msg.payload?.headers || [];
+
+    const from = pickHeader(headers, "From");
+    const subject = pickHeader(headers, "Subject");
+    const date = pickHeader(headers, "Date");
+
+    // ✅ LXT-friendly normalized item
     return {
-      id: msg.id,
-      threadId: msg.threadId,
-      from: pickHeader(headers, "From"),
-      to: pickHeader(headers, "To"),
-      subject: pickHeader(headers, "Subject"),
-      date: pickHeader(headers, "Date"),
-      messageId: pickHeader(headers, "Message-Id"),
-      snippet: msg.snippet || "",
+      id: safeStr(msg.id, 200),
+      threadId: safeStr(msg.threadId, 200),
+      from: safeStr(from, 300) || "(unknown sender)",
+      subject: safeStr(subject, 300) || "(no subject)",
+      snippet: safeStr(msg.snippet || "", 400),
+      date: safeStr(date, 120) || null,
+
+      // extra fields (harmless, sometimes useful)
+      to: safeStr(pickHeader(headers, "To"), 300) || null,
+      replyTo: safeStr(pickHeader(headers, "Reply-To"), 300) || null,
+      messageId: safeStr(pickHeader(headers, "Message-Id"), 300) || null,
+      references: safeStr(pickHeader(headers, "References"), 600) || null,
+      inReplyTo: safeStr(pickHeader(headers, "In-Reply-To"), 300) || null,
     };
   });
 }
@@ -331,24 +349,29 @@ async function opRead({ userId, id }) {
   const textPlain = extractTextPlain(msg.payload);
 
   return {
-    id: msg.id,
-    threadId: msg.threadId,
-    from: pickHeader(headers, "From"),
-    to: pickHeader(headers, "To"),
-    subject: pickHeader(headers, "Subject"),
-    date: pickHeader(headers, "Date"),
-    messageId: pickHeader(headers, "Message-Id"),
-    references: pickHeader(headers, "References"),
-    inReplyTo: pickHeader(headers, "In-Reply-To"),
-    snippet: msg.snippet || "",
-    body_text: textPlain || "",
+    id: safeStr(msg.id, 200),
+    threadId: safeStr(msg.threadId, 200),
+    from: safeStr(pickHeader(headers, "From"), 300) || "(unknown sender)",
+    replyTo: safeStr(pickHeader(headers, "Reply-To"), 300) || null,
+    to: safeStr(pickHeader(headers, "To"), 300) || null,
+    subject: safeStr(pickHeader(headers, "Subject"), 300) || "(no subject)",
+    date: safeStr(pickHeader(headers, "Date"), 120) || null,
+    messageId: safeStr(pickHeader(headers, "Message-Id"), 300) || null,
+    references: safeStr(pickHeader(headers, "References"), 600) || null,
+    inReplyTo: safeStr(pickHeader(headers, "In-Reply-To"), 300) || null,
+    snippet: safeStr(msg.snippet || "", 500),
+    body_text: safeStr(textPlain || "", 200000), // keep large
   };
 }
 
 async function opSend({ userId, to, subject, body, threadId = null }) {
   const { gmail } = await getAuthedGmailClient(userId);
 
-  const raw = buildRawEmail({ to, subject, text: body });
+  const raw = buildRawEmail({
+    to: safeStr(to, 320),
+    subject: safeStr(subject, 400),
+    text: safeStr(body, 200000),
+  });
 
   const sent = await gmail.users.messages.send({
     userId: "me",
@@ -361,26 +384,38 @@ async function opSend({ userId, to, subject, body, threadId = null }) {
 async function opReply({ userId, id, body }) {
   const { gmail } = await getAuthedGmailClient(userId);
 
+  // Pull metadata we need to reply properly
   const original = await gmail.users.messages.get({
     userId: "me",
     id,
     format: "metadata",
-    metadataHeaders: ["From", "Subject", "Message-Id", "References"],
+    metadataHeaders: ["From", "Reply-To", "Subject", "Message-Id", "References", "In-Reply-To"],
   });
 
   const msg = original?.data || {};
   const headers = msg.payload?.headers || [];
 
+  const replyTo = pickHeader(headers, "Reply-To");
   const from = pickHeader(headers, "From");
-  const subject0 = pickHeader(headers, "Subject") || "";
-  const messageId = pickHeader(headers, "Message-Id");
-  const references0 = pickHeader(headers, "References");
+  const to = safeStr(replyTo || from || "", 320);
 
-  const to = from || "";
-  const references = references0 ? `${references0} ${messageId || ""}`.trim() : messageId || null;
+  const subject0 = safeStr(pickHeader(headers, "Subject") || "", 400);
   const subject = /^re:/i.test(subject0) ? subject0 : `Re: ${subject0}`;
 
-  const raw = buildRawEmail({ to, subject, text: body, inReplyTo: messageId || null, references });
+  const messageId = safeStr(pickHeader(headers, "Message-Id") || "", 300) || null;
+  const references0 = safeStr(pickHeader(headers, "References") || "", 600) || null;
+
+  const references = references0
+    ? `${references0} ${messageId || ""}`.trim()
+    : messageId || null;
+
+  const raw = buildRawEmail({
+    to,
+    subject,
+    text: safeStr(body, 200000),
+    inReplyTo: messageId,
+    references,
+  });
 
   const sent = await gmail.users.messages.send({
     userId: "me",
@@ -459,7 +494,10 @@ router.get("/auth-url", async (req, res) => {
     const url = oauth2.generateAuthUrl({
       access_type: "offline",
       prompt: "consent",
-      scope: ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"],
+      scope: [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+      ],
       state,
     });
 
@@ -552,7 +590,7 @@ router.post("/disconnect", async (req, res) => {
   }
 });
 
-// GET /gmail/disconnect?user_id=...   (easy testing)
+// GET /gmail/disconnect?user_id=...
 router.get("/disconnect", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -601,10 +639,10 @@ router.post("/read", async (req, res) => {
 router.post("/send", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
-    const to = String(req.body?.to || "").trim();
-    const subject = String(req.body?.subject || "").trim();
-    const body = String(req.body?.body || "").trim();
-    const threadId = req.body?.threadId ? String(req.body.threadId).trim() : null;
+    const to = safeStr(req.body?.to || "", 320);
+    const subject = safeStr(req.body?.subject || "", 400);
+    const body = safeStr(req.body?.body || "", 200000);
+    const threadId = req.body?.threadId ? safeStr(req.body.threadId, 200) : null;
 
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!to) return res.status(400).json({ error: "Missing to" });
@@ -622,7 +660,7 @@ router.post("/reply", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
     const id = String(req.body?.id || "").trim();
-    const body = String(req.body?.body || "").trim();
+    const body = safeStr(req.body?.body || "", 200000);
 
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
@@ -672,9 +710,9 @@ router.get("/read", async (req, res) => {
 router.get("/send", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
-    const to = String(req.query.to || "").trim();
-    const subject = String(req.query.subject || "").trim();
-    const body = String(req.query.body || "").trim();
+    const to = safeStr(req.query.to || "", 320);
+    const subject = safeStr(req.query.subject || "", 400);
+    const body = safeStr(req.query.body || "", 200000);
 
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!to) return res.status(400).json({ error: "Missing to" });
@@ -694,8 +732,15 @@ async function svcGetConnectedProviders({ userId }) {
   return rec?.tokens ? ["gmail"] : [];
 }
 
-async function svcList({ userId, q = "newer_than:7d", max = 10 }) {
-  return await opList({ userId, q, maxResults: max });
+// ✅ LXT expects: id, subject, from, snippet (and optional date/threadId)
+async function svcList({ userId, q = "newer_than:7d", max = 10, disable_orderby = false }) {
+  // disable_orderby exists for compatibility; Gmail API already returns recent-ish.
+  return await opList({
+    userId,
+    q: String(q || "newer_than:7d"),
+    maxResults: Math.min(Number(max || 10), 25),
+    labelIds: ["INBOX"],
+  });
 }
 
 async function svcGetBody({ userId, messageId }) {
@@ -724,12 +769,12 @@ async function svcReplyById({ userId, messageId, body }) {
 }
 
 async function svcReplyLatest({ userId, body }) {
-  const items = await svcList({ userId, q: "newer_than:14d", max: 1 });
+  // ✅ reliably pick latest INBOX item
+  const items = await svcList({ userId, q: "newer_than:30d", max: 1 });
   if (!items.length) throw new Error("No recent emails to reply to.");
   return await svcReplyById({ userId, messageId: items[0].id, body });
 }
 
-// ✅ Export BOTH router + service
 module.exports = {
   router,
   service: {

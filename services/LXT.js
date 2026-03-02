@@ -49,6 +49,10 @@ function createLXT({
   getDbReady,
 
   // Optional: plug your own service modules here (recommended)
+  // Expected:
+  // services.news.getLive({ userId, country, city, q, pageSize }) -> { ok, articles:[...] }
+  // services.weather.getLive({ userId, text, lat, lon, state }) -> normalized weather object
+  // services.stocks.quote({ userId, ticker }) -> quote object
   services = {},
 
   // Optional: allow index.js to pass app-level config defaults
@@ -117,6 +121,7 @@ function createLXT({
     weather: "core",
     news: "core",
     stocks_quote: "core",
+    affects_me: "core", // ✅ impact reasoning fast-path
 
     // plus features:
     inbox_summarize: "plus",
@@ -466,6 +471,7 @@ Return ONLY the reply text.
     if (/(email|inbox|gmail|outlook|yahoo)/.test(t)) return { kind: "email" };
     if (/(stock|ticker|\$[a-z]{1,5}\b|nasdaq|crypto|btc|eth)/.test(t)) return { kind: "stocks" };
     if (/(news|headlines|breaking|what happened)/.test(t)) return { kind: "news" };
+    if (/(affect me|affects me|impact|what happens to|tariff|inflation|rate hike)/.test(t)) return { kind: "affects_me" };
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return { kind: "daily_brief" };
     if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t))
       return { kind: "signal_scan" };
@@ -487,6 +493,15 @@ Return ONLY the reply text.
 
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return "daily_brief";
     if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t)) return "signal_scan";
+
+    // ✅ IMPACT / "AFFECTS ME" INTENT (local + cause→effect)
+    if (
+      /(how (does|will) this affect me|affect(s)? me|what happens to|impact on|what will happen to|tariff|sanction|rate hike|inflation|strike|shutdown|border|war)/.test(
+        t
+      ) ||
+      /(will (gas|food|rent|prices|costs?) (go|be)|gas prices|food prices|cost of living)/.test(t)
+    )
+      return "affects_me";
 
     if (/(weather|temperature|temp\b|forecast|rain|snow|wind)/.test(t)) return "weather";
     if (/(stock|stocks|market|price of|ticker|\$[a-z]{1,5}\b|nasdaq|nyse|crypto|btc|eth)/.test(t)) return "stocks";
@@ -786,13 +801,17 @@ Return ONLY the reply text.
   function compactLiveContextForDecision(liveContext) {
     if (!liveContext) return null;
 
+    // ✅ keep RSS fields too (summary/url/source)
     const news = Array.isArray(liveContext.news)
-      ? liveContext.news.slice(0, 5).map((n) => ({
+      ? liveContext.news.slice(0, 6).map((n) => ({
           title: n?.title || "",
+          summary: n?.summary || n?.description || null,
+          url: n?.url || null,
+          source: n?.source || null,
           region: n?.region || null,
           severity: n?.severity || null,
           action: n?.action || null,
-          created_at: n?.created_at || null,
+          created_at: n?.created_at || n?.published_at || null,
         }))
       : [];
 
@@ -816,6 +835,7 @@ Return ONLY the reply text.
     };
     live.location = loc;
 
+    // Weather
     if (services?.weather?.getLive) {
       try {
         live.weather = await services.weather.getLive({ userId, text, lat: loc.lat, lon: loc.lon, state: userState });
@@ -846,8 +866,44 @@ Return ONLY the reply text.
       if (weatherGeo?.country && !loc.country) live.location.country = weatherGeo.country;
     }
 
-    live.news = userId ? await getRecentNewsForUser(userId, 5) : [];
+    // ✅ LIVE NEWS (RSS via services.news.getLive) + fallback to DB events
+    if (services?.news?.getLive) {
+      try {
+        const country = String(loc.country || "ca").toLowerCase();
+        const city = loc.city || null;
 
+        const r = await services.news.getLive({
+          userId,
+          country,
+          city,
+          q: null,
+          pageSize: 10,
+        });
+
+        const articles = Array.isArray(r?.articles) ? r.articles : [];
+        live.news = articles
+          .slice(0, 8)
+          .map((a) => ({
+            title: a?.title || "",
+            summary: a?.description || a?.summary || null,
+            description: a?.description || null,
+            url: a?.url || null,
+            source: a?.source || null,
+            published_at: a?.published_at || null,
+            created_at: a?.published_at || r?.fetched_at || new Date().toISOString(),
+            region: { country, city },
+            severity: null,
+            action: null,
+          }))
+          .filter((x) => x.title);
+      } catch {
+        live.news = userId ? await getRecentNewsForUser(userId, 5) : [];
+      }
+    } else {
+      live.news = userId ? await getRecentNewsForUser(userId, 5) : [];
+    }
+
+    // Stocks
     const ticker = extractTicker(text);
     if (ticker && services?.stocks?.quote) {
       try {
@@ -1193,7 +1249,6 @@ Rules:
   }
 
   /* ===================== FAST PATHS (EMAIL / NEWS / WEATHER / STOCKS / CHAT) ===================== */
-  // Everything below remains your logic.
 
   async function handleEmailIntent({ userId, text, planTier }) {
     if (!userId) {
@@ -1516,6 +1571,35 @@ Rules:
     });
   }
 
+  // ✅ NEW: “AFFECTS ME” / LOCAL IMPACT LOGIC LAYER
+  async function handleAffectsMeIntent({ text, liveContext, voiceProfile }) {
+    const payload = {
+      question: text,
+      location: liveContext?.location || {},
+      weather: liveContext?.weather || null,
+      news: Array.isArray(liveContext?.news) ? liveContext.news.slice(0, 8) : [],
+      stocks: liveContext?.stocks || null,
+    };
+
+    return await callGeminiReply({
+      userText: `
+You are LXT. The user asks: "how does this affect me?"
+Do NOT claim exact numbers. Use directional estimates and realistic ranges.
+Output style:
+- 2–5 short sentences
+- include: (1) what likely changes, (2) when, (3) what to do today, (4) one watchout
+Think in cause→effect chains (tariffs→import costs→prices, etc).
+If it's speculative, say it's speculative.
+Context:
+${JSON.stringify(payload)}
+`.trim(),
+      lxt1: null,
+      voiceProfile,
+      liveContext: {},
+      lastReplyHint: "",
+    });
+  }
+
   /* ===================== LEVEL 3: DAILY BRIEF + SIGNAL SCAN ===================== */
 
   async function handleDailyBrief({ planTier, liveContext, voiceProfile }) {
@@ -1758,6 +1842,27 @@ Rules:
         return {
           ...base,
           providers: { decision: "news_fast", reply: "news_fast", triedDecision: ["news_fast"], triedReply: ["news_fast"] },
+        };
+      }
+
+      // ✅ IMPACT fast path
+      if (intent === "affects_me") {
+        const gate = requireFeatureOrTease({ tier: planTier, feature: "affects_me" });
+        if (!gate.ok) {
+          const base = { provider: "loravo_impact", mode, reply: gate.reply, lxt1: null, _errors: {} };
+          if (defaults?.include_provider_meta === false) return base;
+          return {
+            ...base,
+            providers: { decision: "impact_fast", reply: "gemini", triedDecision: ["impact_fast"], triedReply: ["gemini"] },
+          };
+        }
+
+        const reply = await handleAffectsMeIntent({ text, liveContext, voiceProfile: finalVoiceProfile });
+        const base = { provider: "loravo_impact", mode, reply, lxt1: null, _errors: {} };
+        if (defaults?.include_provider_meta === false) return base;
+        return {
+          ...base,
+          providers: { decision: "impact_fast", reply: "gemini", triedDecision: ["impact_fast"], triedReply: ["gemini"] },
         };
       }
 
