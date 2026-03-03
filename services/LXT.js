@@ -3,7 +3,7 @@
  * ✅ No Express routes here.
  * ✅ index.js wires HTTP endpoints + DB + push + routes.
  *
- * ✅ FIXES in this version (your screenshot issues):
+ * ✅ FIXES in this version:
  * - Weather now uses:
  *   1) explicit location in the user text (Edmonton, New York, etc)
  *   2) coordinates inside the text (53.5461,-113.4938)
@@ -458,7 +458,8 @@ Return ONLY the reply text.
 
   function behaviorToVoiceLine(bp) {
     if (!bp) return "";
-    const depth = bp.depth_pref > 0.6 ? "Give depth when asked; otherwise keep it tight." : "Keep it short-first, expand only on request.";
+    const depth =
+      bp.depth_pref > 0.6 ? "Give depth when asked; otherwise keep it tight." : "Keep it short-first, expand only on request.";
     const bullets = bp.bullet_pref > 0.6 ? "When explaining, use bullets naturally." : "Prefer short paragraphs unless asked for lists.";
     const direct = bp.directness > 0.6 ? "Be direct. Minimal fluff." : "Be friendly and calm.";
     const anti = bp.anti_robotic > 0.65 ? "Avoid robotic phrasing; keep it human." : "Keep it calm and clear.";
@@ -473,7 +474,8 @@ Return ONLY the reply text.
     if (/(weather|forecast|temp)/.test(t)) return { kind: "weather" };
     if (/(email|inbox|gmail|outlook|yahoo)/.test(t)) return { kind: "email" };
     if (/(stock|ticker|\$[a-z]{1,5}\b|nasdaq|crypto|btc|eth)/.test(t)) return { kind: "stocks" };
-    if (/(news|headlines|breaking|what happened|what’s happening|whats happening|what is new|what is new\??)/.test(t)) return { kind: "news" };
+    if (/(news|headlines|breaking|what happened|what’s happening|whats happening|what is new|what is new\??)/.test(t))
+      return { kind: "news" };
     if (/(affect me|affects me|impact|what happens to|tariff|inflation|rate hike)/.test(t)) return { kind: "affects_me" };
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return { kind: "daily_brief" };
     if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t))
@@ -842,7 +844,8 @@ Return ONLY the reply text.
     const lower = t.toLowerCase();
 
     const wantsAll =
-      /\b(all|every|all my|all of my|across all|across)\b/.test(lower) && /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(lower);
+      /\b(all|every|all my|all of my|across all|across)\b/.test(lower) &&
+      /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(lower);
 
     function extractCountDefault(defaultN = 5) {
       const m = lower.match(/\b(\d{1,2})\b/);
@@ -1541,7 +1544,9 @@ Rules:
 
     if (cmd.kind === "important") {
       if (allMode) {
-        const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 }));
+        const all = await fetchAllProviders((p) =>
+          emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 })
+        );
 
         const blocks = all.map((x) => {
           if (!x.ok) return `=== ${x.provider} ===\nError: ${x.err}`;
@@ -1562,7 +1567,9 @@ Rules:
       const reply =
         !items?.length
           ? "No unread emails in the last 7 days."
-          : `Here are your top unread emails (${used}):\n\n${formatEmailList(items)}\n\nSay: “summarize my inbox” or “reply to latest email: …”`;
+          : `Here are your top unread emails (${used}):\n\n${formatEmailList(
+              items
+            )}\n\nSay: “summarize my inbox” or “reply to latest email: …”`;
 
       return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
@@ -1583,7 +1590,9 @@ Rules:
         }
 
         const summary = await callGeminiReply({
-          userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(compact)}`,
+          userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(
+            compact
+          )}`,
           lxt1: null,
           voiceProfile: "Calm, human, direct. Bullet-friendly. No robotic phrasing.",
           liveContext: {},
@@ -1608,7 +1617,9 @@ Rules:
       }
 
       const summary = await callGeminiReply({
-        userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(items.slice(0, 8))}`,
+        userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(
+          items.slice(0, 8)
+        )}`,
         lxt1: null,
         voiceProfile: "Calm, human, direct. Bullet-friendly. No robotic phrasing.",
         liveContext: {},
@@ -1745,7 +1756,9 @@ Rules:
     if (!items.length) return "I’m not seeing anything solid to call out right now. Tell me the city/topic and I’ll lock it in.";
 
     // Ahead-of-you framing if user asked "what’s happening / what happened / what is new"
-    const aheadMode = /(what happened|what’s happening|whats happening|what is new|what’s going on|whats going on)/i.test(String(userText || ""));
+    const aheadMode = /(what happened|what’s happening|whats happening|what is new|what’s going on|whats going on)/i.test(
+      String(userText || "")
+    );
 
     const prompt = aheadMode
       ? `Summarize what’s going on in a way that keeps the user ahead.
@@ -1758,7 +1771,9 @@ Use only the provided items. Don’t invent facts.
 
 Items:
 ${JSON.stringify(items.slice(0, 7))}`
-      : `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(items.slice(0, 5))}`;
+      : `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(
+          items.slice(0, 5)
+        )}`;
 
     if (services?.news?.summarizeForChat) {
       try {
@@ -1815,7 +1830,9 @@ ${JSON.stringify(payload)}
     if (!gate.ok) return gate.reply;
 
     const brief = await callGeminiReply({
-      userText: `Create a daily brief. Keep it human and tight.\nInclude:\n1) What's important (max 3 bullets)\n2) What to do today (max 3 bullets)\n3) One watchout (1 line)\n\nContext:\n${JSON.stringify(liveContext)}`,
+      userText: `Create a daily brief. Keep it human and tight.\nInclude:\n1) What's important (max 3 bullets)\n2) What to do today (max 3 bullets)\n3) One watchout (1 line)\n\nContext:\n${JSON.stringify(
+        liveContext
+      )}`,
       lxt1: null,
       voiceProfile,
       liveContext,
@@ -1836,7 +1853,10 @@ ${JSON.stringify(payload)}
     const scan = services?.signals?.scan ? await services.signals.scan({ userId, liveContext }) : null;
 
     const reply = await callGeminiReply({
-      userText: `Do a signal scan.\nOutput:\n- 2–4 key signals\n- 1–2 moves today\n- 1 watchout\nKeep it calm and human.\n\n${JSON.stringify({ liveContext, scan })}`,
+      userText: `Do a signal scan.\nOutput:\n- 2–4 key signals\n- 1–2 moves today\n- 1 watchout\nKeep it calm and human.\n\n${JSON.stringify({
+        liveContext,
+        scan,
+      })}`,
       lxt1: null,
       voiceProfile,
       liveContext,
@@ -1961,13 +1981,7 @@ ${JSON.stringify(payload)}
 
     if (!forceDecision) {
       if (intent === "greeting") {
-        const base = {
-          provider: "loravo_fastpath",
-          mode: "instant",
-          reply: "Hey — what’s on your mind?",
-          lxt1: null,
-          _errors: {},
-        };
+        const base = { provider: "loravo_fastpath", mode: "instant", reply: "Hey — what’s on your mind?", lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
@@ -2026,7 +2040,12 @@ ${JSON.stringify(payload)}
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "weather_meta_fast", reply: "weather_meta_fast", triedDecision: ["weather_meta_fast"], triedReply: ["weather_meta_fast"] },
+          providers: {
+            decision: "weather_meta_fast",
+            reply: "weather_meta_fast",
+            triedDecision: ["weather_meta_fast"],
+            triedReply: ["weather_meta_fast"],
+          },
         };
       }
 
@@ -2051,13 +2070,7 @@ ${JSON.stringify(payload)}
       }
 
       if (intent === "news") {
-        const reply = await handleNewsIntent({
-          userId,
-          memory,
-          liveContext,
-          voiceProfile: finalVoiceProfile,
-          userText: text,
-        });
+        const reply = await handleNewsIntent({ userId, memory, liveContext, voiceProfile: finalVoiceProfile, userText: text });
         const base = { provider: "loravo_news", mode, reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
@@ -2124,13 +2137,7 @@ ${JSON.stringify(payload)}
       }
     }
 
-    const decision = await getDecision({
-      provider,
-      text,
-      memory,
-      liveContextCompact: liveCompact,
-      maxTokens,
-    });
+    const decision = await getDecision({ provider, text, memory, liveContextCompact: liveCompact, maxTokens });
 
     let lxt1 = sanitizeToSchema(decision.lxt1 || safeFallbackResult("Temporary issue — try again."));
 
@@ -2146,13 +2153,7 @@ ${JSON.stringify(payload)}
     const lastReplyHint = state2?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "";
 
     if (forceDecision) {
-      const base = {
-        provider,
-        mode,
-        lxt1,
-        reply: null,
-        _errors: { openai: decision._openai_error },
-      };
+      const base = { provider, mode, lxt1, reply: null, _errors: { openai: decision._openai_error } };
       if (defaults?.include_provider_meta === false) return base;
       return {
         ...base,
@@ -2175,22 +2176,14 @@ ${JSON.stringify(payload)}
       mode,
       lxt1,
       reply: voice.reply,
-      _errors: {
-        openai: decision._openai_error,
-        reply: voice._reply_error,
-      },
+      _errors: { openai: decision._openai_error, reply: voice._reply_error },
     };
 
     if (defaults?.include_provider_meta === false) return base;
 
     return {
       ...base,
-      providers: {
-        decision: decision.decisionProvider,
-        reply: voice.replyProvider,
-        triedDecision: decision.tried,
-        triedReply: voice.tried,
-      },
+      providers: { decision: decision.decisionProvider, reply: voice.replyProvider, triedDecision: decision.tried, triedReply: voice.tried },
     };
   }
 
