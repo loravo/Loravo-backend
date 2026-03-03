@@ -3,32 +3,22 @@
  * ✅ No Express routes here.
  * ✅ index.js wires HTTP endpoints + DB + push + routes.
  *
- * LEVEL 2 (Behavior Intelligence):
- * - behavior_profile (EMA): depth_pref, bullet_pref, directness, anti_robotic, friction
- * - “MORE MODE”: if user says "more", expands last_topic instead of restarting
- * - last_topic stored in user_state for continuity
- *
- * LEVEL 3 (Pro Power):
- * - plan_tier gating: core / plus / pro
- * - daily_brief (Plus), inbox_summarize (Plus), signal_scan (Pro), proactive alerts (Pro)
- * - generateProactiveInsights(): worker/cron can call this to create push-ready insight objects
+ * ✅ FIXES in this version (your screenshot issues):
+ * - Weather now uses:
+ *   1) explicit location in the user text (Edmonton, New York, etc)
+ *   2) coordinates inside the text (53.5461,-113.4938)
+ *   3) device lat/lon from req.body (even if sent as strings)
+ *   4) user_state last_city fallback (but blocks bad placeholders like "Globe")
+ * - Weather now answers BOTH:
+ *   - "what is the weather" (uses device location if available)
+ *   - "weather in Edmonton / Edmonton weather / weather 53.5,-113.4"
+ * - News now has a production-ready fallback:
+ *   - If services.news.getLive is not wired, it fetches Google News RSS
+ *   - "what’s happening" returns a before/now/next style summary (ahead-of-you framing)
  *
  * IMPORTANT BRAND RULE:
  * - User-facing identity: ALWAYS "Powered by LXT-1."
  * - Internally can use OpenAI + Gemini (never mention model names to the user).
- *
- * DB NOTE (recommended columns on user_state):
- * - user_id TEXT PRIMARY KEY
- * - plan_tier TEXT default 'core'
- * - behavior_profile JSONB default '{}'::jsonb
- * - last_topic JSONB default '{}'::jsonb
- * - voice_profile TEXT
- * - voice_profile_updated_at TIMESTAMPTZ
- * - behavior_updated_at TIMESTAMPTZ
- * - preferred_email_provider TEXT
- * - last_city TEXT, last_country TEXT, last_timezone TEXT
- * - last_alert_hash TEXT               -- optional (used to avoid repeated wording)
- * - updated_at TIMESTAMPTZ default NOW()
  *************************************************/
 
 const fetch = require("node-fetch"); // node-fetch@2
@@ -357,6 +347,19 @@ Return ONLY the reply text.
     );
   }
 
+  function toNum(x) {
+    const n = typeof x === "number" ? x : typeof x === "string" ? Number(x.trim()) : NaN;
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function normalizePlaceName(s) {
+    const t = String(s || "").trim();
+    if (!t) return null;
+    const bad = new Set(["globe", "unknown", "n/a", "na", "null", "undefined"]);
+    if (bad.has(t.toLowerCase())) return null;
+    return t;
+  }
+
   // ✅ Normalize incoming images to OpenAI-friendly data URLs
   function normalizeImages(images) {
     if (!Array.isArray(images) || !images.length) return [];
@@ -413,7 +416,7 @@ Return ONLY the reply text.
     const likesBullets = /\b(bullets|bullet points|list it|list)\b/.test(lower);
     const hatesRobotic = /\b(robotic|gray|strict|corporate|stiff)\b/.test(lower);
 
-    const frustration = /\b(no|stop|wrong|nah|not that|you didn’t|you are not listening|hate|trash)\b/.test(lower) ? 1 : 0;
+    const frustration = /\b(no|stop|wrong|nah|not that|you didn’t|you are not listening|hate|trash|dumb)\b/.test(lower) ? 1 : 0;
 
     const directness = /\b(do this|make it|fix it|send|give me|now|copy paste)\b/.test(lower) ? 0.65 : 0.5;
 
@@ -470,7 +473,7 @@ Return ONLY the reply text.
     if (/(weather|forecast|temp)/.test(t)) return { kind: "weather" };
     if (/(email|inbox|gmail|outlook|yahoo)/.test(t)) return { kind: "email" };
     if (/(stock|ticker|\$[a-z]{1,5}\b|nasdaq|crypto|btc|eth)/.test(t)) return { kind: "stocks" };
-    if (/(news|headlines|breaking|what happened)/.test(t)) return { kind: "news" };
+    if (/(news|headlines|breaking|what happened|what’s happening|whats happening|what is new|what is new\??)/.test(t)) return { kind: "news" };
     if (/(affect me|affects me|impact|what happens to|tariff|inflation|rate hike)/.test(t)) return { kind: "affects_me" };
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return { kind: "daily_brief" };
     if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t))
@@ -494,6 +497,9 @@ Return ONLY the reply text.
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return "daily_brief";
     if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t)) return "signal_scan";
 
+    // ✅ Weather-source question like "Where you get this weather"
+    if (/(where.*(get|got).*weather|source.*weather|how.*know.*weather)/.test(t)) return "weather_source";
+
     // ✅ IMPACT / "AFFECTS ME" INTENT (local + cause→effect)
     if (
       /(how (does|will) this affect me|affect(s)? me|what happens to|impact on|what will happen to|tariff|sanction|rate hike|inflation|strike|shutdown|border|war)/.test(
@@ -505,7 +511,7 @@ Return ONLY the reply text.
 
     if (/(weather|temperature|temp\b|forecast|rain|snow|wind)/.test(t)) return "weather";
     if (/(stock|stocks|market|price of|ticker|\$[a-z]{1,5}\b|nasdaq|nyse|crypto|btc|eth)/.test(t)) return "stocks";
-    if (/(news|headlines|what happened|what’s going on|whats going on|breaking|update me|anything i should know)/.test(t))
+    if (/(news|headlines|what happened|what’s going on|whats going on|what’s happening|whats happening|what is new|breaking|update me|anything i should know)/.test(t))
       return "news";
 
     if (
@@ -527,16 +533,45 @@ Return ONLY the reply text.
     return s.includes("weather") || s.includes("forecast") || s.includes("temperature") || /\btemp\b/.test(s);
   }
 
+  // ✅ Parses:
+  // - "weather in Edmonton"
+  // - "Edmonton weather"
+  // - "weather Edmonton"
+  // - "weather 53.5461,-113.4938"
+  function extractCoordinatesFromText(t) {
+    const s = String(t || "");
+    const m = s.match(/(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)/);
+    if (!m) return null;
+    const lat = Number(m[1]);
+    const lon = Number(m[2]);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+    return { lat, lon };
+  }
+
   function extractCityFromWeatherText(t) {
     const s = String(t || "").trim();
-    const m =
-      s.match(/\bweather\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
-      s.match(/\bforecast\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
-      s.match(/\btemperature\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
-      s.match(/\btemp\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i);
-    if (!m) return null;
-    const city = String(m[2] || "").trim();
-    return city.length >= 2 ? city : null;
+
+    // "weather in X" / "forecast for X"
+    const m1 =
+      s.match(/\b(weather|forecast|temperature|temp)\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
+      s.match(/\b(weather|forecast|temperature|temp)\s+([a-zA-Z\s.'-]{2,})$/i);
+
+    if (m1) {
+      const city = String(m1[m1.length - 1] || "").trim();
+      const cleaned = city.replace(/\?+$/g, "").trim();
+      return cleaned.length >= 2 ? cleaned : null;
+    }
+
+    // "Edmonton weather"
+    const m2 = s.match(/^([a-zA-Z\s.'-]{2,})\s+(weather|forecast|temperature|temp)\b/i);
+    if (m2) {
+      const city = String(m2[1] || "").trim();
+      const cleaned = city.replace(/\?+$/g, "").trim();
+      return cleaned.length >= 2 ? cleaned : null;
+    }
+
+    return null;
   }
 
   async function geocodeCity_OpenWeather(city) {
@@ -551,6 +586,23 @@ Return ONLY the reply text.
       const hit = Array.isArray(j) ? j[0] : null;
       if (!hit || typeof hit.lat !== "number" || typeof hit.lon !== "number") return null;
       return { lat: hit.lat, lon: hit.lon, name: hit.name || city, country: hit.country || null };
+    } catch {
+      return null;
+    }
+  }
+
+  async function reverseGeocode_OpenWeather(lat, lon) {
+    const key = process.env.OPENWEATHER_API_KEY;
+    if (!key || typeof lat !== "number" || typeof lon !== "number") return null;
+
+    const url = `https://api.openweathermap.org/geo/1.0/reverse?lat=${lat}&lon=${lon}&limit=1&appid=${key}`;
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return null;
+      const j = await r.json();
+      const hit = Array.isArray(j) ? j[0] : null;
+      if (!hit) return null;
+      return { name: hit.name || null, country: hit.country || null, state: hit.state || null };
     } catch {
       return null;
     }
@@ -587,7 +639,7 @@ Return ONLY the reply text.
     if (!w) return null;
 
     const parts = [];
-    const place = w.city || fallbackPlace || null;
+    const place = normalizePlaceName(w.city) || normalizePlaceName(fallbackPlace) || null;
     if (place) parts.push(`${place}:`);
 
     const temp = typeof w.temp_c === "number" ? Math.round(w.temp_c) : null;
@@ -600,6 +652,75 @@ Return ONLY the reply text.
 
     if (feels != null && temp != null && feels !== temp) parts.push(`Feels like ${feels}°C.`);
     return parts.join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  /* ===================== NEWS (RSS FALLBACK) ===================== */
+
+  function decodeHtmlEntities(s) {
+    return String(s || "")
+      .replace(/&amp;/g, "&")
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">");
+  }
+
+  function stripCdata(s) {
+    return String(s || "").replace(/^<!\[CDATA\[/, "").replace(/\]\]>$/, "");
+  }
+
+  function pickBetween(xml, tag) {
+    const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+    const m = String(xml || "").match(re);
+    return m ? m[1] : "";
+  }
+
+  function parseRssItems(xml) {
+    const out = [];
+    const items = String(xml || "").split(/<item>/i).slice(1);
+    for (const chunk of items.slice(0, 12)) {
+      const title = decodeHtmlEntities(stripCdata(pickBetween(chunk, "title")).trim());
+      const link = stripCdata(pickBetween(chunk, "link")).trim();
+      const pubDate = stripCdata(pickBetween(chunk, "pubDate")).trim();
+      const source = decodeHtmlEntities(stripCdata(pickBetween(chunk, "source")).trim());
+      const descRaw = decodeHtmlEntities(stripCdata(pickBetween(chunk, "description")).trim())
+        .replace(/<[^>]+>/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (title) {
+        out.push({
+          title,
+          url: link || null,
+          source: source || null,
+          description: descRaw || null,
+          published_at: pubDate || null,
+        });
+      }
+    }
+    return out;
+  }
+
+  async function fetchGoogleNewsRss({ q = null, countryCode = "CA", lang = "en" }) {
+    // Google News RSS (no key)
+    const cc = String(countryCode || "CA").toUpperCase();
+    const ll = String(lang || "en").toLowerCase();
+
+    const base = q
+      ? `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=${ll}-${cc}&gl=${cc}&ceid=${cc}:${ll}`
+      : `https://news.google.com/rss?hl=${ll}-${cc}&gl=${cc}&ceid=${cc}:${ll}`;
+
+    const { controller, cancel } = withTimeout(12000);
+    try {
+      const r = await fetch(base, { signal: controller.signal });
+      if (!r.ok) return [];
+      const xml = await r.text();
+      return parseRssItems(xml);
+    } catch {
+      return [];
+    } finally {
+      cancel();
+    }
   }
 
   /* ===================== STOCKS (plug-in friendly) ===================== */
@@ -801,7 +922,6 @@ Return ONLY the reply text.
   function compactLiveContextForDecision(liveContext) {
     if (!liveContext) return null;
 
-    // ✅ keep RSS fields too (summary/url/source)
     const news = Array.isArray(liveContext.news)
       ? liveContext.news.slice(0, 6).map((n) => ({
           title: n?.title || "",
@@ -826,12 +946,16 @@ Return ONLY the reply text.
   async function buildLiveContext({ userId, text, lat, lon, userState }) {
     const live = { weather: null, location: null, news: [], stocks: null };
 
+    const textCoords = extractCoordinatesFromText(text);
+    const reqLat = toNum(lat);
+    const reqLon = toNum(lon);
+
     const loc = {
-      lat: typeof lat === "number" ? lat : null,
-      lon: typeof lon === "number" ? lon : null,
-      city: userState?.last_city || null,
-      country: userState?.last_country || null,
-      timezone: userState?.last_timezone || null,
+      lat: textCoords?.lat ?? reqLat ?? null,
+      lon: textCoords?.lon ?? reqLon ?? null,
+      city: normalizePlaceName(userState?.last_city) || null,
+      country: normalizePlaceName(userState?.last_country) || null,
+      timezone: normalizePlaceName(userState?.last_timezone) || null,
     };
     live.location = loc;
 
@@ -846,31 +970,63 @@ Return ONLY the reply text.
       let weatherRaw = null;
       let weatherGeo = null;
 
+      // 1) coords from text / device
       if (typeof loc.lat === "number" && typeof loc.lon === "number") {
         weatherRaw = await getWeather_OpenWeather(loc.lat, loc.lon);
-        weatherGeo = { lat: loc.lat, lon: loc.lon, name: loc.city || null, country: loc.country || null };
+        weatherGeo = await reverseGeocode_OpenWeather(loc.lat, loc.lon);
       } else if (isWeatherQuestion(text)) {
+        // 2) city in text
         const city = extractCityFromWeatherText(text);
         if (city) {
           const geo = await geocodeCity_OpenWeather(city);
           if (geo?.lat != null && geo?.lon != null) {
             weatherRaw = await getWeather_OpenWeather(geo.lat, geo.lon);
-            weatherGeo = geo;
+            weatherGeo = { name: geo.name || city, country: geo.country || null };
+            loc.lat = geo.lat;
+            loc.lon = geo.lon;
+          }
+        } else if (loc.city) {
+          // 3) fallback to last_city (if valid)
+          const geo = await geocodeCity_OpenWeather(loc.city);
+          if (geo?.lat != null && geo?.lon != null) {
+            weatherRaw = await getWeather_OpenWeather(geo.lat, geo.lon);
+            weatherGeo = { name: geo.name || loc.city, country: geo.country || loc.country || null };
+            loc.lat = geo.lat;
+            loc.lon = geo.lon;
           }
         }
       }
 
       const norm = normalizeWeatherForLLM(weatherRaw);
       if (norm) live.weather = norm;
-      if (weatherGeo?.name && !loc.city) live.location.city = weatherGeo.name;
-      if (weatherGeo?.country && !loc.country) live.location.country = weatherGeo.country;
+
+      // Improve location naming (fixes "Globe" / missing city)
+      const maybeCity = normalizePlaceName(weatherGeo?.name) || normalizePlaceName(norm?.city) || null;
+      const maybeCountry = normalizePlaceName(weatherGeo?.country) || loc.country || null;
+
+      if (maybeCity) live.location.city = maybeCity;
+      if (maybeCountry) live.location.country = maybeCountry;
+
+      // Save back to user_state so next request is better (best-effort)
+      if (userId && (maybeCity || maybeCountry)) {
+        await setUserStateFields(userId, {
+          ...(maybeCity ? { last_city: maybeCity } : {}),
+          ...(maybeCountry ? { last_country: maybeCountry } : {}),
+          updated_at: new Date().toISOString(),
+        });
+      }
     }
 
-    // ✅ LIVE NEWS (RSS via services.news.getLive) + fallback to DB events
+    // ✅ LIVE NEWS:
+    // 1) services.news.getLive (if wired)
+    // 2) Google News RSS fallback (production-ready, no key)
+    // 3) DB fallback
+    const cc = String(live.location.country || "CA").toUpperCase();
+
     if (services?.news?.getLive) {
       try {
-        const country = String(loc.country || "ca").toLowerCase();
-        const city = loc.city || null;
+        const country = String(live.location.country || "ca").toLowerCase();
+        const city = live.location.city || null;
 
         const r = await services.news.getLive({
           userId,
@@ -882,7 +1038,7 @@ Return ONLY the reply text.
 
         const articles = Array.isArray(r?.articles) ? r.articles : [];
         live.news = articles
-          .slice(0, 8)
+          .slice(0, 10)
           .map((a) => ({
             title: a?.title || "",
             summary: a?.description || a?.summary || null,
@@ -897,10 +1053,31 @@ Return ONLY the reply text.
           }))
           .filter((x) => x.title);
       } catch {
-        live.news = userId ? await getRecentNewsForUser(userId, 5) : [];
+        live.news = [];
       }
-    } else {
-      live.news = userId ? await getRecentNewsForUser(userId, 5) : [];
+    }
+
+    if (!live.news?.length) {
+      const q = live.location.city ? `${live.location.city} news` : null;
+      const rss = await fetchGoogleNewsRss({ q, countryCode: cc, lang: "en" });
+      if (rss.length) {
+        live.news = rss.slice(0, 10).map((a) => ({
+          title: a.title || "",
+          summary: a.description || null,
+          description: a.description || null,
+          url: a.url || null,
+          source: a.source || null,
+          published_at: a.published_at || null,
+          created_at: a.published_at || new Date().toISOString(),
+          region: { country: cc.toLowerCase(), city: live.location.city || null },
+          severity: null,
+          action: null,
+        }));
+      }
+    }
+
+    if (!live.news?.length) {
+      live.news = userId ? await getRecentNewsForUser(userId, 6) : [];
     }
 
     // Stocks
@@ -1526,12 +1703,22 @@ Rules:
   async function handleWeatherIntent({ text, liveContext }) {
     if (liveContext?.weather) {
       const one = formatWeatherOneLiner(liveContext.weather, liveContext?.location?.city || null);
-      return one || "I can pull your weather — do you want current conditions or the next 24 hours?";
+      return one || "Tell me the city (or send coordinates) and I’ll pull it.";
     }
+
+    // If user asked weather but we have no live weather, give a clean instruction
+    const coords = extractCoordinatesFromText(text);
     const city = extractCityFromWeatherText(text);
-    return city
-      ? `I can pull it — current conditions in ${city}, or the next 24 hours?`
-      : "Which city are you in (or allow location), and do you want current conditions or the next 24 hours?";
+
+    if (coords) return `Got it — weather for ${coords.lat}, ${coords.lon}. One sec (enable OPENWEATHER_API_KEY or wire services.weather.getLive).`;
+    if (city) return `Which one do you want for ${city}: right now, next 24 hours, or 7-day?`;
+
+    return "Which city (or drop coordinates like `53.5461,-113.4938`)? If you allow location, I’ll use your current spot automatically.";
+  }
+
+  async function handleWeatherSourceIntent() {
+    // Keep it human. Don’t mention “APIs”.
+    return "I’m using your current location (if you shared it) and a live forecast feed. If you ask a city or coordinates, I pull it for that exact place.";
   }
 
   async function handleStocksIntent({ text, liveContext }) {
@@ -1553,17 +1740,34 @@ Rules:
     return `I can check ${ticker}, but stocks service isn’t connected yet.`;
   }
 
-  async function handleNewsIntent({ userId, memory, liveContext, voiceProfile }) {
+  async function handleNewsIntent({ userId, memory, liveContext, voiceProfile, userText }) {
     const items = Array.isArray(liveContext?.news) ? liveContext.news : [];
+    if (!items.length) return "I’m not seeing anything solid to call out right now. Tell me the city/topic and I’ll lock it in.";
+
+    // Ahead-of-you framing if user asked "what’s happening / what happened / what is new"
+    const aheadMode = /(what happened|what’s happening|whats happening|what is new|what’s going on|whats going on)/i.test(String(userText || ""));
+
+    const prompt = aheadMode
+      ? `Summarize what’s going on in a way that keeps the user ahead.
+Format (tight):
+- Before: 1 line (what led to this)
+- Now: 1–2 lines (what’s happening)
+- Next: 1 line (what to watch in the next 24–72h)
+- One move: 1 line (what to do today)
+Use only the provided items. Don’t invent facts.
+
+Items:
+${JSON.stringify(items.slice(0, 7))}`
+      : `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(items.slice(0, 5))}`;
+
     if (services?.news?.summarizeForChat) {
       try {
         return await services.news.summarizeForChat({ userId, memory, items });
       } catch {}
     }
-    if (!items.length) return "Nothing urgent on your radar right now.";
 
     return await callGeminiReply({
-      userText: `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(items.slice(0, 5))}`,
+      userText: prompt,
       lxt1: null,
       voiceProfile,
       liveContext: {},
@@ -1571,7 +1775,7 @@ Rules:
     });
   }
 
-  // ✅ NEW: “AFFECTS ME” / LOCAL IMPACT LOGIC LAYER
+  // ✅ “AFFECTS ME” / LOCAL IMPACT LOGIC LAYER
   async function handleAffectsMeIntent({ text, liveContext, voiceProfile }) {
     const payload = {
       question: text,
@@ -1711,8 +1915,9 @@ ${JSON.stringify(payload)}
     const liveContext = await buildLiveContext({
       userId,
       text,
-      lat: typeof lat === "number" ? lat : null,
-      lon: typeof lon === "number" ? lon : null,
+      // IMPORTANT: accept lat/lon even if sent as strings
+      lat: toNum(lat),
+      lon: toNum(lon),
       userState: state2,
     });
 
@@ -1815,6 +2020,16 @@ ${JSON.stringify(payload)}
         }
       }
 
+      if (intent === "weather_source") {
+        const reply = await handleWeatherSourceIntent();
+        const base = { provider: "loravo_weather", mode: "instant", reply, lxt1: null, _errors: {} };
+        if (defaults?.include_provider_meta === false) return base;
+        return {
+          ...base,
+          providers: { decision: "weather_meta_fast", reply: "weather_meta_fast", triedDecision: ["weather_meta_fast"], triedReply: ["weather_meta_fast"] },
+        };
+      }
+
       if (intent === "weather") {
         const reply = await handleWeatherIntent({ text, liveContext });
         const base = { provider: "loravo_weather", mode: "instant", reply, lxt1: null, _errors: {} };
@@ -1836,7 +2051,13 @@ ${JSON.stringify(payload)}
       }
 
       if (intent === "news") {
-        const reply = await handleNewsIntent({ userId, memory, liveContext, voiceProfile: finalVoiceProfile });
+        const reply = await handleNewsIntent({
+          userId,
+          memory,
+          liveContext,
+          voiceProfile: finalVoiceProfile,
+          userText: text,
+        });
         const base = { provider: "loravo_news", mode, reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
@@ -1985,8 +2206,8 @@ ${JSON.stringify(payload)}
     const liveContext = await buildLiveContext({
       userId,
       text: "proactive_scan",
-      lat,
-      lon,
+      lat: toNum(lat),
+      lon: toNum(lon),
       userState: state,
     });
 
@@ -2037,6 +2258,7 @@ ${JSON.stringify(liveContext)}`,
       compactLiveContextForDecision,
       extractTicker,
       extractCityFromWeatherText,
+      extractCoordinatesFromText,
       sha1,
       normalizeTier,
       tierAtLeast,

@@ -325,7 +325,6 @@ const CHAT_MAX_IMAGE_BYTES_TOTAL = 6.0 * 1024 * 1024;  // 6MB
 
 function stripDataUrlPrefix(b64) {
   const s = String(b64 || "").trim();
-  // data:image/jpeg;base64,AAAA...
   const m = s.match(/^data:.*?;base64,(.+)$/i);
   return m ? m[1] : s;
 }
@@ -495,15 +494,23 @@ async function getWeather(lat, lon) {
 /* ===================== ALERT QUEUE ===================== */
 const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 
+function pushTitleForAlertType(alertType) {
+  const t = String(alertType || "").toLowerCase();
+  if (t === "weather") return "Weather";
+  if (t === "news") return "News";
+  if (t === "trip") return "Trip";
+  if (t === "location") return "Location";
+  return "Loravo";
+}
+
 async function enqueueAlert({ userId, alertType, message, payload }) {
   if (!userId || !message) return;
   if (!dbReady) return;
 
+  // ✅ Always queue alerts (so /poll can show later)
+  // Quiet hours are enforced only at PUSH time (below).
   const prefs = await loadUserPrefs(userId);
   const quiet = isNowInQuietHours(prefs);
-
-  const NON_URGENT = ["weather", "location", "news"];
-  if (quiet && NON_URGENT.includes(alertType)) return;
 
   const state = await loadUserState(userId);
   const now = Date.now();
@@ -517,9 +524,10 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
 
   const mergedPayload = { ...(payload || {}), quiet_hours_active: Boolean(quiet) };
 
+  // ✅ pass object directly for JSONB
   await dbQuery(
     `INSERT INTO alert_queue (user_id, alert_type, message, payload) VALUES ($1,$2,$3,$4)`,
-    [userId, alertType, message, JSON.stringify(mergedPayload)]
+    [userId, alertType, message, mergedPayload]
   );
 
   await upsertUserState(userId, {
@@ -829,6 +837,8 @@ async function maybeSendPushForAlert({ userId, alertType, message, payload }) {
 
   const prefs = await loadUserPrefs(userId);
   const force = Boolean(payload?.force_push);
+
+  // ✅ push is what respects quiet hours (queue still stores)
   if (!force && isNowInQuietHours(prefs)) return;
 
   const devices = await getUserDevices(userId);
@@ -839,7 +849,7 @@ async function maybeSendPushForAlert({ userId, alertType, message, payload }) {
   for (const d of devices) {
     const r = await apnsSendStrict({
       deviceToken: d.device_token,
-      title: "Loravo",
+      title: pushTitleForAlertType(alertType),
       body: message,
       payload: pushPayload,
       environment: normalizeEnv(d.environment),
@@ -1034,20 +1044,12 @@ const services = {
   // ✅ WEATHER wired into LXT.js buildLiveContext()
   weather: weatherPkg.service
     ? weatherPkg.service
-    : {
-        // fallback: if your /services/weather doesn't export a service yet,
-        // LXT will still use its OpenWeather fallback (inside LXT.js)
-        getLive: async () => null,
-      },
+    : { getLive: async () => null },
 
   // ✅ NEWS wired into LXT.js buildLiveContext()
   news: newsPkg.service
     ? newsPkg.service
-    : {
-        // fallback: if your /services/news doesn't export a service yet,
-        // LXT will fall back to DB events (inside LXT.js)
-        getLive: async () => ({ ok: true, articles: [] }),
-      },
+    : { getLive: async () => ({ ok: true, articles: [] }) },
 };
 
 /* ===================== LXT INSTANCE ===================== */
@@ -1106,9 +1108,6 @@ app.post("/lxt1", async (req, res) => {
  * /chat now supports BOTH:
  * - multipart/form-data images (multer)
  * - JSON body images: { images: [base64...] }
- *
- * This fixes: "if I send with empty text (image-only), it never replies"
- * because we no longer overwrite JSON images with [].
  */
 app.post("/chat", upload.array("images", 4), async (req, res) => {
   try {
@@ -1123,9 +1122,7 @@ app.post("/chat", upload.array("images", 4), async (req, res) => {
     const jsonImages = Array.isArray(req.body.images) ? req.body.images : null;
 
     // ✅ use multipart files if present
-    const fileImages = files.length
-      ? files.map((f) => f.buffer.toString("base64"))
-      : null;
+    const fileImages = files.length ? files.map((f) => f.buffer.toString("base64")) : null;
 
     // ✅ choose best source
     req.body.images = fileImages || jsonImages || [];
@@ -1150,9 +1147,7 @@ app.post("/chat", upload.array("images", 4), async (req, res) => {
       reply: result.reply,
       lxt1: result.lxt1,
       _providers: result.providers,
-      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply
-        ? { _errors: result._errors }
-        : {}),
+      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply ? { _errors: result._errors } : {}),
     });
   } catch (e) {
     res.status(500).json({ error: "server error", detail: String(e?.message || e) });
