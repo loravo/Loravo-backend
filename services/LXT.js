@@ -1,34 +1,22 @@
 /*************************************************
- * LXT.js — Loravo LXT Engine (MASTER) — MAXED (L2 + L3)
- * ✅ No Express routes here.
- * ✅ index.js wires HTTP endpoints + DB + push + routes.
+ * LXT.js — Loravo LXT Engine (UPGRADED)
  *
- * ✅ FIXES in this version:
- * - Weather priority is ACTUALLY correct:
- *   1) explicit city in the user text ("weather in Edmonton")
- *   2) coordinates inside the text ("53.5461,-113.4938")
- *   3) device lat/lon from req.body (even if strings)
- *   4) user_state last_city fallback (blocks bad placeholders)
- *
- * - Vision is "smart + human":
- *   - short, confident identification (no essay)
- *   - remembers last image label so follow-ups like "Where can I find one"
- *     don’t ask dumb clarification
- *
- * ✅ FIXES for provider stability:
- * - OpenAI Responses API parsing is resilient (output_text / output[] / legacy choices)
- * - Timeout handling is clean
- * - Schema sanitization is strict
+ * GOALS OF THIS VERSION:
+ * - GPT-style answer quality while still branded as LXT-1
+ * - OpenAI FIRST for chat + vision in trinity mode
+ * - richer image understanding
+ * - richer weather/news answers
+ * - fewer weak handcrafted fast-path replies
+ * - keeps email / tier / memory / live-context logic
  *
  * IMPORTANT BRAND RULE:
  * - User-facing identity: ALWAYS "Powered by LXT-1."
- * - Internally can use OpenAI + Gemini (never mention model names to the user).
+ * - Never mention model names to the user.
  *************************************************/
 
-const fetch = require("node-fetch"); // node-fetch@2
+const fetch = require("node-fetch");
 const crypto = require("crypto");
 
-/* Optional deps (only if you use them) */
 let google;
 try {
   google = require("googleapis").google;
@@ -36,28 +24,17 @@ try {
   google = null;
 }
 
-/* ===================== FACTORY ===================== */
-
 function createLXT({
   pool,
   getDbReady,
-
-  // Optional: plug your own service modules here (recommended)
-  // Expected:
-  // services.news.getLive({ userId, country, city, q, pageSize }) -> { ok, articles:[...] }
-  // services.weather.getLive({ userId, text, lat, lon, state }) -> normalized weather object
-  // services.stocks.quote({ userId, ticker }) -> quote object
   services = {},
-
-  // Optional: allow index.js to pass app-level config defaults
-  // defaults.include_provider_meta = false to hide provider debug fields from responses
   defaults = {},
 }) {
   const dbReady = () => (typeof getDbReady === "function" ? !!getDbReady() : false);
 
   /* ===================== CONFIG ===================== */
 
-  const TOKEN_LIMITS = { instant: 420, auto: 1100, thinking: 1900 };
+  const TOKEN_LIMITS = { instant: 520, auto: 1400, thinking: 2600 };
 
   function getMode(req) {
     const m = String(req?.query?.mode || "auto").toLowerCase();
@@ -69,30 +46,34 @@ function createLXT({
     return ["openai", "gemini", "trinity"].includes(p) ? p : "trinity";
   }
 
-  function pickAutoMode(text) {
+  function pickAutoMode(text, hasImages = false) {
+    if (hasImages) return "thinking";
     if (!text) return "instant";
+
     const t = String(text).toLowerCase().trim();
 
-    if (t.length < 40 || /^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)) return "instant";
-    if (/^(what|when|where|who|is|are|do|does|can|should)\b/.test(t) && t.length < 130) return "instant";
+    if (t.length < 30 || /^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)) return "instant";
+
     if (
-      /(analyze|plan|compare|strategy|explain|forecast|should i|pros and cons|step by step|break it down)/.test(t) ||
-      t.length > 220
-    )
+      /(analyze|compare|strategy|explain|forecast|why|step by step|break it down|deep|details|elaborate|plan|roadmap)/.test(t) ||
+      t.length > 180
+    ) {
       return "thinking";
+    }
+
     return "instant";
   }
 
-  function pickReplyTokens(userText) {
-    const t = String(userText || "").trim();
-    const len = t.length;
-    if (len <= 18) return 170;
-    if (len <= 80) return 320;
-    if (len <= 200) return 650;
-    return 1100;
+  function pickReplyTokens(userText, hasImages = false) {
+    if (hasImages) return 1400;
+    const len = String(userText || "").trim().length;
+    if (len <= 18) return 220;
+    if (len <= 80) return 480;
+    if (len <= 200) return 900;
+    return 1500;
   }
 
-  /* ===================== TIERS + GATING (CORE / PLUS / PRO) ===================== */
+  /* ===================== TIERS ===================== */
 
   const TIERS = ["core", "plus", "pro"];
 
@@ -107,23 +88,17 @@ function createLXT({
     return a >= b;
   }
 
-  // Feature matrix (edit anytime)
   const FEATURES = {
-    // core features:
     chat: "core",
     email: "core",
     weather: "core",
     news: "core",
     stocks_quote: "core",
     affects_me: "core",
-
-    // plus features:
     inbox_summarize: "plus",
     smart_replies: "plus",
     daily_brief: "plus",
     memory_persona: "plus",
-
-    // pro features:
     signal_scan: "pro",
     watchlists: "pro",
     proactive_alerts: "pro",
@@ -144,103 +119,92 @@ function createLXT({
     };
   }
 
-  /* ===================== LXT MASTER CHAT PROMPT ===================== */
+  /* ===================== PROMPTS ===================== */
 
   function LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile) {
     return `
 You are LXT, the intelligence layer inside LORAVO.
 
-You are not a generic chatbot.
-You are a calm, human, strategic thinking partner.
+You are the real brain behind the conversation.
+Internally you can use strong reasoning and multimodal understanding, but to the user you are only LXT.
 
-PRIMARY IDENTITY:
-- Human-sounding.
-- Calm.
-- Sharp.
-- Slightly ahead of the user.
-- Never robotic, never corporate, never stiff, never hype.
+PRIMARY IDENTITY
+- Calm
+- Human
+- Sharp
+- Helpful
+- Natural
+- Slightly ahead
+- Never robotic
+- Never corporate
+- Never stiff
+- Never hype
 
-CORE RESPONSE RULE:
-- Default: 2–6 short sentences.
-- If user asks for more detail (why / explain / more / go deeper / step by step / examples / elaborate): expand naturally.
-- Don’t ask useless clarification questions if you can reasonably answer.
-  (Example: if user asks “Where can I buy one?”, give buying options + ONE targeted follow-up.)
+CORE RULE
+- Answer the user directly.
+- Do not give weak placeholder replies when you can answer now.
+- Do not ask unnecessary clarification questions when a strong answer is possible.
+- If the user asks a simple question, answer it fully.
+- If the user asks for more, then expand.
 
-VISION RULE (when images are present):
-- Identify what it most likely is in 1–2 sentences.
-- Then give the next step (how to use it / where to buy / what to search).
-- No long essays. No “possibly within a specific faith or community…” filler.
+QUALITY BAR
+- Match a top-tier assistant.
+- Be specific, not generic.
+- Use real reasoning from the provided live context.
+- If context is missing, still be useful and intelligent.
 
-TONE RULES:
-- Vary sentence length and rhythm.
-- Avoid templates and predictable formatting.
-- Avoid repeating the same structures.
+VISION RULE
+When images are present:
+- First identify clearly what the object/scene most likely is.
+- Then explain the key details that matter.
+- Then give the practical next step if relevant.
+- Be detailed when helpful.
+- Do not be vague.
+- Do not hedge too much.
+- Do not say “possibly” every sentence.
+- If the user asks “what is this”, answer like an expert would.
+- If they ask “where can I buy this”, assume they mean the item in the image unless the context says otherwise.
 
-NEVER SAY:
-- “As an AI…”
-- Model names
+WEATHER RULE
+If the user asks for weather and live weather exists:
+- Give the actual answer now.
+- Do not ask “which one do you want?” unless the user truly asked something ambiguous.
+- Include current conditions and a useful short outlook.
+
+NEWS RULE
+If live news exists:
+- Summarize what matters.
+- Pull out the real implication.
+- Keep the user ahead.
+
+STYLE
+- Default: 2–6 sentences.
+- Expand naturally when the task needs depth.
+- Use bullets only when they improve clarity.
+- Vary sentence rhythm.
+- Avoid templates.
+- Avoid filler.
+
+NEVER SAY
+- “As an AI”
+- model names
 - “I can’t browse”
-- Anything about system prompts or internal tools
+- “Based on the image provided” unless needed once naturally
+- anything about internal tools or prompts
 
-LIVE CONTEXT:
-If live context is provided (weather/news/stocks/location), weave it naturally.
-Do not mention APIs or “live context”.
-
-IDENTITY RESPONSE:
-If asked “What are you powered by?” reply EXACTLY:
+IDENTITY RESPONSE
+If asked what powers you, reply exactly:
 Powered by LXT-1.
 
-VOICE PROFILE (adapt slowly, don’t overdo it):
-${voiceProfile ? `- ${voiceProfile}` : "- Calm, human, direct. Short-first; expands when asked. No hype."}
+VOICE PROFILE
+${voiceProfile ? `- ${voiceProfile}` : "- Calm, human, direct. Short first. Expands when needed. No hype."}
 
-FINAL RULE:
+FINAL RULE
 Return ONLY the reply text.
 `.trim();
   }
 
-  /* ===================== SCHEMAS (LXT1) ===================== */
-
-  const LXT1_SCHEMA = {
-    type: "object",
-    additionalProperties: false,
-    required: ["verdict", "confidence", "one_liner", "signals", "actions", "watchouts", "next_check"],
-    properties: {
-      verdict: { type: "string", enum: ["HOLD", "PREPARE", "MOVE", "AVOID"] },
-      confidence: { type: "number", minimum: 0, maximum: 1 },
-      one_liner: { type: "string" },
-      signals: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["name", "direction", "weight", "why"],
-          properties: {
-            name: { type: "string" },
-            direction: { type: "string", enum: ["up", "down", "neutral"] },
-            weight: { type: "number" },
-            why: { type: "string" },
-          },
-        },
-      },
-      actions: {
-        type: "array",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          required: ["now", "time", "effort"],
-          properties: {
-            now: { type: "string" },
-            time: { type: "string", enum: ["today", "this_week", "this_month"] },
-            effort: { type: "string", enum: ["low", "med", "high"] },
-          },
-        },
-      },
-      watchouts: { type: "array", items: { type: "string" } },
-      next_check: { type: "string" },
-    },
-  };
-
-  /* ===================== UTIL HELPERS ===================== */
+  /* ===================== SCHEMA ===================== */
 
   function clamp(n, a, b) {
     const x = Number(n);
@@ -324,7 +288,6 @@ Return ONLY the reply text.
       const ch = s[i];
       if (ch === "{") depth++;
       if (ch === "}") depth--;
-
       if (depth === 0) {
         const candidate = s.slice(start, i + 1);
         try {
@@ -364,7 +327,6 @@ Return ONLY the reply text.
     return t;
   }
 
-  // ✅ Normalize incoming images to OpenAI-friendly data URLs
   function normalizeImages(images) {
     if (!Array.isArray(images) || !images.length) return [];
     const out = [];
@@ -376,7 +338,6 @@ Return ONLY the reply text.
         out.push(s);
         continue;
       }
-
       if (/^https?:\/\//i.test(s)) {
         out.push(s);
         continue;
@@ -392,35 +353,29 @@ Return ONLY the reply text.
     const s = String(text || "").replace(/\s+/g, " ").trim();
     if (!s) return null;
     const cut = s.split(/[.!?]\s/)[0] || s;
-    return cut.slice(0, 90);
+    return cut.slice(0, 120);
   }
 
   function isBuyOrFindQuestion(text) {
     const t = String(text || "").toLowerCase();
-    return /(where can i find|where do i buy|where to buy|buy one|purchase|shop|order|get one|link to|amazon|etsy)/.test(t);
+    return /(where can i find|where do i buy|where to buy|buy one|purchase|shop|order|get one|link to|amazon|etsy|where can i buy)/.test(t);
   }
-
-  /* ===================== “SHORT FIRST, EXPAND IF ASKED” ===================== */
 
   function userWantsMore(text) {
     const t = String(text || "").toLowerCase();
-    return (
-      /\b(more|more detail|details|go deeper|deeper|why|explain|break it down|step by step|steps|examples|expand|elaborate)\b/.test(
-        t
-      ) || /\bhow exactly\b/.test(t)
-    );
+    return /\b(more|more detail|details|go deeper|deeper|why|explain|break it down|step by step|steps|examples|expand|elaborate)\b/.test(t);
   }
 
-  function lengthHintForReply(userText) {
+  function lengthHintForReply(userText, hasImages = false) {
     const t = String(userText || "").trim();
-    const short = t.length < 40 || /^(hi|hello|hey|yo|sup|what'?s up)\b/i.test(t);
-    if (short) return "short";
+    if (hasImages) return "deep";
+    if (t.length < 40 || /^(hi|hello|hey|yo|sup|what'?s up)\b/i.test(t)) return "short";
     if (userWantsMore(t)) return "deep";
-    if (/(analyze|strategy|plan|compare|pros and cons|forecast|timeline)/i.test(t) || t.length > 200) return "deep";
+    if (/(analyze|strategy|plan|compare|pros and cons|forecast|timeline|what is this|weather|news)/i.test(t) || t.length > 140) return "deep";
     return "normal";
   }
 
-  /* ===================== BEHAVIOR PROFILE (LEVEL 2) ===================== */
+  /* ===================== BEHAVIOR ===================== */
 
   function inferBehaviorFromText(text) {
     const t = String(text || "");
@@ -428,12 +383,9 @@ Return ONLY the reply text.
 
     const wantsShort = /\b(short|quick|fast|brief|one line)\b/.test(lower);
     const wantsDeep = /\b(more|details|go deeper|explain|break it down|step by step|examples)\b/.test(lower);
-
     const likesBullets = /\b(bullets|bullet points|list it|list)\b/.test(lower);
     const hatesRobotic = /\b(robotic|gray|strict|corporate|stiff)\b/.test(lower);
-
     const frustration = /\b(no|stop|wrong|nah|not that|you didn’t|you are not listening|hate|trash|dumb)\b/.test(lower) ? 1 : 0;
-
     const directness = /\b(do this|make it|fix it|send|give me|now|copy paste)\b/.test(lower) ? 0.65 : 0.5;
 
     return {
@@ -474,15 +426,15 @@ Return ONLY the reply text.
 
   function behaviorToVoiceLine(bp) {
     if (!bp) return "";
-    const depth = bp.depth_pref > 0.6 ? "Give depth when asked; otherwise keep it tight." : "Keep it short-first, expand only on request.";
-    const bullets = bp.bullet_pref > 0.6 ? "When explaining, use bullets naturally." : "Prefer short paragraphs unless asked for lists.";
-    const direct = bp.directness > 0.6 ? "Be direct. Minimal fluff." : "Be friendly and calm.";
-    const anti = bp.anti_robotic > 0.65 ? "Avoid robotic phrasing; keep it human." : "Keep it calm and clear.";
-    const friction = bp.friction > 0.6 ? "User seems frustrated: be extra clear and avoid repeating." : "";
+    const depth = bp.depth_pref > 0.6 ? "Give depth when needed." : "Keep it short first.";
+    const bullets = bp.bullet_pref > 0.6 ? "Use bullets when clarity improves." : "Prefer short paragraphs.";
+    const direct = bp.directness > 0.6 ? "Be direct. Minimal fluff." : "Be calm and friendly.";
+    const anti = bp.anti_robotic > 0.65 ? "Avoid robotic phrasing. Sound natural." : "Keep it clear and human.";
+    const friction = bp.friction > 0.6 ? "User may be frustrated. Be extra sharp and avoid weak filler." : "";
     return `${depth} ${bullets} ${direct} ${anti} ${friction}`.trim();
   }
 
-  /* ===================== LAST TOPIC MEMORY (“MORE MODE”) ===================== */
+  /* ===================== TOPIC ===================== */
 
   function detectTopic(text, hasImages = false) {
     if (hasImages) return { kind: "image" };
@@ -490,11 +442,10 @@ Return ONLY the reply text.
     if (/(weather|forecast|temp)/.test(t)) return { kind: "weather" };
     if (/(email|inbox|gmail|outlook|yahoo)/.test(t)) return { kind: "email" };
     if (/(stock|ticker|\$[a-z]{1,5}\b|nasdaq|crypto|btc|eth)/.test(t)) return { kind: "stocks" };
-    if (/(news|headlines|breaking|what happened|what’s happening|whats happening|what is new|what is new\??)/.test(t)) return { kind: "news" };
+    if (/(news|headlines|breaking|what happened|what’s happening|whats happening|what is new)/.test(t)) return { kind: "news" };
     if (/(affect me|affects me|impact|what happens to|tariff|inflation|rate hike)/.test(t)) return { kind: "affects_me" };
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return { kind: "daily_brief" };
-    if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t))
-      return { kind: "signal_scan" };
+    if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t)) return { kind: "signal_scan" };
     if (/(plan|strategy|roadmap|steps|launch)/.test(t)) return { kind: "plan" };
     return { kind: "chat" };
   }
@@ -510,42 +461,30 @@ Return ONLY the reply text.
     const t = String(text || "").toLowerCase().trim();
 
     if (/^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)) return "greeting";
-
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return "daily_brief";
     if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t)) return "signal_scan";
-
     if (isBuyOrFindQuestion(t)) return "shopping";
-
     if (/(where.*(get|got).*weather|source.*weather|how.*know.*weather)/.test(t)) return "weather_source";
 
     if (
-      /(how (does|will) this affect me|affect(s)? me|what happens to|impact on|what will happen to|tariff|sanction|rate hike|inflation|strike|shutdown|border|war)/.test(
-        t
-      ) ||
+      /(how (does|will) this affect me|affect(s)? me|what happens to|impact on|what will happen to|tariff|sanction|rate hike|inflation|strike|shutdown|border|war)/.test(t) ||
       /(will (gas|food|rent|prices|costs?) (go|be)|gas prices|food prices|cost of living)/.test(t)
-    )
-      return "affects_me";
+    ) return "affects_me";
 
     if (/(weather|temperature|temp\b|forecast|rain|snow|wind)/.test(t)) return "weather";
     if (/(stock|stocks|market|price of|ticker|\$[a-z]{1,5}\b|nasdaq|nyse|crypto|btc|eth)/.test(t)) return "stocks";
-    if (/(news|headlines|what happened|what’s going on|whats going on|what’s happening|whats happening|what is new|breaking|update me|anything i should know)/.test(t))
-      return "news";
+    if (/(news|headlines|what happened|what’s going on|whats going on|what’s happening|whats happening|what is new|breaking|update me|anything i should know)/.test(t)) return "news";
 
-    if (
-      /(gmail|outlook|yahoo|email|inbox|messages|unread|important email|summari[sz]e.*email|summari[sz]e.*inbox|reply to.*email|send.*email|check.*email|new emails|latest emails)/.test(
-        t
-      )
-    )
+    if (/(gmail|outlook|yahoo|email|inbox|messages|unread|important email|summari[sz]e.*email|summari[sz]e.*inbox|reply to.*email|send.*email|check.*email|new emails|latest emails)/.test(t)) {
       return "email";
+    }
 
     if (/(should i|what should i do|be honest|verdict|move or wait|is it smart|risk|timing window)/.test(t)) return "decision";
-
     if (hasImages) return "chat";
-
     return "chat";
   }
 
-  /* ===================== WEATHER HELPERS (fallback OpenWeather) ===================== */
+  /* ===================== WEATHER ===================== */
 
   function isWeatherQuestion(t) {
     const s = String(t || "").toLowerCase();
@@ -571,16 +510,14 @@ Return ONLY the reply text.
       s.match(/\b(weather|forecast|temperature|temp)\s+([a-zA-Z\s.'-]{2,})$/i);
 
     if (m1) {
-      const city = String(m1[m1.length - 1] || "").trim();
-      const cleaned = city.replace(/\?+$/g, "").trim();
-      return cleaned.length >= 2 ? cleaned : null;
+      const city = String(m1[m1.length - 1] || "").trim().replace(/\?+$/g, "").trim();
+      return city.length >= 2 ? city : null;
     }
 
     const m2 = s.match(/^([a-zA-Z\s.'-]{2,})\s+(weather|forecast|temperature|temp)\b/i);
     if (m2) {
-      const city = String(m2[1] || "").trim();
-      const cleaned = city.replace(/\?+$/g, "").trim();
-      return cleaned.length >= 2 ? cleaned : null;
+      const city = String(m2[1] || "").trim().replace(/\?+$/g, "").trim();
+      return city.length >= 2 ? city : null;
     }
 
     return null;
@@ -666,7 +603,7 @@ Return ONLY the reply text.
     return parts.join(" ").replace(/\s+/g, " ").trim();
   }
 
-  /* ===================== NEWS (RSS FALLBACK) ===================== */
+  /* ===================== NEWS ===================== */
 
   function decodeHtmlEntities(s) {
     return String(s || "")
@@ -734,7 +671,7 @@ Return ONLY the reply text.
     }
   }
 
-  /* ===================== STOCKS (plug-in friendly) ===================== */
+  /* ===================== STOCKS ===================== */
 
   function extractTicker(text) {
     const t = String(text || "").trim();
@@ -745,7 +682,7 @@ Return ONLY the reply text.
     return null;
   }
 
-  /* ===================== DB WRAPPERS ===================== */
+  /* ===================== DB ===================== */
 
   async function dbQuery(sql, params) {
     if (!pool || dbReady() !== true) return { rows: [] };
@@ -808,9 +745,7 @@ Return ONLY the reply text.
 
     try {
       await dbQuery(sql, vals);
-    } catch {
-      // ignore if schema doesn’t match (keeps engine resilient while you migrate DB)
-    }
+    } catch {}
   }
 
   async function getRecentNewsForUser(userId, limit = 6) {
@@ -834,7 +769,7 @@ Return ONLY the reply text.
     return rows || [];
   }
 
-  /* ===================== EMAIL (plug-in friendly) ===================== */
+  /* ===================== EMAIL ===================== */
 
   async function getConnectedEmailProviders(userId) {
     if (services?.email?.getConnectedProviders) {
@@ -877,16 +812,16 @@ Return ONLY the reply text.
     if (replyLatest) return { kind: "reply_latest", body: String(replyLatest[3] || "").trim() };
 
     const replyId = t.match(/reply to (message )?id\s+([a-zA-Z0-9_\-]+)[:\-]?\s*([\s\S]+)/i);
-    if (replyId)
+    if (replyId) {
       return {
         kind: "reply_id",
         messageId: String(replyId[2] || "").trim(),
         body: String(replyId[3] || "").trim(),
       };
+    }
 
     if (/(summari[sz]e).*(inbox|emails|email)/i.test(t)) return { kind: "summarize", scope: wantsAll ? "all" : "one" };
-    if (/(important|urgent).*(email|emails)|new important emails|unread emails|check my inbox/i.test(lower))
-      return { kind: "important", scope: wantsAll ? "all" : "one" };
+    if (/(important|urgent).*(email|emails)|new important emails|unread emails|check my inbox/i.test(lower)) return { kind: "important", scope: wantsAll ? "all" : "one" };
 
     const search = t.match(/search (my )?(email|gmail|inbox) for\s+([\s\S]+)/i);
     if (search) return { kind: "search", query: String(search[3] || "").trim(), scope: wantsAll ? "all" : "one" };
@@ -906,11 +841,7 @@ Return ONLY the reply text.
   }
 
   function cleanSnippet(s) {
-    return String(s || "")
-      .replace(/\r/g, "")
-      .replace(/\n+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+    return String(s || "").replace(/\r/g, "").replace(/\n+/g, " ").replace(/\s+/g, " ").trim();
   }
 
   function formatEmailList(items) {
@@ -927,7 +858,7 @@ Return ONLY the reply text.
     return lines.join("\n");
   }
 
-  /* ===================== LIVE CONTEXT (news + weather + stocks) ===================== */
+  /* ===================== LIVE CONTEXT ===================== */
 
   function compactLiveContextForDecision(liveContext) {
     if (!liveContext) return null;
@@ -953,7 +884,6 @@ Return ONLY the reply text.
     };
   }
 
-  // ✅ FIXED weather priority: city-in-text beats device coords
   async function buildLiveContext({ userId, text, lat, lon, userState }) {
     const live = { weather: null, location: null, news: [], stocks: null };
 
@@ -973,11 +903,6 @@ Return ONLY the reply text.
       _city_from_text: normalizePlaceName(cityInText) || null,
     };
 
-    // Priority:
-    // 1) explicit city in text => leave lat/lon null so we geocode the city
-    // 2) coords in text
-    // 3) device coords
-    // 4) last_city geocode later
     if (textCoords?.lat != null && textCoords?.lon != null) {
       loc.lat = textCoords.lat;
       loc.lon = textCoords.lon;
@@ -988,7 +913,6 @@ Return ONLY the reply text.
 
     live.location = loc;
 
-    // Weather
     if (services?.weather?.getLive) {
       try {
         live.weather = await services.weather.getLive({ userId, text, lat: loc.lat, lon: loc.lon, state: userState });
@@ -999,7 +923,6 @@ Return ONLY the reply text.
       let weatherRaw = null;
       let weatherGeo = null;
 
-      // 1) Explicit city in text
       if (isWx && loc._city_from_text) {
         const geo = await geocodeCity_OpenWeather(loc._city_from_text);
         if (geo?.lat != null && geo?.lon != null) {
@@ -1010,13 +933,11 @@ Return ONLY the reply text.
         }
       }
 
-      // 2) coords from text
       if (!weatherRaw && typeof loc.lat === "number" && typeof loc.lon === "number") {
         weatherRaw = await getWeather_OpenWeather(loc.lat, loc.lon);
         weatherGeo = await reverseGeocode_OpenWeather(loc.lat, loc.lon);
       }
 
-      // 3) last_city fallback (only if user asked weather and we still have nothing)
       if (!weatherRaw && isWx && loc.city) {
         const geo = await geocodeCity_OpenWeather(loc.city);
         if (geo?.lat != null && geo?.lon != null) {
@@ -1049,7 +970,6 @@ Return ONLY the reply text.
       }
     }
 
-    // LIVE NEWS
     const cc = String(live.location.country || "CA").toUpperCase();
 
     if (services?.news?.getLive) {
@@ -1109,7 +1029,6 @@ Return ONLY the reply text.
       live.news = userId ? await getRecentNewsForUser(userId, 6) : [];
     }
 
-    // Stocks
     const ticker = extractTicker(text);
     if (ticker && services?.stocks?.quote) {
       try {
@@ -1130,12 +1049,11 @@ Return ONLY the reply text.
     return live;
   }
 
-  /* ===================== PERSONALITY (SLOW ADAPTATION) ===================== */
+  /* ===================== VOICE PROFILE ===================== */
 
   function shouldRefreshVoiceProfile(userState) {
     const last = userState?.voice_profile_updated_at ? new Date(userState.voice_profile_updated_at).getTime() : 0;
-    const now = Date.now();
-    return !last || now - last > 7 * 24 * 60 * 60 * 1000;
+    return !last || Date.now() - last > 7 * 24 * 60 * 60 * 1000;
   }
 
   async function maybeUpdateVoiceProfile({ userId, userState, memory }) {
@@ -1153,22 +1071,23 @@ Return ONLY the reply text.
           });
         }
         return;
-      } catch {
-        return;
-      }
+      } catch {}
     }
 
-    const profile = "Prefers a calm, human tone. Short first; expands when asked. Direct, no hype.";
     await setUserStateFields(userId, {
-      voice_profile: profile,
+      voice_profile: "Prefers a calm, human tone. Short first; expands when needed. Direct, polished, no hype.",
       voice_profile_updated_at: new Date().toISOString(),
     });
   }
 
-  /* ===================== PROVIDERS: DECISION + REPLY ===================== */
+  /* ===================== OPENAI / GEMINI ===================== */
 
   function getOpenAIModelDecision() {
     return process.env.OPENAI_MODEL_DECISION || process.env.OPENAI_MODEL || "gpt-4o-mini";
+  }
+
+  function getOpenAIModelReply() {
+    return process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
   }
 
   function openAIBaseUrl() {
@@ -1198,18 +1117,18 @@ Return ONLY the reply text.
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-    const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 20000);
-    const { controller, cancel } = withTimeout(timeoutMs);
+    const { controller, cancel } = withTimeout(Number(process.env.OPENAI_TIMEOUT_MS || 22000));
 
     const prompt = `
 You are LXT-1 (Loravo decision engine).
-Return ONLY one JSON object matching the schema EXACTLY. JSON only.
+Return ONLY one JSON object matching the schema EXACTLY.
 
 Rules:
-- Use ONLY: user message + memory + provided live context.
-- Do NOT invent breaking news or facts.
-- Be calm and realistic. If uncertain: verdict="HOLD", confidence around 0.6.
-- Keep one_liner human, not robotic.
+- Use only the user message, memory, and provided live context.
+- Be calm and realistic.
+- Do not invent facts.
+- If uncertain, use HOLD with moderate confidence.
+- Keep one_liner human and sharp.
 `.trim();
 
     try {
@@ -1230,8 +1149,8 @@ Rules:
       });
 
       if (!resp.ok) throw new Error(await resp.text());
-      const data = await resp.json();
 
+      const data = await resp.json();
       const outText = parseOpenAIResponsesText(data);
       const obj = extractFirstJSONObject(outText);
       if (!obj) throw new Error("OpenAI returned no JSON");
@@ -1267,7 +1186,7 @@ Rules:
     if (!key) throw new Error("Missing GEMINI_API_KEY");
 
     const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
-    const replyTokens = pickReplyTokens(userText);
+    const replyTokens = pickReplyTokens(userText, false);
 
     if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
 
@@ -1275,7 +1194,7 @@ Rules:
 
     const payload = {
       userText: String(userText || ""),
-      length_hint: lengthHintForReply(userText),
+      length_hint: lengthHintForReply(userText, false),
       lxt_brief: lxt1
         ? {
             verdict: lxt1?.verdict || null,
@@ -1308,32 +1227,26 @@ Rules:
       if (!r.ok) throw new Error(await r.text());
       const j = await r.json();
       return (j?.choices?.[0]?.message?.content || "").trim() || "Got you. What do you want to do next?";
-    } catch (e) {
-      if (String(e?.name || "").toLowerCase().includes("abort")) return "One sec — try that again.";
-      throw e;
     } finally {
       cancel();
     }
   }
 
-  // ✅ OpenAI reply using MASTER CHAT PROMPT (+ optional vision images)
   async function callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
-    const model = process.env.OPENAI_MODEL_REPLY || process.env.OPENAI_MODEL || "gpt-4o-mini";
+    const model = getOpenAIModelReply();
     if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
 
     const system = LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile);
-
     const imgs = normalizeImages(images);
     const hasImages = Array.isArray(imgs) && imgs.length > 0;
-
     const t = String(userText || "").trim();
 
     const payload = {
       userText: t || (hasImages ? "What is this?" : ""),
-      length_hint: lengthHintForReply(t),
+      length_hint: lengthHintForReply(t, hasImages),
       lxt_brief: lxt1
         ? {
             verdict: lxt1?.verdict || null,
@@ -1348,23 +1261,27 @@ Rules:
     };
 
     const userContent = [{ type: "input_text", text: JSON.stringify(payload) }];
-    for (const url of imgs.slice(0, 4)) userContent.push({ type: "input_image", image_url: url });
+    for (const url of imgs.slice(0, 4)) {
+      userContent.push({ type: "input_image", image_url: url });
+    }
 
-    const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS_REPLY || process.env.OPENAI_TIMEOUT_MS || 30000);
-    const { controller, cancel } = withTimeout(timeoutMs);
+    const { controller, cancel } = withTimeout(Number(process.env.OPENAI_TIMEOUT_MS_REPLY || process.env.OPENAI_TIMEOUT_MS || 32000));
 
     try {
       const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
         method: "POST",
         signal: controller.signal,
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
         body: JSON.stringify({
           model,
           input: [
             { role: "system", content: system },
             { role: "user", content: userContent },
           ],
-          max_output_tokens: 1200,
+          max_output_tokens: pickReplyTokens(t, hasImages),
           temperature: 0.7,
         }),
       });
@@ -1373,11 +1290,7 @@ Rules:
 
       const data = await resp.json();
       const outText = parseOpenAIResponsesText(data);
-
       return outText.trim() || "Got you — what do you want to do next?";
-    } catch (e) {
-      if (String(e?.name || "").toLowerCase().includes("abort")) return "One sec — try that again.";
-      throw e;
     } finally {
       cancel();
     }
@@ -1401,21 +1314,22 @@ Rules:
       return { reply, replyProvider: "gemini", tried: ["gemini"] };
     }
 
+    // trinity = OPENAI first now
     try {
-      const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
-      return { reply, replyProvider: "gemini", tried: ["gemini"] };
-    } catch (e) {
       const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+      return { reply, replyProvider: "openai", tried: ["openai"] };
+    } catch (e) {
+      const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
       return {
         reply,
-        replyProvider: "openai_fallback",
-        tried: ["gemini", "openai"],
+        replyProvider: "gemini_fallback",
+        tried: ["openai", "gemini"],
         _reply_error: String(e?.message || e),
       };
     }
   }
 
-  /* ===================== TRINITY ORCHESTRATION ===================== */
+  /* ===================== DECISION ===================== */
 
   async function getDecision({ provider, text, memory, liveContextCompact, maxTokens }) {
     const tried = [];
@@ -1426,12 +1340,10 @@ Rules:
       return { lxt1, decisionProvider: "openai", tried };
     }
 
-    if (provider === "gemini") {
-      if (services?.gemini?.decision) {
-        tried.push("gemini");
-        const lxt1 = await services.gemini.decision({ text, memory, liveContextCompact, maxTokens, schema: LXT1_SCHEMA });
-        return { lxt1: sanitizeToSchema(lxt1), decisionProvider: "gemini", tried };
-      }
+    if (provider === "gemini" && services?.gemini?.decision) {
+      tried.push("gemini");
+      const lxt1 = await services.gemini.decision({ text, memory, liveContextCompact, maxTokens });
+      return { lxt1: sanitizeToSchema(lxt1), decisionProvider: "gemini", tried };
     }
 
     try {
@@ -1441,9 +1353,10 @@ Rules:
     } catch (openaiErr) {
       if (services?.gemini?.decision) {
         tried.push("gemini");
-        const lxt1 = await services.gemini.decision({ text, memory, liveContextCompact, maxTokens, schema: LXT1_SCHEMA });
+        const lxt1 = await services.gemini.decision({ text, memory, liveContextCompact, maxTokens });
         return { lxt1: sanitizeToSchema(lxt1), decisionProvider: "gemini", tried, _openai_error: String(openaiErr) };
       }
+
       return {
         lxt1: safeFallbackResult("Provider failed — try again shortly."),
         decisionProvider: "fallback",
@@ -1453,12 +1366,173 @@ Rules:
     }
   }
 
-  /* ===================== FAST PATHS (EMAIL / NEWS / WEATHER / STOCKS / CHAT) ===================== */
+  /* ===================== ENRICHED FAST HELPERS ===================== */
+
+  async function handleWeatherIntent({ text, liveContext, voiceProfile }) {
+    if (!liveContext?.weather) {
+      const coords = extractCoordinatesFromText(text);
+      const city = extractCityFromWeatherText(text);
+
+      if (coords) return `Got it — weather for ${coords.lat}, ${coords.lon}. I just need the live weather service wired or the weather key enabled.`;
+      if (city) return `I can give you the weather for ${city} as soon as the live weather feed is available.`;
+      return "Tell me the city, or allow location, and I’ll give you the live weather.";
+    }
+
+    return await callOpenAIReply({
+      userText: `
+Answer the user's weather question directly using the live weather context.
+If they asked for weather in a place, give:
+- current condition
+- current temp
+- short useful outlook for today
+- one practical note if relevant
+Keep it natural and polished.
+User question: ${text}
+      `.trim(),
+      images: [],
+      lxt1: null,
+      voiceProfile,
+      liveContext,
+      lastReplyHint: "",
+    });
+  }
+
+  async function handleWeatherSourceIntent() {
+    return "I’m using your location if you shared it, or the exact city/coordinates you asked for, then pulling a live weather read for that place.";
+  }
+
+  async function handleStocksIntent({ text, liveContext }) {
+    const ticker = extractTicker(text);
+    if (!ticker) return "Which ticker? Example: $TSLA or price of AAPL.";
+
+    if (liveContext?.stocks) {
+      const q = liveContext.stocks;
+      const price = q?.price != null ? q.price : q?.c ?? null;
+      const chg = q?.change_pct != null ? q.change_pct : q?.dp ?? null;
+      const asof = q?.asof || q?.t || null;
+
+      if (price != null && chg != null) {
+        return `${ticker} is around ${price} (${chg >= 0 ? "+" : ""}${Math.round(chg * 100) / 100}%).${asof ? ` (${asof})` : ""}`;
+      }
+      if (price != null) return `${ticker} is around ${price}.`;
+      return `I pulled data for ${ticker}, but it came back incomplete.`;
+    }
+
+    return `I can check ${ticker}, but the stocks service isn’t connected yet.`;
+  }
+
+  async function handleNewsIntent({ userId, memory, liveContext, voiceProfile, userText }) {
+    const items = Array.isArray(liveContext?.news) ? liveContext.news : [];
+    if (!items.length) return "I’m not seeing anything strong enough to call out right now. Give me a city or topic and I’ll lock in tighter.";
+
+    if (services?.news?.summarizeForChat) {
+      try {
+        return await services.news.summarizeForChat({ userId, memory, items });
+      } catch {}
+    }
+
+    return await callOpenAIReply({
+      userText: `
+The user is asking about news.
+Use the provided live news context and answer like a strong premium assistant.
+What to do:
+- summarize what actually matters
+- keep the user ahead
+- if relevant, include implication + one move
+User question: ${userText}
+      `.trim(),
+      images: [],
+      lxt1: null,
+      voiceProfile,
+      liveContext,
+      lastReplyHint: "",
+    });
+  }
+
+  async function handleAffectsMeIntent({ text, liveContext, voiceProfile }) {
+    return await callOpenAIReply({
+      userText: `
+The user asks how something affects them.
+Answer with:
+1) what changes
+2) when it matters
+3) what to do today
+4) one watchout
+Be concrete but don't invent exact unsupported numbers.
+User question: ${text}
+      `.trim(),
+      images: [],
+      lxt1: null,
+      voiceProfile,
+      liveContext,
+      lastReplyHint: "",
+    });
+  }
+
+  async function handleDailyBrief({ planTier, liveContext, voiceProfile }) {
+    const gate = requireFeatureOrTease({
+      tier: planTier,
+      feature: "daily_brief",
+      tease: "I can give you a daily brief. That’s Plus. Want me to unlock it?",
+    });
+    if (!gate.ok) return gate.reply;
+
+    return await callOpenAIReply({
+      userText: `Create a daily brief using the live context. Keep it sharp, useful, and polished.`,
+      images: [],
+      lxt1: null,
+      voiceProfile,
+      liveContext,
+      lastReplyHint: "",
+    });
+  }
+
+  async function handleSignalScan({ planTier, userId, liveContext, voiceProfile }) {
+    const gate = requireFeatureOrTease({
+      tier: planTier,
+      feature: "signal_scan",
+      tease: "I can scan signals and tell you what actually matters — that’s Pro. Want me to unlock it?",
+    });
+    if (!gate.ok) return gate.reply;
+
+    const scan = services?.signals?.scan ? await services.signals.scan({ userId, liveContext }) : null;
+
+    return await callOpenAIReply({
+      userText: `Do a signal scan. Pull out the real signals, the best move today, and one watchout.`,
+      images: [],
+      lxt1: null,
+      voiceProfile,
+      liveContext: { ...liveContext, scan },
+      lastReplyHint: "",
+    });
+  }
+
+  async function handleShoppingIntent({ userId, text, userState, voiceProfile, liveContext }) {
+    const lastLabel = normalizePlaceName(userState?.last_image_label) || null;
+
+    return await callOpenAIReply({
+      userText: `
+User asked a buying/finding question: "${text}"
+If there is a last image label, assume that is what they mean.
+Give:
+- the most likely thing to search
+- 3–5 practical places/options
+- a strong search phrase
+- one focused follow-up only if needed
+last_image_label: ${lastLabel || "none"}
+      `.trim(),
+      images: [],
+      lxt1: null,
+      voiceProfile,
+      liveContext,
+      lastReplyHint: "",
+    });
+  }
 
   async function handleEmailIntent({ userId, text, planTier }) {
     if (!userId) {
       return {
-        reply: "To use email, I need your user_id (the same one you connected with).",
+        reply: "To use email, I need your user_id, the same one you connected with.",
         payload: { provider: "loravo_email", mode: "instant", lxt1: null },
       };
     }
@@ -1479,15 +1553,13 @@ Rules:
         feature: "inbox_summarize",
         tease: "I can summarize your inbox and pull out what matters — that’s Plus. Want me to unlock it?",
       });
-      if (!gate.ok) {
-        return { reply: gate.reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
-      }
+      if (!gate.ok) return { reply: gate.reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
     }
 
     const connected = await getConnectedEmailProviders(userId);
     if (!connected.length) {
       return {
-        reply: "No email account is connected yet. Connect Gmail/Outlook/Yahoo first, then try again.",
+        reply: "No email account is connected yet. Connect Gmail, Outlook, or Yahoo first.",
         payload: { provider: "loravo_email", mode: "instant", lxt1: null },
       };
     }
@@ -1533,10 +1605,7 @@ Rules:
 
     function wantsAllInboxesFromText(t) {
       const s = String(t || "").toLowerCase();
-      return (
-        /\b(all|every|all my|all of my|across all|across)\b/.test(s) &&
-        /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(s)
-      );
+      return /\b(all|every|all my|all of my|across all|across)\b/.test(s) && /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(s);
     }
 
     const allMode = cmd?.scope === "all" || wantsAllInboxesFromText(text);
@@ -1563,14 +1632,15 @@ Rules:
       }
 
       const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, max }));
-      const reply = !items?.length ? "No emails found." : `Latest emails (${used}):\n\n${formatEmailList(items)}`;
-      return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      return {
+        reply: !items?.length ? "No emails found." : `Latest emails (${used}):\n\n${formatEmailList(items)}`,
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
     if (cmd.kind === "important") {
       if (allMode) {
         const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 }));
-
         const blocks = all.map((x) => {
           if (!x.ok) return `=== ${x.provider} ===\nError: ${x.err}`;
           const items = x.res || [];
@@ -1583,25 +1653,19 @@ Rules:
         };
       }
 
-      const { provider: used, res: items } = await tryProviders((p) =>
-        emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 })
-      );
-
-      const reply =
-        !items?.length
+      const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d is:unread", max: 6 }));
+      return {
+        reply: !items?.length
           ? "No unread emails in the last 7 days."
-          : `Here are your top unread emails (${used}):\n\n${formatEmailList(items)}\n\nSay: “summarize my inbox” or “reply to latest email: …”`;
-
-      return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+          : `Here are your top unread emails (${used}):\n\n${formatEmailList(items)}\n\nSay “summarize my inbox” or “reply to latest email: …”`,
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
     if (cmd.kind === "summarize") {
       if (allMode) {
         const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d", max: 8 }));
-
-        const compact = all
-          .filter((x) => x.ok && Array.isArray(x.res) && x.res.length)
-          .map((x) => ({ provider: x.provider, items: x.res.slice(0, 8) }));
+        const compact = all.filter((x) => x.ok && Array.isArray(x.res) && x.res.length).map((x) => ({ provider: x.provider, items: x.res.slice(0, 8) }));
 
         if (!compact.length) {
           return {
@@ -1610,10 +1674,11 @@ Rules:
           };
         }
 
-        const summary = await callGeminiReply({
-          userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(compact)}`,
+        const summary = await callOpenAIReply({
+          userText: `Summarize these emails in clear bullets. Pull out urgency, key actions, and anything important.\n\n${JSON.stringify(compact)}`,
+          images: [],
           lxt1: null,
-          voiceProfile: "Calm, human, direct. Bullet-friendly. No robotic phrasing.",
+          voiceProfile: "Calm, sharp, concise, useful.",
           liveContext: {},
           lastReplyHint: "",
         });
@@ -1624,10 +1689,7 @@ Rules:
         };
       }
 
-      const { provider: used, res: items } = await tryProviders((p) =>
-        emailSvc.list({ provider: p, userId, q: "newer_than:7d", max: 8 })
-      );
-
+      const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d", max: 8 }));
       if (!items?.length) {
         return {
           reply: "No emails found in the last 7 days.",
@@ -1635,30 +1697,27 @@ Rules:
         };
       }
 
-      const summary = await callGeminiReply({
-        userText: `Summarize these emails in 4–7 tight bullets. Pull out anything urgent and the next action.\n\n${JSON.stringify(items.slice(0, 8))}`,
+      const summary = await callOpenAIReply({
+        userText: `Summarize these emails in clear bullets. Pull out urgency, key actions, and anything important.\n\n${JSON.stringify(items.slice(0, 8))}`,
+        images: [],
         lxt1: null,
-        voiceProfile: "Calm, human, direct. Bullet-friendly. No robotic phrasing.",
+        voiceProfile: "Calm, sharp, concise, useful.",
         liveContext: {},
         lastReplyHint: "",
       });
 
-      return { reply: `${summary}\n\n(Provider: ${used})`, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      return {
+        reply: `${summary}\n\n(Provider: ${used})`,
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
     if (cmd.kind === "search") {
       const q = cmd.query || "";
-
-      const listArgs = {
-        userId,
-        q: q ? `newer_than:180d ${q}` : "newer_than:30d",
-        max: 6,
-        disable_orderby: true,
-      };
+      const listArgs = { userId, q: q ? `newer_than:180d ${q}` : "newer_than:30d", max: 6, disable_orderby: true };
 
       if (allMode) {
         const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, ...listArgs }));
-
         const blocks = all.map((x) => {
           if (!x.ok) return `=== ${x.provider} ===\nError: ${x.err}`;
           const items = x.res || [];
@@ -1672,14 +1731,16 @@ Rules:
       }
 
       const { provider: used, res: items } = await tryProviders((p) => emailSvc.list({ provider: p, ...listArgs }));
-      const reply = !items?.length ? `No matches for: "${q}".` : `Top matches (${used}):\n\n${formatEmailList(items)}`;
-      return { reply, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
+      return {
+        reply: !items?.length ? `No matches for: "${q}".` : `Top matches (${used}):\n\n${formatEmailList(items)}`,
+        payload: { provider: "loravo_email", mode: "instant", lxt1: null },
+      };
     }
 
     if (cmd.kind === "send") {
       if (!cmd.to || !cmd.body) {
         return {
-          reply: "Send format: `send email to someone@email.com subject Your subject body Your message`",
+          reply: "Send format: send email to someone@email.com subject Your subject body Your message",
           payload: { provider: "loravo_email", mode: "instant", lxt1: null },
         };
       }
@@ -1698,6 +1759,7 @@ Rules:
       const { provider: used, res: info } = await tryProviders((p) =>
         emailSvc.replyLatest({ provider: p, userId, body: cmd.body || "" })
       );
+
       return {
         reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`,
         payload: { provider: "loravo_email", mode: "instant", lxt1: null },
@@ -1708,192 +1770,28 @@ Rules:
       const { provider: used, res: info } = await tryProviders((p) =>
         emailSvc.replyById({ provider: p, userId, messageId: cmd.messageId, body: cmd.body || "" })
       );
+
       return {
         reply: `Replied. ✅ (${used})\nMessage id: ${info?.id || "ok"}`,
         payload: { provider: "loravo_email", mode: "instant", lxt1: null },
       };
     }
 
-    const hint =
-      "Tell me what you want:\n" +
-      "- “new important emails”\n" +
-      "- “summarize my inbox” (Plus)\n" +
-      "- “search my email for paypal”\n" +
-      "- “send email to a@b.com subject Hi body Hello…”\n" +
-      "- “reply to latest email: …”\n" +
-      "- “use outlook” / “use gmail” / “use yahoo”\n" +
-      "- “list my latest 5 emails”\n" +
-      "- “list my latest 5 emails across all inboxes”";
-
-    return { reply: hint, payload: { provider: "loravo_email", mode: "instant", lxt1: null } };
-  }
-
-  async function handleWeatherIntent({ text, liveContext }) {
-    if (liveContext?.weather) {
-      const one = formatWeatherOneLiner(liveContext.weather, liveContext?.location?.city || null);
-      return one || "Tell me the city (or send coordinates) and I’ll pull it.";
-    }
-
-    const coords = extractCoordinatesFromText(text);
-    const city = extractCityFromWeatherText(text);
-
-    if (coords) return `Got it — weather for ${coords.lat}, ${coords.lon}. One sec (enable OPENWEATHER_API_KEY or wire services.weather.getLive).`;
-    if (city) return `Which one do you want for ${city}: right now, next 24 hours, or 7-day?`;
-
-    return "Which city (or drop coordinates like `53.5461,-113.4938`)? If you allow location, I’ll use your current spot automatically.";
-  }
-
-  async function handleWeatherSourceIntent() {
-    return "I’m using your current location (if you shared it) and a live forecast feed. If you ask a city or coordinates, I pull it for that exact place.";
-  }
-
-  async function handleStocksIntent({ text, liveContext }) {
-    const ticker = extractTicker(text);
-    if (!ticker) return "Which ticker? (Example: “$TSLA” or “price of AAPL”)";
-
-    if (liveContext?.stocks) {
-      const q = liveContext.stocks;
-      const price = q?.price != null ? q.price : q?.c ?? null;
-      const chg = q?.change_pct != null ? q.change_pct : q?.dp ?? null;
-      const asof = q?.asof || q?.t || null;
-
-      if (price != null && chg != null)
-        return `${ticker} is around ${price} (${chg >= 0 ? "+" : ""}${Math.round(chg * 100) / 100}%).${asof ? ` (${asof})` : ""}`;
-      if (price != null) return `${ticker} is around ${price}.`;
-      return `I pulled data for ${ticker}, but it’s incomplete.`;
-    }
-
-    return `I can check ${ticker}, but stocks service isn’t connected yet.`;
-  }
-
-  async function handleNewsIntent({ userId, memory, liveContext, voiceProfile, userText }) {
-    const items = Array.isArray(liveContext?.news) ? liveContext.news : [];
-    if (!items.length) return "I’m not seeing anything solid to call out right now. Tell me the city/topic and I’ll lock it in.";
-
-    const aheadMode = /(what happened|what’s happening|whats happening|what is new|what’s going on|whats going on)/i.test(String(userText || ""));
-
-    const prompt = aheadMode
-      ? `Summarize what’s going on in a way that keeps the user ahead.
-Format (tight):
-- Before: 1 line
-- Now: 1–2 lines
-- Next: 1 line (24–72h)
-- One move: 1 line (today)
-Use only the provided items. Don’t invent facts.
-
-Items:
-${JSON.stringify(items.slice(0, 7))}`
-      : `Summarize these news items in 1–3 short sentences. If anything is severe, include one next step.\n\n${JSON.stringify(items.slice(0, 5))}`;
-
-    if (services?.news?.summarizeForChat) {
-      try {
-        return await services.news.summarizeForChat({ userId, memory, items });
-      } catch {}
-    }
-
-    return await callGeminiReply({
-      userText: prompt,
-      lxt1: null,
-      voiceProfile,
-      liveContext: {},
-      lastReplyHint: "",
-    });
-  }
-
-  async function handleAffectsMeIntent({ text, liveContext, voiceProfile }) {
-    const payload = {
-      question: text,
-      location: liveContext?.location || {},
-      weather: liveContext?.weather || null,
-      news: Array.isArray(liveContext?.news) ? liveContext.news.slice(0, 8) : [],
-      stocks: liveContext?.stocks || null,
+    return {
+      reply:
+        "Tell me what you want:\n" +
+        "- new important emails\n" +
+        "- summarize my inbox\n" +
+        "- search my email for paypal\n" +
+        "- send email to a@b.com subject Hi body Hello\n" +
+        "- reply to latest email: ...\n" +
+        "- use outlook / use gmail / use yahoo\n" +
+        "- list my latest 5 emails",
+      payload: { provider: "loravo_email", mode: "instant", lxt1: null },
     };
-
-    return await callGeminiReply({
-      userText: `
-You are LXT. The user asks: "how does this affect me?"
-Do NOT claim exact numbers. Use directional estimates and realistic ranges.
-Output style:
-- 2–5 short sentences
-- include: (1) what changes, (2) when, (3) what to do today, (4) one watchout
-Cause→effect chains.
-If speculative, say it’s speculative.
-Context:
-${JSON.stringify(payload)}
-`.trim(),
-      lxt1: null,
-      voiceProfile,
-      liveContext: {},
-      lastReplyHint: "",
-    });
   }
 
-  async function handleDailyBrief({ planTier, liveContext, voiceProfile }) {
-    const gate = requireFeatureOrTease({
-      tier: planTier,
-      feature: "daily_brief",
-      tease: "I can give you a daily brief (news + weather + what to do today). That’s Plus. Want me to unlock it?",
-    });
-    if (!gate.ok) return gate.reply;
-
-    const brief = await callGeminiReply({
-      userText: `Create a daily brief. Keep it human and tight.\nInclude:\n1) What's important (max 3 bullets)\n2) What to do today (max 3 bullets)\n3) One watchout (1 line)\n\nContext:\n${JSON.stringify(liveContext)}`,
-      lxt1: null,
-      voiceProfile,
-      liveContext,
-      lastReplyHint: "",
-    });
-
-    return brief;
-  }
-
-  async function handleSignalScan({ planTier, userId, liveContext, voiceProfile }) {
-    const gate = requireFeatureOrTease({
-      tier: planTier,
-      feature: "signal_scan",
-      tease: "I can scan signals (news + stocks + local conditions) and tell you what matters — that’s Pro. Want me to unlock it?",
-    });
-    if (!gate.ok) return gate.reply;
-
-    const scan = services?.signals?.scan ? await services.signals.scan({ userId, liveContext }) : null;
-
-    const reply = await callGeminiReply({
-      userText: `Do a signal scan.\nOutput:\n- 2–4 key signals\n- 1–2 moves today\n- 1 watchout\nKeep it calm and human.\n\n${JSON.stringify({ liveContext, scan })}`,
-      lxt1: null,
-      voiceProfile,
-      liveContext,
-      lastReplyHint: "",
-    });
-
-    return reply;
-  }
-
-  async function handleShoppingIntent({ userId, text, userState, voiceProfile }) {
-    const lastLabel = normalizePlaceName(userState?.last_image_label) || null;
-
-    const prompt = `
-User asked a buying/finding question: "${text}"
-If you have a last_image_label, assume that’s what they mean.
-
-Rules:
-- Give 3–5 concrete ways to find/buy it (local + online + keywords).
-- Include a search phrase the user can copy.
-- Ask ONLY one targeted follow-up (size/material/tradition) if needed.
-- Keep it 3–7 short lines max.
-
-last_image_label: ${lastLabel || "none"}
-`.trim();
-
-    return await callGeminiReply({
-      userText: prompt,
-      lxt1: null,
-      voiceProfile: voiceProfile || "Calm, human, direct. No filler.",
-      liveContext: {},
-      lastReplyHint: "",
-    });
-  }
-
-  /* ===================== MAIN ENGINE: runLXT ===================== */
+  /* ===================== MAIN ===================== */
 
   async function runLXT({ req, forceDecision = false, forceIntent = null }) {
     const provider = getProvider(req);
@@ -1908,7 +1806,13 @@ last_image_label: ${lastLabel || "none"}
     const trimmedText = rawText.trim();
 
     if (!trimmedText && !hasImages) {
-      const base = { provider: "loravo_fastpath", mode: "instant", reply: "Hey — what’s on your mind?", lxt1: null, _errors: {} };
+      const base = {
+        provider: "loravo_fastpath",
+        mode: "instant",
+        reply: "Hello! What do you want help with?",
+        lxt1: null,
+        _errors: {},
+      };
       if (defaults?.include_provider_meta === false) return base;
       return {
         ...base,
@@ -1916,11 +1820,8 @@ last_image_label: ${lastLabel || "none"}
       };
     }
 
-    if (!trimmedText && hasImages) {
-      text = "What is this?";
-    } else {
-      text = trimmedText;
-    }
+    if (!trimmedText && hasImages) text = "What is this?";
+    else text = trimmedText;
 
     const userId = String(user_id || "").trim() || null;
 
@@ -1953,7 +1854,7 @@ last_image_label: ${lastLabel || "none"}
     if (forceIntent) intent = String(forceIntent);
     if (forceDecision) intent = "decision";
 
-    if (mode === "auto") mode = pickAutoMode(text);
+    if (mode === "auto") mode = pickAutoMode(text, hasImages);
     const maxTokens = TOKEN_LIMITS[mode] || TOKEN_LIMITS.auto;
 
     const liveContext = await buildLiveContext({
@@ -1967,10 +1868,7 @@ last_image_label: ${lastLabel || "none"}
     const liveCompact = compactLiveContextForDecision(liveContext);
 
     let topic = detectTopic(text, hasImages);
-    if (isMoreOnly(text) && state2?.last_topic) {
-      topic = state2.last_topic;
-      if (!forceDecision && intent === "chat") intent = "chat";
-    }
+    if (isMoreOnly(text) && state2?.last_topic) topic = state2.last_topic;
     if (userId) await setUserStateFields(userId, { last_topic: topic });
 
     if (isPoweredByQuestion(text)) {
@@ -1985,7 +1883,7 @@ last_image_label: ${lastLabel || "none"}
           confidence: 0.9,
           one_liner: "Identity request.",
           signals: [],
-          actions: [{ now: "Ask what they want to do", time: "today", effort: "low" }],
+          actions: [{ now: "Ask what they want to do next", time: "today", effort: "low" }],
           watchouts: [],
           next_check: safeNowPlus(6 * 60 * 60 * 1000),
         }),
@@ -1993,7 +1891,6 @@ last_image_label: ${lastLabel || "none"}
       };
 
       if (defaults?.include_provider_meta === false) return base;
-
       return {
         ...base,
         providers: { decision: "fastpath", reply: "fastpath", triedDecision: ["fastpath"], triedReply: ["fastpath"] },
@@ -2007,7 +1904,7 @@ last_image_label: ${lastLabel || "none"}
         const base = {
           provider: "loravo_fastpath",
           mode: "instant",
-          reply: "Hey — what’s on your mind?",
+          reply: "Hello! What do you want help with?",
           lxt1: null,
           _errors: {},
         };
@@ -2019,12 +1916,19 @@ last_image_label: ${lastLabel || "none"}
       }
 
       if (intent === "shopping") {
-        const reply = await handleShoppingIntent({ userId, text, userState: state2 || {}, voiceProfile: finalVoiceProfile });
+        const reply = await handleShoppingIntent({
+          userId,
+          text,
+          userState: state2 || {},
+          voiceProfile: finalVoiceProfile,
+          liveContext,
+        });
+
         const base = { provider: "loravo_shop", mode: "instant", reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "shop_fast", reply: "gemini", triedDecision: ["shop_fast"], triedReply: ["gemini"] },
+          providers: { decision: "shop_fast", reply: "openai", triedDecision: ["shop_fast"], triedReply: ["openai"] },
         };
       }
 
@@ -2034,7 +1938,7 @@ last_image_label: ${lastLabel || "none"}
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "brief_fast", reply: "gemini", triedDecision: ["brief_fast"], triedReply: ["gemini"] },
+          providers: { decision: "brief_fast", reply: "openai", triedDecision: ["brief_fast"], triedReply: ["openai"] },
         };
       }
 
@@ -2044,7 +1948,7 @@ last_image_label: ${lastLabel || "none"}
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "signal_fast", reply: "gemini", triedDecision: ["signal_fast"], triedReply: ["gemini"] },
+          providers: { decision: "signal_fast", reply: "openai", triedDecision: ["signal_fast"], triedReply: ["openai"] },
         };
       }
 
@@ -2084,12 +1988,12 @@ last_image_label: ${lastLabel || "none"}
       }
 
       if (intent === "weather") {
-        const reply = await handleWeatherIntent({ text, liveContext });
+        const reply = await handleWeatherIntent({ text, liveContext, voiceProfile: finalVoiceProfile });
         const base = { provider: "loravo_weather", mode: "instant", reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "weather_fast", reply: "weather_fast", triedDecision: ["weather_fast"], triedReply: ["weather_fast"] },
+          providers: { decision: "weather_fast", reply: "openai", triedDecision: ["weather_fast"], triedReply: ["openai"] },
         };
       }
 
@@ -2111,11 +2015,12 @@ last_image_label: ${lastLabel || "none"}
           voiceProfile: finalVoiceProfile,
           userText: text,
         });
+
         const base = { provider: "loravo_news", mode, reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "news_fast", reply: "news_fast", triedDecision: ["news_fast"], triedReply: ["news_fast"] },
+          providers: { decision: "news_fast", reply: "openai", triedDecision: ["news_fast"], triedReply: ["openai"] },
         };
       }
 
@@ -2126,7 +2031,7 @@ last_image_label: ${lastLabel || "none"}
           if (defaults?.include_provider_meta === false) return base;
           return {
             ...base,
-            providers: { decision: "impact_fast", reply: "gemini", triedDecision: ["impact_fast"], triedReply: ["gemini"] },
+            providers: { decision: "impact_fast", reply: "fastpath", triedDecision: ["impact_fast"], triedReply: ["fastpath"] },
           };
         }
 
@@ -2135,14 +2040,14 @@ last_image_label: ${lastLabel || "none"}
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "impact_fast", reply: "gemini", triedDecision: ["impact_fast"], triedReply: ["gemini"] },
+          providers: { decision: "impact_fast", reply: "openai", triedDecision: ["impact_fast"], triedReply: ["openai"] },
         };
       }
 
       if (intent === "chat") {
         const lxt1ForChat = sanitizeToSchema({
           verdict: "HOLD",
-          confidence: 0.82,
+          confidence: 0.84,
           one_liner: "General chat.",
           signals: [],
           actions: [],
@@ -2152,14 +2057,14 @@ last_image_label: ${lastLabel || "none"}
 
         const imageHint =
           isBuyOrFindQuestion(text) && normalizePlaceName(state2?.last_image_label)
-            ? `Context: The user previously shared an image labeled: "${state2.last_image_label}". Assume that’s what "one" refers to.`
+            ? `The user previously shared an image labeled: "${state2.last_image_label}". If they say "one" or "this", assume they mean that item.`
             : "";
 
-        const lastReplyHint = [state2?.last_alert_hash ? "Rephrase; avoid repeating last wording." : "", imageHint].filter(Boolean).join(" ");
+        const lastReplyHint = [state2?.last_alert_hash ? "Rephrase; avoid repeating the same wording." : "", imageHint].filter(Boolean).join(" ");
 
         const expandedUserText =
           isMoreOnly(text) && topic?.kind
-            ? `User said "more". Continue deeper on the last topic: ${topic.kind}. Expand naturally with details and examples if relevant.`
+            ? `The user said "more". Continue deeper on the previous topic: ${topic.kind}.`
             : text;
 
         const voice = await getHumanReply({
@@ -2175,11 +2080,21 @@ last_image_label: ${lastLabel || "none"}
         if (userId && hasImages && voice?.reply) {
           const label = firstLineLabel(voice.reply);
           if (label) {
-            await setUserStateFields(userId, { last_image_label: label, last_image_at: new Date().toISOString() });
+            await setUserStateFields(userId, {
+              last_image_label: label,
+              last_image_at: new Date().toISOString(),
+            });
           }
         }
 
-        const base = { provider, mode, reply: voice.reply, lxt1: null, _errors: { reply: voice._reply_error } };
+        const base = {
+          provider,
+          mode,
+          reply: voice.reply,
+          lxt1: null,
+          _errors: { reply: voice._reply_error },
+        };
+
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
@@ -2237,7 +2152,10 @@ last_image_label: ${lastLabel || "none"}
     if (userId && hasImages && voice?.reply) {
       const label = firstLineLabel(voice.reply);
       if (label) {
-        await setUserStateFields(userId, { last_image_label: label, last_image_at: new Date().toISOString() });
+        await setUserStateFields(userId, {
+          last_image_label: label,
+          last_image_at: new Date().toISOString(),
+        });
       }
     }
 
@@ -2265,7 +2183,7 @@ last_image_label: ${lastLabel || "none"}
     };
   }
 
-  /* ===================== PROACTIVE INSIGHTS (WORKER-READY, LEVEL 3) ===================== */
+  /* ===================== PROACTIVE ===================== */
 
   async function generateProactiveInsights({ userId, lat = null, lon = null }) {
     const state = await loadUserState(userId);
@@ -2288,15 +2206,14 @@ last_image_label: ${lastLabel || "none"}
       } catch {}
     }
 
-    const out = await callGeminiReply({
-      userText: `Generate up to 2 proactive insights for the user.
-Rules:
-- Only if truly useful.
-- Each insight must include: title, why, action.
-- If nothing urgent: return "NONE".
-
-Context:
-${JSON.stringify(liveContext)}`,
+    const out = await callOpenAIReply({
+      userText: `
+Generate up to 2 proactive insights for the user.
+Only if truly useful.
+Each insight should include: title, why, action.
+If nothing matters, return NONE.
+      `.trim(),
+      images: [],
       lxt1: null,
       voiceProfile: (state?.voice_profile || "") + " Proactive. Only notify when it matters.",
       liveContext,
@@ -2316,12 +2233,9 @@ ${JSON.stringify(liveContext)}`,
     ];
   }
 
-  /* ===================== PUBLIC API ===================== */
-
   return {
     runLXT,
     generateProactiveInsights,
-
     _internals: {
       classifyIntent,
       pickAutoMode,
