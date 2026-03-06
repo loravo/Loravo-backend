@@ -4,16 +4,21 @@
  * ✅ index.js wires HTTP endpoints + DB + push + routes.
  *
  * ✅ FIXES in this version:
- * - Weather priority is now ACTUALLY correct:
+ * - Weather priority is ACTUALLY correct:
  *   1) explicit city in the user text ("weather in Edmonton")
  *   2) coordinates inside the text ("53.5461,-113.4938")
  *   3) device lat/lon from req.body (even if strings)
  *   4) user_state last_city fallback (blocks bad placeholders)
  *
- * - Vision is now "smart + human":
+ * - Vision is "smart + human":
  *   - short, confident identification (no essay)
  *   - remembers last image label so follow-ups like "Where can I find one"
  *     don’t ask dumb clarification
+ *
+ * ✅ FIXES for provider stability:
+ * - OpenAI Responses API parsing is resilient (output_text / output[] / legacy choices)
+ * - Timeout handling is clean
+ * - Schema sanitization is strict
  *
  * IMPORTANT BRAND RULE:
  * - User-facing identity: ALWAYS "Powered by LXT-1."
@@ -386,7 +391,6 @@ Return ONLY the reply text.
   function firstLineLabel(text) {
     const s = String(text || "").replace(/\s+/g, " ").trim();
     if (!s) return null;
-    // Take first sentence-ish chunk
     const cut = s.split(/[.!?]\s/)[0] || s;
     return cut.slice(0, 90);
   }
@@ -510,7 +514,6 @@ Return ONLY the reply text.
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return "daily_brief";
     if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t)) return "signal_scan";
 
-    // If user is clearly asking a "where to buy / find" follow-up (often after an image)
     if (isBuyOrFindQuestion(t)) return "shopping";
 
     if (/(where.*(get|got).*weather|source.*weather|how.*know.*weather)/.test(t)) return "weather_source";
@@ -537,7 +540,6 @@ Return ONLY the reply text.
 
     if (/(should i|what should i do|be honest|verdict|move or wait|is it smart|risk|timing window)/.test(t)) return "decision";
 
-    // If images exist and user text is short, treat as image chat
     if (hasImages) return "chat";
 
     return "chat";
@@ -962,7 +964,6 @@ Return ONLY the reply text.
     const reqLat = toNum(lat);
     const reqLon = toNum(lon);
 
-    // Base location (do NOT let device coords override an explicit city request)
     const loc = {
       lat: null,
       lon: null,
@@ -1330,7 +1331,6 @@ Rules:
 
     const t = String(userText || "").trim();
 
-    // ✅ Always send structured payload even for images, so the model stays “LXT”
     const payload = {
       userText: t || (hasImages ? "What is this?" : ""),
       length_hint: lengthHintForReply(t),
@@ -1868,7 +1868,6 @@ ${JSON.stringify(payload)}
     return reply;
   }
 
-  // ✅ Shopping intent (mostly for image follow-ups like “Where can I find one?”)
   async function handleShoppingIntent({ userId, text, userState, voiceProfile }) {
     const lastLabel = normalizePlaceName(userState?.last_image_label) || null;
 
@@ -2151,7 +2150,6 @@ last_image_label: ${lastLabel || "none"}
           next_check: safeNowPlus(6 * 60 * 60 * 1000),
         });
 
-        // If they’re asking “where can I find one” and we have last_image_label, pass that in
         const imageHint =
           isBuyOrFindQuestion(text) && normalizePlaceName(state2?.last_image_label)
             ? `Context: The user previously shared an image labeled: "${state2.last_image_label}". Assume that’s what "one" refers to.`
@@ -2174,7 +2172,6 @@ last_image_label: ${lastLabel || "none"}
           lastReplyHint,
         });
 
-        // ✅ If this was a vision reply, store a short label for smarter follow-ups
         if (userId && hasImages && voice?.reply) {
           const label = firstLineLabel(voice.reply);
           if (label) {
@@ -2237,7 +2234,6 @@ last_image_label: ${lastLabel || "none"}
       lastReplyHint,
     });
 
-    // ✅ If this was a vision reply, store a short label for smarter follow-ups
     if (userId && hasImages && voice?.reply) {
       const label = firstLineLabel(voice.reply);
       if (label) {

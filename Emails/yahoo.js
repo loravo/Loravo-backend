@@ -9,6 +9,9 @@
 // ✅ iOS auto-close: mode=app -> redirects to loravo://connected
 // ✅ Web success page (desktop/manual testing)
 // ✅ Exports BOTH router + service interface for LXT.js
+// ✅ Better sender parsing
+// ✅ Better LXT-normalized list/read output
+// ✅ Better latest-email reply behavior
 //
 // Mount in index.js:
 //   const yahooPkg = require("./Emails/yahoo");
@@ -51,9 +54,6 @@ const REDIRECT_URI = String(process.env.YAHOO_REDIRECT_URI || "").trim();
 
 const STATE_SECRET = String(process.env.YAHOO_STATE_SECRET || "loravo_yahoo_state_secret_change_me").trim();
 
-// ⚠️ If Yahoo Mail permissions are enabled in your Yahoo app,
-// you may need mail scopes. Many apps fail IMAP OAuth if only openid/profile/email.
-// You can set this in Render env as needed.
 const SCOPES = String(process.env.YAHOO_SCOPES || "openid profile email").trim();
 
 const DATABASE_URL = String(process.env.DATABASE_URL || "").trim();
@@ -63,12 +63,10 @@ const SUCCESS_WEB_BASE =
   String(process.env.YAHOO_SUCCESS_WEB_URL || "").trim() ||
   "https://loravo-backend.onrender.com";
 
-// Yahoo OAuth endpoints
 const YAHOO_AUTH_URL = "https://api.login.yahoo.com/oauth2/request_auth";
 const YAHOO_TOKEN_URL = "https://api.login.yahoo.com/oauth2/get_token";
 const YAHOO_USERINFO_URL = "https://api.login.yahoo.com/openid/v1/userinfo";
 
-// Yahoo Mail servers (IMAP/SMTP)
 const YAHOO_IMAP_HOST = "imap.mail.yahoo.com";
 const YAHOO_IMAP_PORT = 993;
 const YAHOO_SMTP_HOST = "smtp.mail.yahoo.com";
@@ -174,6 +172,39 @@ function verifyState(state) {
 
   if (obj?.exp && Date.now() > Number(obj.exp)) return null;
   return obj;
+}
+
+function extractEmailAddress(raw) {
+  const s = safeStr(raw, 500);
+  if (!s) return null;
+  const m = s.match(/<([^>]+@[^>]+)>/);
+  if (m?.[1]) return m[1].trim();
+  const m2 = s.match(/\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/i);
+  return m2?.[1] ? m2[1].trim() : null;
+}
+
+function extractDisplayName(raw) {
+  const s = safeStr(raw, 500);
+  if (!s) return null;
+  const m = s.match(/^"?([^"<]+?)"?\s*<[^>]+>$/);
+  if (m?.[1]) return m[1].trim();
+  if (s.includes("@")) return null;
+  return s.trim();
+}
+
+function normalizeFrom(rawFrom) {
+  const email = extractEmailAddress(rawFrom);
+  const name = extractDisplayName(rawFrom);
+  return {
+    raw: safeStr(rawFrom, 500) || null,
+    email: email || null,
+    name: name || null,
+    display: name ? `${name}${email ? ` <${email}>` : ""}` : email || safeStr(rawFrom, 500) || "(unknown sender)",
+  };
+}
+
+function textSnippet(s, max = 180) {
+  return String(s || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
 /* ===================== TOKEN STORAGE (user_state) ===================== */
@@ -437,18 +468,25 @@ async function imapListInboxHeaders({ userId, maxResults = 10 }) {
 
           msg.once("end", () => {
             const uid = String(attrs?.uid || "");
+            const fromRaw = parseHeaderValue(headerBuf, "From") || "";
+            const fromNorm = normalizeFrom(fromRaw);
+
             out.push({
               id: uid,
               threadId: null,
-              from: safeStr(parseHeaderValue(headerBuf, "From") || "", 300) || "(unknown sender)",
+              from: fromNorm.display,
+              from_name: fromNorm.name,
+              from_email: fromNorm.email,
+              from_raw: fromNorm.raw,
               replyTo: safeStr(parseHeaderValue(headerBuf, "Reply-To") || "", 300) || null,
               to: safeStr(parseHeaderValue(headerBuf, "To") || "", 300) || null,
               subject: safeStr(parseHeaderValue(headerBuf, "Subject") || "", 300) || "(no subject)",
               date: safeStr(parseHeaderValue(headerBuf, "Date") || "", 120) || null,
               messageId: safeStr(parseHeaderValue(headerBuf, "Message-Id") || "", 300) || null,
-              references: safeStr(parseHeaderValue(headerBuf, "References") || "", 600) || null,
+              references: safeStr(parseHeaderValue(headerBuf, "References") || "", 1000) || null,
               inReplyTo: safeStr(parseHeaderValue(headerBuf, "In-Reply-To") || "", 300) || null,
               snippet: "",
+              internalDate: Number(attrs?.date ? new Date(attrs.date).getTime() : 0) || 0,
             });
           });
         });
@@ -466,8 +504,7 @@ async function imapListInboxHeaders({ userId, maxResults = 10 }) {
     imap.connect();
   });
 
-  // newest first (by uid)
-  out.sort((a, b) => Number(b.id || 0) - Number(a.id || 0));
+  out.sort((a, b) => Number(b.internalDate || 0) - Number(a.internalDate || 0));
   return out;
 }
 
@@ -559,6 +596,38 @@ async function smtpSend({ userId, to, subject, body, headers = {} }) {
   return { id: info?.messageId || null, threadId: null };
 }
 
+/* ===================== NORMALIZED READ ===================== */
+
+async function readParsedByUid({ userId, uid }) {
+  const raw = await imapReadRawByUid({ userId, uid });
+  const parsed = await simpleParser(raw);
+
+  const fromRaw = parsed.from?.text || "";
+  const fromNorm = normalizeFrom(fromRaw);
+
+  const bodyText =
+    safeStr(parsed.text || "", 200000) ||
+    safeStr(textSnippet(parsed.html || "", 200000), 200000);
+
+  return {
+    id: uid,
+    threadId: null,
+    from: fromNorm.display,
+    from_name: fromNorm.name,
+    from_email: fromNorm.email,
+    from_raw: fromNorm.raw,
+    to: parsed.to?.text || "",
+    subject: parsed.subject || "",
+    date: parsed.date ? parsed.date.toString() : "",
+    messageId: parsed.messageId || "",
+    references: Array.isArray(parsed.references) ? parsed.references.join(" ") : String(parsed.references || ""),
+    inReplyTo: parsed.inReplyTo || "",
+    snippet: textSnippet(parsed.text || parsed.html || "", 180),
+    body_text: bodyText,
+    parsed,
+  };
+}
+
 /* ===================== ROUTES ===================== */
 
 router.get("/", (_, res) => {
@@ -582,7 +651,6 @@ router.get("/", (_, res) => {
   });
 });
 
-// GET /yahoo/auth?user_id=...&mode=app&email=...
 router.get("/auth", (req, res) => {
   const userId = String(req.query.user_id || "").trim();
   const mode = String(req.query.mode || "").trim();
@@ -596,7 +664,6 @@ router.get("/auth", (req, res) => {
   return res.redirect(redirectTo);
 });
 
-// GET /yahoo/status?user_id=...
 router.get("/status", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -616,8 +683,6 @@ router.get("/status", async (req, res) => {
   }
 });
 
-// GET /yahoo/auth-url?user_id=...&mode=app&email=...
-// Default: redirects to Yahoo. Debug: add &format=json
 router.get("/auth-url", async (req, res) => {
   try {
     requireEnv();
@@ -654,7 +719,6 @@ router.get("/auth-url", async (req, res) => {
   }
 });
 
-// Web success page: GET /yahoo/connected?user_id=...&email=...
 router.get("/connected", (req, res) => {
   const email = String(req.query.email || "");
   const userId = String(req.query.user_id || "");
@@ -680,7 +744,6 @@ router.get("/connected", (req, res) => {
   `);
 });
 
-// OAuth callback: GET /yahoo/oauth2callback?code=...&state=...
 router.get("/oauth2callback", async (req, res) => {
   try {
     const oauthErr = String(req.query.error || "").trim();
@@ -730,7 +793,6 @@ router.get("/oauth2callback", async (req, res) => {
       return res.status(500).send(`Yahoo token exchange failed (${resp.status}): ${text}`);
     }
 
-    // Get email from userinfo (best effort)
     let emailGuess = null;
     try {
       const u = await fetch(YAHOO_USERINFO_URL, {
@@ -790,7 +852,6 @@ router.get("/disconnect", async (req, res) => {
 
 /* ===================== MAIL ROUTES (GET) ===================== */
 
-// GET /yahoo/list?user_id=...&maxResults=...
 router.get("/list", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -798,8 +859,6 @@ router.get("/list", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
 
     const emails = await imapListInboxHeaders({ userId, maxResults });
-
-    // route output includes a few extras; LXT will still use the service shape
     return res.json({ ok: true, q: "INBOX", emails });
   } catch (e) {
     const msg = String(e?.message || e);
@@ -807,13 +866,12 @@ router.get("/list", async (req, res) => {
     return res.status(looksAuth ? 401 : e?.status || 500).json({
       error: msg,
       hint: looksAuth
-        ? "Yahoo IMAP OAuth2 auth failed. Your Yahoo app likely does NOT have Mail/IMAP permission enabled. Enable Yahoo Mail access in Yahoo Developer Console (or use app-password IMAP)."
+        ? "Yahoo IMAP OAuth2 auth failed. Your Yahoo app likely does NOT have Mail/IMAP permission enabled. Enable Yahoo Mail access in Yahoo Developer Console."
         : null,
     });
   }
 });
 
-// GET /yahoo/read?user_id=...&id=...
 router.get("/read", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -821,23 +879,24 @@ router.get("/read", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
 
-    const raw = await imapReadRawByUid({ userId, uid: id });
-    const parsed = await simpleParser(raw);
+    const email = await readParsedByUid({ userId, uid: id });
 
     res.json({
       ok: true,
       email: {
-        id,
-        threadId: null,
-        from: parsed.from?.text || "",
-        to: parsed.to?.text || "",
-        subject: parsed.subject || "",
-        date: parsed.date ? parsed.date.toString() : "",
-        messageId: parsed.messageId || "",
-        references: Array.isArray(parsed.references) ? parsed.references.join(" ") : String(parsed.references || ""),
-        inReplyTo: parsed.inReplyTo || "",
-        snippet: (parsed.text || "").slice(0, 180),
-        body_text: parsed.text || "",
+        id: email.id,
+        threadId: email.threadId,
+        from: email.from,
+        from_name: email.from_name,
+        from_email: email.from_email,
+        to: email.to,
+        subject: email.subject,
+        date: email.date,
+        messageId: email.messageId,
+        references: email.references,
+        inReplyTo: email.inReplyTo,
+        snippet: email.snippet,
+        body_text: email.body_text,
       },
     });
   } catch (e) {
@@ -847,7 +906,6 @@ router.get("/read", async (req, res) => {
   }
 });
 
-// GET /yahoo/send?user_id=...&to=...&subject=...&body=...
 router.get("/send", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -866,7 +924,6 @@ router.get("/send", async (req, res) => {
   }
 });
 
-// GET /yahoo/reply?user_id=...&id=...&body=...
 router.get("/reply", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -877,15 +934,10 @@ router.get("/reply", async (req, res) => {
     if (!id) return res.status(400).json({ error: "Missing id" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    // Read original
-    const raw = await imapReadRawByUid({ userId, uid: id });
-    const parsed = await simpleParser(raw);
+    const email = await readParsedByUid({ userId, uid: id });
+    const parsed = email.parsed;
 
-    const replyTo =
-      parsed.replyTo?.text ||
-      parsed.from?.text ||
-      "";
-
+    const replyTo = parsed.replyTo?.text || parsed.from?.text || "";
     const subj0 = parsed.subject || "";
     const subject = /^re:/i.test(subj0) ? subj0 : `Re: ${subj0}`;
 
@@ -915,7 +967,6 @@ router.get("/reply", async (req, res) => {
 
 /* ===================== MAIL ROUTES (POST) ===================== */
 
-// POST /yahoo/list  { user_id, maxResults? }
 router.post("/list", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -931,7 +982,6 @@ router.post("/list", async (req, res) => {
   }
 });
 
-// POST /yahoo/read  { user_id, id }
 router.post("/read", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -939,23 +989,24 @@ router.post("/read", async (req, res) => {
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
     if (!id) return res.status(400).json({ error: "Missing id" });
 
-    const raw = await imapReadRawByUid({ userId, uid: id });
-    const parsed = await simpleParser(raw);
+    const email = await readParsedByUid({ userId, uid: id });
 
     res.json({
       ok: true,
       email: {
-        id,
-        threadId: null,
-        from: parsed.from?.text || "",
-        to: parsed.to?.text || "",
-        subject: parsed.subject || "",
-        date: parsed.date ? parsed.date.toString() : "",
-        messageId: parsed.messageId || "",
-        references: Array.isArray(parsed.references) ? parsed.references.join(" ") : String(parsed.references || ""),
-        inReplyTo: parsed.inReplyTo || "",
-        snippet: (parsed.text || "").slice(0, 180),
-        body_text: parsed.text || "",
+        id: email.id,
+        threadId: email.threadId,
+        from: email.from,
+        from_name: email.from_name,
+        from_email: email.from_email,
+        to: email.to,
+        subject: email.subject,
+        date: email.date,
+        messageId: email.messageId,
+        references: email.references,
+        inReplyTo: email.inReplyTo,
+        snippet: email.snippet,
+        body_text: email.body_text,
       },
     });
   } catch (e) {
@@ -963,7 +1014,6 @@ router.post("/read", async (req, res) => {
   }
 });
 
-// POST /yahoo/send  { user_id, to, subject?, body }
 router.post("/send", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -982,7 +1032,6 @@ router.post("/send", async (req, res) => {
   }
 });
 
-// POST /yahoo/reply  { user_id, id, body }
 router.post("/reply", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -993,8 +1042,8 @@ router.post("/reply", async (req, res) => {
     if (!id) return res.status(400).json({ error: "Missing id" });
     if (!body) return res.status(400).json({ error: "Missing body" });
 
-    const raw = await imapReadRawByUid({ userId, uid: id });
-    const parsed = await simpleParser(raw);
+    const email = await readParsedByUid({ userId, uid: id });
+    const parsed = email.parsed;
 
     const replyTo = parsed.replyTo?.text || parsed.from?.text || "";
     const subj0 = parsed.subject || "";
@@ -1032,20 +1081,21 @@ async function svcGetConnectedProviders({ userId }) {
 }
 
 async function svcList({ userId, q = null, max = 10 }) {
-  // Yahoo IMAP search by q is optional; keep stable: list newest inbox
   const emails = await imapListInboxHeaders({
     userId,
     maxResults: Math.min(Number(max || 10), 25),
   });
 
-  // ✅ Return the LXT shape (same style as Gmail)
   return emails.map((e) => ({
     id: e.id,
     threadId: null,
     from: e.from,
+    from_name: e.from_name,
+    from_email: e.from_email,
     subject: e.subject,
     date: e.date,
     snippet: e.snippet || "",
+    internalDate: e.internalDate || 0,
   }));
 }
 
@@ -1053,21 +1103,22 @@ async function svcGetBody({ userId, messageId }) {
   const uid = String(messageId || "").trim();
   if (!uid) throw new Error("Missing messageId");
 
-  const raw = await imapReadRawByUid({ userId, uid });
-  const parsed = await simpleParser(raw);
+  const email = await readParsedByUid({ userId, uid });
 
   return {
     id: uid,
     threadId: null,
-    from: parsed.from?.text || "",
-    to: parsed.to?.text || "",
-    subject: parsed.subject || "",
-    date: parsed.date ? parsed.date.toString() : "",
-    messageId: parsed.messageId || null,
-    references: Array.isArray(parsed.references) ? parsed.references.join(" ") : String(parsed.references || ""),
-    inReplyTo: parsed.inReplyTo || null,
-    snippet: (parsed.text || "").slice(0, 180),
-    body: parsed.text || "",
+    from: email.from,
+    from_name: email.from_name,
+    from_email: email.from_email,
+    to: email.to,
+    subject: email.subject,
+    date: email.date,
+    messageId: email.messageId || null,
+    references: email.references || null,
+    inReplyTo: email.inReplyTo || null,
+    snippet: email.snippet,
+    body: email.body_text || "",
   };
 }
 
@@ -1084,8 +1135,8 @@ async function svcReplyById({ userId, messageId, body }) {
   const uid = String(messageId || "").trim();
   if (!uid) throw new Error("Missing messageId");
 
-  const raw = await imapReadRawByUid({ userId, uid });
-  const parsed = await simpleParser(raw);
+  const email = await readParsedByUid({ userId, uid });
+  const parsed = email.parsed;
 
   const replyTo = parsed.replyTo?.text || parsed.from?.text || "";
   const subj0 = parsed.subject || "";
@@ -1111,8 +1162,8 @@ async function svcReplyById({ userId, messageId, body }) {
 }
 
 async function svcReplyLatest({ userId, body }) {
-  const list = await svcList({ userId, max: 1 });
-  const latest = list?.[0];
+  const list = await svcList({ userId, max: 10 });
+  const latest = (list || []).sort((a, b) => Number(b.internalDate || 0) - Number(a.internalDate || 0))[0];
   if (!latest?.id) throw new Error("No Yahoo emails found to reply to.");
   return await svcReplyById({ userId, messageId: latest.id, body });
 }

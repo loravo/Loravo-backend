@@ -1,14 +1,23 @@
 // services/weather.js (CommonJS)
 // - Router: GET /weather?lat=..&lon=..&units=metric
 // - Service: services.weather.getLive({ userId, text, lat, lon, state }) -> normalized object for LXT
+//
+// FIXES:
+// ✅ If user asks "weather in Edmonton", we geocode Edmonton and use that (even if device lat/lon is sent)
+// ✅ Still supports coordinates and plain device-location weather
+// ✅ Accepts lat/lon as strings or numbers
 
 const express = require("express");
 const fetch = require("node-fetch"); // node-fetch@2
 const router = express.Router();
 
+function toNum(x) {
+  const n = typeof x === "number" ? x : typeof x === "string" ? Number(x.trim()) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
 function sfSymbolFromOWIcon(icon) {
   const code = String(icon || "").toLowerCase();
-
   if (code.startsWith("01")) return "sun.max.fill";
   if (code.startsWith("02")) return "cloud.sun.fill";
   if (code.startsWith("03")) return "cloud.fill";
@@ -42,21 +51,74 @@ function pickClosestForecast(list, targetUnixSec) {
   return best;
 }
 
+// ---- City / coordinates parsing ----
+
+function extractCoordinatesFromText(t) {
+  const s = String(t || "");
+  const m = s.match(/(-?\d{1,2}\.\d+)\s*,\s*(-?\d{1,3}\.\d+)/);
+  if (!m) return null;
+  const lat = Number(m[1]);
+  const lon = Number(m[2]);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
+  return { lat, lon };
+}
+
+// "weather in Edmonton" / "Edmonton weather"
+function extractCityFromWeatherText(t) {
+  const s = String(t || "").trim();
+
+  const m1 =
+    s.match(/\b(weather|forecast|temperature|temp)\s+(in|for)\s+([a-zA-Z\s.'-]{2,})$/i) ||
+    s.match(/\b(weather|forecast|temperature|temp)\s+([a-zA-Z\s.'-]{2,})$/i);
+
+  if (m1) {
+    const city = String(m1[m1.length - 1] || "").trim().replace(/\?+$/g, "").trim();
+    return city.length >= 2 ? city : null;
+  }
+
+  const m2 = s.match(/^([a-zA-Z\s.'-]{2,})\s+(weather|forecast|temperature|temp)\b/i);
+  if (m2) {
+    const city = String(m2[1] || "").trim().replace(/\?+$/g, "").trim();
+    return city.length >= 2 ? city : null;
+  }
+
+  return null;
+}
+
+async function geocodeCity_OpenWeather(city) {
+  const key = String(process.env.OPENWEATHER_API_KEY || "").trim();
+  if (!key) throw new Error("Missing OPENWEATHER_API_KEY on server");
+  const q = String(city || "").trim();
+  if (!q) return null;
+
+  const url = `https://api.openweathermap.org/geo/1.0/direct?q=${encodeURIComponent(q)}&limit=1&appid=${key}`;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const j = await r.json();
+  const hit = Array.isArray(j) ? j[0] : null;
+  if (!hit || typeof hit.lat !== "number" || typeof hit.lon !== "number") return null;
+
+  return { lat: hit.lat, lon: hit.lon, name: hit.name || q, country: hit.country || null, state: hit.state || null };
+}
+
 async function fetchOpenWeatherBundle({ lat, lon, units = "metric" }) {
   const key = String(process.env.OPENWEATHER_API_KEY || "").trim();
   if (!key) throw new Error("Missing OPENWEATHER_API_KEY on server");
 
-  if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lon))) {
+  const la = toNum(lat);
+  const lo = toNum(lon);
+  if (la == null || lo == null) {
     throw new Error("Missing lat/lon (numbers)");
   }
 
-  const curUrl = `https://api.openweathermap.org/data/2.5/weather?lat=${Number(lat)}&lon=${Number(
-    lon
-  )}&units=${encodeURIComponent(units)}&appid=${key}`;
+  const curUrl = `https://api.openweathermap.org/data/2.5/weather?lat=${la}&lon=${lo}&units=${encodeURIComponent(
+    units
+  )}&appid=${key}`;
 
-  const fcUrl = `https://api.openweathermap.org/data/2.5/forecast?lat=${Number(lat)}&lon=${Number(
-    lon
-  )}&units=${encodeURIComponent(units)}&appid=${key}`;
+  const fcUrl = `https://api.openweathermap.org/data/2.5/forecast?lat=${la}&lon=${lo}&units=${encodeURIComponent(
+    units
+  )}&appid=${key}`;
 
   const [curResp, fcResp] = await Promise.all([fetch(curUrl), fetch(fcUrl)]);
 
@@ -69,13 +131,9 @@ async function fetchOpenWeatherBundle({ lat, lon, units = "metric" }) {
   const now = Math.floor(Date.now() / 1000);
   const list = fc?.list || [];
 
-  const t4 = now + 4 * 3600;
-  const t8 = now + 8 * 3600;
-  const t12 = now + 12 * 3600;
-
-  const f4 = pickClosestForecast(list, t4);
-  const f8 = pickClosestForecast(list, t8);
-  const f12 = pickClosestForecast(list, t12);
+  const f4 = pickClosestForecast(list, now + 4 * 3600);
+  const f8 = pickClosestForecast(list, now + 8 * 3600);
+  const f12 = pickClosestForecast(list, now + 12 * 3600);
 
   const curIcon = cur?.weather?.[0]?.icon || "";
   const curMain = cur?.weather?.[0]?.main || "";
@@ -100,7 +158,7 @@ async function fetchOpenWeatherBundle({ lat, lon, units = "metric" }) {
     description: curDesc,
     hourly,
     raw: cur,
-    _fc: fc, // keep forecast if you want it
+    _fc: fc,
     at: new Date().toISOString(),
   };
 }
@@ -108,13 +166,12 @@ async function fetchOpenWeatherBundle({ lat, lon, units = "metric" }) {
 /** ✅ Router stays the same behavior */
 router.get("/weather", async (req, res) => {
   try {
-    const lat = Number(req.query.lat);
-    const lon = Number(req.query.lon);
+    const lat = req.query.lat;
+    const lon = req.query.lon;
     const units = String(req.query.units || "metric");
 
     const bundle = await fetchOpenWeatherBundle({ lat, lon, units });
 
-    // Keep your exact output shape for the app:
     return res.json({
       ok: true,
       city: bundle.city,
@@ -133,24 +190,39 @@ router.get("/weather", async (req, res) => {
   }
 });
 
-/** ✅ NEW: Service that LXT can call internally */
+/** ✅ Service that LXT can call internally */
 const service = {
   // LXT calls: services.weather.getLive({ userId, text, lat, lon, state })
-  getLive: async ({ lat, lon }) => {
-    // LXT already passes lat/lon from request or user_state.
-    // Keep it tight + normalized for LXT context.
-    const bundle = await fetchOpenWeatherBundle({ lat, lon, units: "metric" });
+  getLive: async ({ text, lat, lon }) => {
+    // 1) If coordinates are literally in the text, use them (most explicit)
+    const textCoords = extractCoordinatesFromText(text);
 
-    // Return the normalized object LXT expects (simple, stable keys):
+    // 2) If user asked "weather in CITY", override device coords with city geocode
+    const city = extractCityFromWeatherText(text);
+    const cityGeo = city ? await geocodeCity_OpenWeather(city) : null;
+
+    const finalLat = textCoords?.lat ?? cityGeo?.lat ?? toNum(lat);
+    const finalLon = textCoords?.lon ?? cityGeo?.lon ?? toNum(lon);
+
+    if (finalLat == null || finalLon == null) {
+      // Don’t hallucinate weather. Tell LXT it needs a location.
+      return null;
+    }
+
+    const bundle = await fetchOpenWeatherBundle({ lat: finalLat, lon: finalLon, units: "metric" });
+
+    // If we geocoded a city, prefer that name (feels consistent)
+    const placeName = cityGeo?.name || bundle.city;
+
     return {
-      city: bundle.city,
+      city: placeName,
       temp_c: bundle.temp,
       feels_like_c: bundle.feels_like,
       humidity_pct: bundle.humidity,
       clouds_pct: bundle.clouds,
       main: bundle.main,
       description: bundle.description,
-      hourly: bundle.hourly, // optional but powerful for reasoning
+      hourly: bundle.hourly,
       at: bundle.at,
     };
   },

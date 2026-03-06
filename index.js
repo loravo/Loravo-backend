@@ -46,6 +46,7 @@ const fetch = require("node-fetch"); // node-fetch@2
 const { Pool } = require("pg");
 const crypto = require("crypto");
 const http2 = require("http2");
+const multer = require("multer");
 
 // ✅ define PORT early (used by helper funcs too)
 const PORT = process.env.PORT || 3000;
@@ -53,8 +54,6 @@ const PORT = process.env.PORT || 3000;
 // ✅ Weather + News packages (support router-only OR { router, service })
 const weatherMod = require("./services/weather");
 const newsMod = require("./services/news");
-
-const multer = require("multer");
 
 // ✅ Email provider packages (must export { router, service })
 // NOTE: Outlook may currently export router only — we support both.
@@ -88,8 +87,9 @@ function normalizePkg(mod) {
   if (typeof mod === "function") return { router: mod, service: null };
   if (typeof mod === "object") {
     if (mod.router) return { router: mod.router, service: mod.service || null };
-    // sometimes modules export express router as default
-    if (mod.default && typeof mod.default === "function") return { router: mod.default, service: mod.service || null };
+    if (mod.default && typeof mod.default === "function") {
+      return { router: mod.default, service: mod.service || null };
+    }
   }
   return { router: null, service: null };
 }
@@ -201,7 +201,9 @@ async function initDb() {
       ADD COLUMN IF NOT EXISTS plan_tier TEXT DEFAULT 'core',
       ADD COLUMN IF NOT EXISTS behavior_profile JSONB DEFAULT '{}'::jsonb,
       ADD COLUMN IF NOT EXISTS last_topic JSONB DEFAULT '{}'::jsonb,
-      ADD COLUMN IF NOT EXISTS behavior_updated_at TIMESTAMPTZ;
+      ADD COLUMN IF NOT EXISTS behavior_updated_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS last_image_label TEXT,
+      ADD COLUMN IF NOT EXISTS last_image_at TIMESTAMPTZ;
   `);
 
   // ✅ CRITICAL: Yahoo router stores tokens in user_state (these columns MUST exist)
@@ -314,6 +316,12 @@ function minutesFromHHMM(hhmm) {
   return parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
 }
 
+function numOrNull(v) {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 /* ===================== IMAGE UPLOAD GUARDS (PROD) ===================== */
 /**
  * Accept base64 JPEG strings in req.body.images.
@@ -419,9 +427,15 @@ async function loadUserState(userId) {
 async function upsertUserState(userId, patch) {
   if (!userId || !patch || !Object.keys(patch).length) return;
 
-  const fields = Object.keys(patch);
+  const cleanPatch = {};
+  for (const [k, v] of Object.entries(patch)) {
+    if (v !== undefined) cleanPatch[k] = v;
+  }
+  if (!Object.keys(cleanPatch).length) return;
+
+  const fields = Object.keys(cleanPatch);
   const cols = ["user_id", ...fields];
-  const vals = [userId, ...fields.map((k) => patch[k])];
+  const vals = [userId, ...fields.map((k) => cleanPatch[k])];
   const params = cols.map((_, i) => `$${i + 1}`);
 
   const updates = fields.map((k) => `${k}=EXCLUDED.${k}`).concat(["updated_at=NOW()"]).join(", ");
@@ -491,6 +505,30 @@ async function getWeather(lat, lon) {
   }
 }
 
+// ✅ sync location/weather into user_state from /chat requests too
+async function syncChatLocationContext({ userId, lat, lon, city, country, timezone }) {
+  if (!dbReady || !userId) return;
+  if (typeof lat !== "number" || typeof lon !== "number") return;
+
+  let live = null;
+  try {
+    live = await getWeather(lat, lon);
+  } catch {}
+
+  await upsertUserState(userId, {
+    last_lat: lat,
+    last_lon: lon,
+    last_city: city || live?.name || undefined,
+    last_country: country || live?.sys?.country || undefined,
+    last_timezone: timezone || undefined,
+    last_temp_c: typeof live?.main?.temp === "number" ? live.main.temp : undefined,
+    last_cloud_pct: typeof live?.clouds?.all === "number" ? live.clouds.all : undefined,
+    last_weather_main: live?.weather?.[0]?.main || undefined,
+    last_weather_desc: live?.weather?.[0]?.description || undefined,
+    last_weather_at: live ? new Date().toISOString() : undefined,
+  });
+}
+
 /* ===================== ALERT QUEUE ===================== */
 const ALERT_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -508,7 +546,7 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
   if (!dbReady) return;
 
   // ✅ Always queue alerts (so /poll can show later)
-  // Quiet hours are enforced only at PUSH time (below).
+  // Quiet hours are enforced only at PUSH time.
   const prefs = await loadUserPrefs(userId);
   const quiet = isNowInQuietHours(prefs);
 
@@ -524,7 +562,6 @@ async function enqueueAlert({ userId, alertType, message, payload }) {
 
   const mergedPayload = { ...(payload || {}), quiet_hours_active: Boolean(quiet) };
 
-  // ✅ pass object directly for JSONB
   await dbQuery(
     `INSERT INTO alert_queue (user_id, alert_type, message, payload) VALUES ($1,$2,$3,$4)`,
     [userId, alertType, message, mergedPayload]
@@ -1114,9 +1151,9 @@ app.post("/chat", upload.array("images", 4), async (req, res) => {
     const files = Array.isArray(req.files) ? req.files : [];
     req.body = req.body || {};
 
-    // multer sends fields as strings (when multipart)
-    if (req.body.lat != null) req.body.lat = Number(req.body.lat);
-    if (req.body.lon != null) req.body.lon = Number(req.body.lon);
+    // multipart sends fields as strings
+    req.body.lat = numOrNull(req.body.lat);
+    req.body.lon = numOrNull(req.body.lon);
 
     // ✅ keep JSON images if present
     const jsonImages = Array.isArray(req.body.images) ? req.body.images : null;
@@ -1138,6 +1175,23 @@ app.post("/chat", upload.array("images", 4), async (req, res) => {
       name: f.originalname,
     }));
 
+    // ✅ best-effort: sync current chat location into DB so later weather/news stays local
+    const chatUserId = String(req.body.user_id || "").trim();
+    if (chatUserId && typeof req.body.lat === "number" && typeof req.body.lon === "number") {
+      try {
+        await syncChatLocationContext({
+          userId: chatUserId,
+          lat: req.body.lat,
+          lon: req.body.lon,
+          city: req.body.city || null,
+          country: req.body.country || null,
+          timezone: req.body.timezone || null,
+        });
+      } catch (e) {
+        console.error("⚠️ chat location sync failed:", e?.message || e);
+      }
+    }
+
     // fail fast if too big / malformed
     if (!validateChatImages(req, res)) return;
 
@@ -1147,7 +1201,9 @@ app.post("/chat", upload.array("images", 4), async (req, res) => {
       reply: result.reply,
       lxt1: result.lxt1,
       _providers: result.providers,
-      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply ? { _errors: result._errors } : {}),
+      ...(result?._errors?.openai || result?._errors?.gemini || result?._errors?.reply
+        ? { _errors: result._errors }
+        : {}),
     });
   } catch (e) {
     res.status(500).json({ error: "server error", detail: String(e?.message || e) });
@@ -1157,7 +1213,13 @@ app.post("/chat", upload.array("images", 4), async (req, res) => {
 /* ===================== STAY-AHEAD ENDPOINTS ===================== */
 app.post("/state/location", async (req, res) => {
   try {
-    const { user_id, lat, lon, city, country, timezone } = req.body || {};
+    const user_id = req.body?.user_id;
+    const lat = numOrNull(req.body?.lat);
+    const lon = numOrNull(req.body?.lon);
+    const city = req.body?.city || null;
+    const country = req.body?.country || null;
+    const timezone = req.body?.timezone || null;
+
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (typeof lat !== "number" || typeof lon !== "number") {
       return res.status(400).json({ error: "Missing lat/lon (numbers)" });
@@ -1174,7 +1236,10 @@ app.post("/state/location", async (req, res) => {
 
 app.post("/state/weather", async (req, res) => {
   try {
-    const { user_id, lat, lon } = req.body || {};
+    const user_id = req.body?.user_id;
+    const lat = numOrNull(req.body?.lat);
+    const lon = numOrNull(req.body?.lon);
+
     if (!user_id) return res.status(400).json({ error: "Missing user_id" });
     if (typeof lat !== "number" || typeof lon !== "number") {
       return res.status(400).json({ error: "Missing lat/lon (numbers)" });

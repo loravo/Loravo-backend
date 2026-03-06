@@ -10,6 +10,10 @@
 // ✅ Browser success page (desktop/manual testing)
 // ✅ Friendly GET routes for quick testing
 // ✅ Exports BOTH router + service interface for LXT.js
+// ✅ Better sender normalization
+// ✅ Better body extraction
+// ✅ Better LXT-normalized list/read output
+// ✅ Safer callback + latest reply behavior
 //
 // Mount in index.js:
 //   const outlookPkg = require("./Emails/outlook");
@@ -18,12 +22,12 @@
 // Required env:
 //   OUTLOOK_CLIENT_ID
 //   OUTLOOK_CLIENT_SECRET
-//   OUTLOOK_REDIRECT_URI     (must match Azure Redirect URI exactly)
+//   OUTLOOK_REDIRECT_URI
 //
 // Optional env:
 //   DATABASE_URL
 //   OUTLOOK_STATE_SECRET
-//   OUTLOOK_SUCCESS_WEB_URL  (default https://loravo-backend.onrender.com)
+//   OUTLOOK_SUCCESS_WEB_URL
 //
 // Azure API permissions (Delegated):
 //   openid, profile, email, offline_access, User.Read, Mail.ReadWrite, Mail.Send
@@ -55,7 +59,7 @@ const SUCCESS_WEB_BASE =
   "https://loravo-backend.onrender.com";
 
 const AUTH_BASE = "https://login.microsoftonline.com";
-const TENANT = "common"; // supports personal + work/school
+const TENANT = "common";
 const AUTHORIZE_URL = `${AUTH_BASE}/${TENANT}/oauth2/v2.0/authorize`;
 const TOKEN_URL = `${AUTH_BASE}/${TENANT}/oauth2/v2.0/token`;
 
@@ -134,6 +138,12 @@ function requireEnv() {
   }
 }
 
+function safeStr(x, max = 500) {
+  const s = String(x ?? "").replace(/\r/g, "").trim();
+  if (!s) return "";
+  return s.length > max ? s.slice(0, max) : s;
+}
+
 function base64url(input) {
   return Buffer.from(input)
     .toString("base64")
@@ -179,6 +189,59 @@ async function dbQuery(sql, params) {
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function extractEmailAddress(raw) {
+  const s = safeStr(raw, 500);
+  if (!s) return null;
+  const m = s.match(/<([^>]+@[^>]+)>/);
+  if (m?.[1]) return m[1].trim();
+  const m2 = s.match(/\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/i);
+  return m2?.[1] ? m2[1].trim() : null;
+}
+
+function normalizeGraphPerson(person) {
+  const name = safeStr(person?.name || "", 250) || null;
+  const email = safeStr(person?.address || "", 320) || null;
+  return {
+    name,
+    email,
+    display: name && email ? `${name} <${email}>` : email || name || null,
+  };
+}
+
+function normalizeRecipientList(arr) {
+  return (Array.isArray(arr) ? arr : [])
+    .map((r) => normalizeGraphPerson(r?.emailAddress || {}))
+    .filter((x) => x.display)
+    .map((x) => x.display);
+}
+
+function htmlToText(html) {
+  if (!html) return "";
+  return String(html)
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<\/p>/gi, "\n")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<\/div>/gi, "\n")
+    .replace(/<li>/gi, "• ")
+    .replace(/<\/li>/gi, "\n")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&#39;/g, "'")
+    .replace(/&quot;/g, '"')
+    .replace(/\s+\n/g, "\n")
+    .replace(/\n\s+/g, "\n")
+    .replace(/[ \t]{2,}/g, " ")
+    .trim();
+}
+
+function makeSnippet(s, max = 180) {
+  return String(s || "").replace(/\s+/g, " ").trim().slice(0, max);
 }
 
 async function saveTokens(userId, tokens, email) {
@@ -285,7 +348,6 @@ async function ensureFreshAccessToken(userId) {
     refreshed.expires_at = Date.now() + sec * 1000;
   }
 
-  // ✅ Microsoft sometimes omits refresh_token on refresh. Preserve the old one.
   if (!refreshed.refresh_token && refreshToken) refreshed.refresh_token = refreshToken;
 
   await saveTokens(userId, refreshed, record.email || null);
@@ -334,34 +396,14 @@ async function graphRequest(userId, method, path, { query, body, headers } = {})
 }
 
 function pickSender(item) {
-  const from = item?.from?.emailAddress?.address || null;
-  const fromName = item?.from?.emailAddress?.name || null;
-  const sender = item?.sender?.emailAddress?.address || null;
-  const senderName = item?.sender?.emailAddress?.name || null;
+  const fromObj = normalizeGraphPerson(item?.from?.emailAddress || {});
+  const senderObj = normalizeGraphPerson(item?.sender?.emailAddress || {});
   return {
-    from: fromName && from ? `${fromName} <${from}>` : from || null,
-    sender: senderName && sender ? `${senderName} <${sender}>` : sender || null,
+    from: fromObj.display || senderObj.display || null,
+    from_name: fromObj.name || senderObj.name || null,
+    from_email: fromObj.email || senderObj.email || null,
+    sender: senderObj.display || null,
   };
-}
-
-// Simple HTML → text fallback for LXT (not perfect but good)
-function stripHtml(html) {
-  if (!html) return "";
-  const s = String(html);
-  return s
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<\/p>/gi, "\n")
-    .replace(/<br\s*\/?>/gi, "\n")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/\s+\n/g, "\n")
-    .replace(/\n\s+/g, "\n")
-    .replace(/[ \t]{2,}/g, " ")
-    .trim();
 }
 
 /* ===================== CORE OPS (shared) ===================== */
@@ -374,13 +416,14 @@ async function opList({ userId, top = 10, folder = "inbox", search = null }) {
   const query = {
     $top: take,
     $orderby: "receivedDateTime desc",
-    $select: "id,subject,bodyPreview,from,receivedDateTime,isRead,conversationId,internetMessageId",
+    $select: "id,subject,bodyPreview,from,sender,receivedDateTime,isRead,conversationId,internetMessageId",
   };
 
   const headers = {};
   if (search) {
     query.$search = `"${String(search).replace(/"/g, '\\"')}"`;
     headers.ConsistencyLevel = "eventual";
+    delete query.$orderby;
   }
 
   const data = await graphRequest(userId, "GET", path, { query, headers });
@@ -392,8 +435,11 @@ async function opList({ userId, top = 10, folder = "inbox", search = null }) {
       threadId: m.conversationId || null,
       messageId: m.internetMessageId || null,
       subject: m.subject || "",
-      from: who.from || who.sender || null,
+      from: who.from,
+      from_name: who.from_name,
+      from_email: who.from_email,
       date: m.receivedDateTime || null,
+      internalDate: m.receivedDateTime ? new Date(m.receivedDateTime).getTime() : 0,
       isRead: Boolean(m.isRead),
       snippet: m.bodyPreview || "",
     };
@@ -404,33 +450,36 @@ async function opRead({ userId, id }) {
   const msg = await graphRequest(userId, "GET", `/me/messages/${encodeURIComponent(id)}`, {
     query: {
       $select:
-        "id,subject,body,bodyPreview,from,toRecipients,ccRecipients,receivedDateTime,conversationId,internetMessageId,inReplyTo",
+        "id,subject,body,bodyPreview,from,sender,toRecipients,ccRecipients,receivedDateTime,conversationId,internetMessageId,inReplyTo",
     },
   });
 
   const who = pickSender(msg);
 
-  const to = (msg?.toRecipients || [])
-    .map((r) => r?.emailAddress?.address || null)
-    .filter(Boolean);
+  const to = normalizeRecipientList(msg?.toRecipients || []);
+  const cc = normalizeRecipientList(msg?.ccRecipients || []);
 
   const contentType = String(msg?.body?.contentType || "").toLowerCase();
   const content = msg?.body?.content || "";
 
-  const bodyText = contentType === "text" ? content : stripHtml(content);
+  const bodyText = contentType === "text" ? content : htmlToText(content);
   const bodyHtml = contentType === "html" ? content : null;
 
   return {
     id: msg?.id || id,
     threadId: msg?.conversationId || null,
     messageId: msg?.internetMessageId || null,
-    from: who.from || who.sender || null,
+    from: who.from || null,
+    from_name: who.from_name || null,
+    from_email: who.from_email || null,
     to,
+    cc,
     subject: msg?.subject || "",
     date: msg?.receivedDateTime || null,
-    snippet: msg?.bodyPreview || "",
+    snippet: msg?.bodyPreview || makeSnippet(bodyText || "", 180),
     body_text: bodyText || "",
     body_html: bodyHtml,
+    inReplyTo: msg?.inReplyTo || null,
   };
 }
 
@@ -449,8 +498,6 @@ async function opSend({ userId, to, subject, body, saveToSentItems = true }) {
 }
 
 async function opReply({ userId, id, body }) {
-  // Graph: POST /me/messages/{id}/reply
-  // We can pass a comment (simple) OR createReply + send.
   const payload = { comment: body || "" };
   await graphRequest(userId, "POST", `/me/messages/${encodeURIComponent(id)}/reply`, { body: payload });
   return { id: null, threadId: null };
@@ -478,7 +525,6 @@ router.get("/", (_, res) => {
   });
 });
 
-// GET /outlook/auth?user_id=...&mode=app?
 router.get("/auth", (req, res) => {
   const userId = String(req.query.user_id || "").trim();
   const mode = String(req.query.mode || "").trim();
@@ -487,7 +533,6 @@ router.get("/auth", (req, res) => {
   return res.redirect(`/outlook/auth-url?user_id=${encodeURIComponent(userId)}${extra}`);
 });
 
-// GET /outlook/status?user_id=...
 router.get("/status", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -506,7 +551,6 @@ router.get("/status", async (req, res) => {
   }
 });
 
-// GET /outlook/auth-url?user_id=...&mode=app?
 router.get("/auth-url", async (req, res) => {
   try {
     requireEnv();
@@ -537,7 +581,6 @@ router.get("/auth-url", async (req, res) => {
   }
 });
 
-// Browser success page: GET /outlook/connected?user_id=...&email=...
 router.get("/connected", (req, res) => {
   const email = String(req.query.email || "");
   const userId = String(req.query.user_id || "");
@@ -563,10 +606,15 @@ router.get("/connected", (req, res) => {
   `);
 });
 
-// OAuth callback: GET /outlook/oauth2callback?code=...&state=...
 router.get("/oauth2callback", async (req, res) => {
   try {
     requireEnv();
+
+    const oauthErr = String(req.query.error || "").trim();
+    const oauthDesc = String(req.query.error_description || "").trim();
+    if (oauthErr) {
+      return res.status(400).send(`OAuth error: ${oauthErr}${oauthDesc ? " — " + oauthDesc : ""}`);
+    }
 
     const code = String(req.query.code || "").trim();
     const stateStr = String(req.query.state || "").trim();
@@ -604,17 +652,9 @@ router.get("/oauth2callback", async (req, res) => {
 
     let email = null;
     try {
-      const me = await graphRequest(userId, "GET", `/me`, {
-        // temporarily use this new token directly:
-        // easiest: call graph with fetch here
+      const rr = await fetch(`${GRAPH_BASE}/me`, {
+        headers: { Authorization: `Bearer ${tokens.access_token}` },
       });
-      // NOTE: graphRequest uses ensureFreshAccessToken which uses DB tokens,
-      // so we do a direct fetch instead:
-    } catch {}
-
-    // ✅ Direct fetch to /me using new access token:
-    try {
-      const rr = await fetch(`${GRAPH_BASE}/me`, { headers: { Authorization: `Bearer ${tokens.access_token}` } });
       const t = await rr.text();
       const me = t ? JSON.parse(t) : null;
       email = me?.mail || me?.userPrincipalName || null;
@@ -666,7 +706,6 @@ router.get("/disconnect", async (req, res) => {
 
 /* ===================== MAIL API (POST) ===================== */
 
-// POST /outlook/list  { user_id, top?, folder?, search? }
 router.post("/list", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -683,7 +722,6 @@ router.post("/list", async (req, res) => {
   }
 });
 
-// POST /outlook/read  { user_id, id }
 router.post("/read", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -698,7 +736,6 @@ router.post("/read", async (req, res) => {
   }
 });
 
-// POST /outlook/send  { user_id, to, subject?, body, saveToSentItems? }
 router.post("/send", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -718,7 +755,6 @@ router.post("/send", async (req, res) => {
   }
 });
 
-// POST /outlook/reply  { user_id, id, body }
 router.post("/reply", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -738,7 +774,6 @@ router.post("/reply", async (req, res) => {
 
 /* ===================== EASY TEST ROUTES (GET) ===================== */
 
-// GET /outlook/list?user_id=...&top=...&folder=...&search=...
 router.get("/list", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -755,7 +790,6 @@ router.get("/list", async (req, res) => {
   }
 });
 
-// GET /outlook/read?user_id=...&id=...
 router.get("/read", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -770,7 +804,6 @@ router.get("/read", async (req, res) => {
   }
 });
 
-// GET /outlook/send?user_id=...&to=...&subject=...&body=...
 router.get("/send", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -789,7 +822,6 @@ router.get("/send", async (req, res) => {
   }
 });
 
-// GET /outlook/reply?user_id=...&id=...&body=...
 router.get("/reply", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -816,20 +848,20 @@ async function svcGetConnectedProviders({ userId }) {
 
 async function svcList({ userId, q = null, max = 10 }) {
   const top = Math.min(Number(max || 10), 25);
-
-  // q -> Graph search keyword (AQS). If q is Gmail-style, pass simpler keywords.
   const search = q ? String(q) : null;
 
   const emails = await opList({ userId, top, folder: "inbox", search });
 
-  // ✅ normalize to Gmail/Yahoo style
   return emails.map((m) => ({
     id: m.id,
     threadId: m.threadId,
     from: m.from,
+    from_name: m.from_name,
+    from_email: m.from_email,
     subject: m.subject,
     date: m.date,
     snippet: m.snippet || "",
+    internalDate: m.internalDate || 0,
   }));
 }
 
@@ -839,19 +871,20 @@ async function svcGetBody({ userId, messageId }) {
     id: r.id,
     threadId: r.threadId,
     from: r.from,
+    from_name: r.from_name,
+    from_email: r.from_email,
     to: r.to,
     subject: r.subject,
     date: r.date,
     messageId: r.messageId,
     references: null,
-    inReplyTo: null,
+    inReplyTo: r.inReplyTo || null,
     snippet: r.snippet || "",
     body: r.body_text || r.body_html || "",
   };
 }
 
 async function svcSend({ userId, to, subject, body, threadId = null }) {
-  // threadId not used yet for Outlook send
   return await opSend({ userId, to, subject, body, saveToSentItems: true });
 }
 
@@ -860,8 +893,8 @@ async function svcReplyById({ userId, messageId, body }) {
 }
 
 async function svcReplyLatest({ userId, body }) {
-  const list = await svcList({ userId, max: 1 });
-  const latest = list?.[0];
+  const list = await svcList({ userId, max: 10 });
+  const latest = (list || []).sort((a, b) => Number(b.internalDate || 0) - Number(a.internalDate || 0))[0];
   if (!latest?.id) throw new Error("No Outlook emails found to reply to.");
   return await svcReplyById({ userId, messageId: latest.id, body });
 }

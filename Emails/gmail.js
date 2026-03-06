@@ -10,16 +10,20 @@
 // ✅ Browser success page (for desktop/manual testing)
 // ✅ Friendly GET routes for quick testing
 // ✅ Exports BOTH router + service interface for LXT.js
+// ✅ Better LXT normalization
+// ✅ Better latest-email ordering
+// ✅ Better sender parsing
+// ✅ Better unread / recent inbox behavior
 //
 // Required env:
 //   GOOGLE_CLIENT_ID
 //   GOOGLE_CLIENT_SECRET
-//   GOOGLE_REDIRECT_URI   (must match Google Cloud OAuth redirect URI exactly)
+//   GOOGLE_REDIRECT_URI
 //
 // Optional env:
 //   DATABASE_URL
 //   GMAIL_STATE_SECRET
-//   GMAIL_SUCCESS_WEB_URL (default https://loravo-backend.onrender.com)
+//   GMAIL_SUCCESS_WEB_URL
 // =====================================================
 
 require("dotenv").config();
@@ -180,11 +184,16 @@ function decodeBody(dataB64Url) {
 function extractTextPlain(payload) {
   if (!payload) return "";
   const mimeType = payload.mimeType || "";
-  if (mimeType === "text/plain" && payload.body?.data) return decodeBody(payload.body.data);
+
+  if (mimeType === "text/plain" && payload.body?.data) {
+    return decodeBody(payload.body.data);
+  }
 
   const parts = payload.parts || [];
   for (const p of parts) {
-    if (p?.mimeType === "text/plain" && p?.body?.data) return decodeBody(p.body.data);
+    if (p?.mimeType === "text/plain" && p?.body?.data) {
+      return decodeBody(p.body.data);
+    }
   }
 
   for (const p of parts) {
@@ -193,6 +202,67 @@ function extractTextPlain(payload) {
   }
 
   return "";
+}
+
+function extractTextHtml(payload) {
+  if (!payload) return "";
+  const mimeType = payload.mimeType || "";
+
+  if (mimeType === "text/html" && payload.body?.data) {
+    return decodeBody(payload.body.data);
+  }
+
+  const parts = payload.parts || [];
+  for (const p of parts) {
+    if (p?.mimeType === "text/html" && p?.body?.data) {
+      return decodeBody(p.body.data);
+    }
+  }
+
+  for (const p of parts) {
+    const nested = extractTextHtml(p);
+    if (nested) return nested;
+  }
+
+  return "";
+}
+
+function stripHtml(html) {
+  return String(html || "")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractEmailAddress(raw) {
+  const s = safeStr(raw, 500);
+  if (!s) return null;
+  const m = s.match(/<([^>]+@[^>]+)>/);
+  if (m?.[1]) return m[1].trim();
+  const m2 = s.match(/\b([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})\b/i);
+  return m2?.[1] ? m2[1].trim() : null;
+}
+
+function extractDisplayName(raw) {
+  const s = safeStr(raw, 500);
+  if (!s) return null;
+  const m = s.match(/^"?([^"<]+?)"?\s*<[^>]+>$/);
+  if (m?.[1]) return m[1].trim();
+  if (s.includes("@")) return null;
+  return s.trim();
+}
+
+function normalizeFrom(rawFrom) {
+  const email = extractEmailAddress(rawFrom);
+  const name = extractDisplayName(rawFrom);
+  return {
+    raw: safeStr(rawFrom, 500) || null,
+    email: email || null,
+    name: name || null,
+    display: name ? `${name}${email ? ` <${email}>` : ""}` : email || safeStr(rawFrom, 500) || "(unknown sender)",
+  };
 }
 
 function buildRawEmail({ to, subject, text, from, inReplyTo, references }) {
@@ -230,7 +300,11 @@ async function saveTokens(userId, tokens, email) {
     return;
   }
 
-  memTokens.set(String(userId), { tokens, email: email || null, updated_at: new Date().toISOString() });
+  memTokens.set(String(userId), {
+    tokens,
+    email: email || null,
+    updated_at: new Date().toISOString(),
+  });
 }
 
 async function loadTokens(userId) {
@@ -246,7 +320,13 @@ async function loadTokens(userId) {
 
   const hit = memTokens.get(String(userId));
   if (!hit) return null;
-  return { user_id: String(userId), email: hit.email, tokens: hit.tokens, updated_at: hit.updated_at };
+
+  return {
+    user_id: String(userId),
+    email: hit.email,
+    tokens: hit.tokens,
+    updated_at: hit.updated_at,
+  };
 }
 
 async function clearTokens(userId) {
@@ -269,11 +349,9 @@ async function getAuthedGmailClient(userId) {
   const oauth2 = makeOAuthClient();
   oauth2.setCredentials(record.tokens);
 
-  // Persist refreshed tokens (best effort)
   oauth2.on("tokens", async (newTokens) => {
     try {
       if (!newTokens) return;
-      // Reload latest, then merge
       const latest = await loadTokens(userId);
       const merged = { ...(latest?.tokens || record.tokens || {}), ...(newTokens || {}) };
       await saveTokens(userId, merged, latest?.email || record.email || null);
@@ -288,7 +366,13 @@ async function getAuthedGmailClient(userId) {
 
 /* ===================== CORE OPS ===================== */
 
-async function opList({ userId, q = "newer_than:2d", maxResults = 10, labelIds = ["INBOX"] }) {
+async function opList({
+  userId,
+  q = "newer_than:2d",
+  maxResults = 10,
+  labelIds = ["INBOX"],
+  includeBody = false,
+}) {
   const { gmail } = await getAuthedGmailClient(userId);
 
   const list = await gmail.users.messages.list({
@@ -306,37 +390,58 @@ async function opList({ userId, q = "newer_than:2d", maxResults = 10, labelIds =
       gmail.users.messages.get({
         userId: "me",
         id: m.id,
-        format: "metadata",
-        metadataHeaders: ["From", "Reply-To", "To", "Subject", "Date", "Message-Id", "References", "In-Reply-To"],
+        format: includeBody ? "full" : "metadata",
+        metadataHeaders: [
+          "From",
+          "Reply-To",
+          "To",
+          "Subject",
+          "Date",
+          "Message-Id",
+          "References",
+          "In-Reply-To",
+        ],
       })
     )
   );
 
-  return details.map((d) => {
-    const msg = d?.data || {};
-    const headers = msg.payload?.headers || [];
+  return details
+    .map((d) => {
+      const msg = d?.data || {};
+      const headers = msg.payload?.headers || [];
 
-    const from = pickHeader(headers, "From");
-    const subject = pickHeader(headers, "Subject");
-    const date = pickHeader(headers, "Date");
+      const fromRaw = pickHeader(headers, "From");
+      const fromNorm = normalizeFrom(fromRaw);
 
-    // ✅ LXT-friendly normalized item
-    return {
-      id: safeStr(msg.id, 200),
-      threadId: safeStr(msg.threadId, 200),
-      from: safeStr(from, 300) || "(unknown sender)",
-      subject: safeStr(subject, 300) || "(no subject)",
-      snippet: safeStr(msg.snippet || "", 400),
-      date: safeStr(date, 120) || null,
+      let bodyText = "";
+      if (includeBody) {
+        bodyText = extractTextPlain(msg.payload);
+        if (!bodyText) {
+          const html = extractTextHtml(msg.payload);
+          bodyText = stripHtml(html);
+        }
+      }
 
-      // extra fields (harmless, sometimes useful)
-      to: safeStr(pickHeader(headers, "To"), 300) || null,
-      replyTo: safeStr(pickHeader(headers, "Reply-To"), 300) || null,
-      messageId: safeStr(pickHeader(headers, "Message-Id"), 300) || null,
-      references: safeStr(pickHeader(headers, "References"), 600) || null,
-      inReplyTo: safeStr(pickHeader(headers, "In-Reply-To"), 300) || null,
-    };
-  });
+      return {
+        id: safeStr(msg.id, 200),
+        threadId: safeStr(msg.threadId, 200),
+        from: fromNorm.display,
+        from_name: fromNorm.name,
+        from_email: fromNorm.email,
+        from_raw: fromNorm.raw,
+        subject: safeStr(pickHeader(headers, "Subject"), 300) || "(no subject)",
+        snippet: safeStr(msg.snippet || "", 500),
+        date: safeStr(pickHeader(headers, "Date"), 120) || null,
+        to: safeStr(pickHeader(headers, "To"), 300) || null,
+        replyTo: safeStr(pickHeader(headers, "Reply-To"), 300) || null,
+        messageId: safeStr(pickHeader(headers, "Message-Id"), 300) || null,
+        references: safeStr(pickHeader(headers, "References"), 1000) || null,
+        inReplyTo: safeStr(pickHeader(headers, "In-Reply-To"), 300) || null,
+        internalDate: msg.internalDate ? Number(msg.internalDate) : null,
+        body_text: includeBody ? safeStr(bodyText, 200000) : null,
+      };
+    })
+    .sort((a, b) => Number(b.internalDate || 0) - Number(a.internalDate || 0));
 }
 
 async function opRead({ userId, id }) {
@@ -346,21 +451,32 @@ async function opRead({ userId, id }) {
 
   const msg = r?.data || {};
   const headers = msg.payload?.headers || [];
-  const textPlain = extractTextPlain(msg.payload);
+  const fromRaw = pickHeader(headers, "From");
+  const fromNorm = normalizeFrom(fromRaw);
+
+  let textPlain = extractTextPlain(msg.payload);
+  if (!textPlain) {
+    const html = extractTextHtml(msg.payload);
+    textPlain = stripHtml(html);
+  }
 
   return {
     id: safeStr(msg.id, 200),
     threadId: safeStr(msg.threadId, 200),
-    from: safeStr(pickHeader(headers, "From"), 300) || "(unknown sender)",
+    from: fromNorm.display,
+    from_name: fromNorm.name,
+    from_email: fromNorm.email,
+    from_raw: fromNorm.raw,
     replyTo: safeStr(pickHeader(headers, "Reply-To"), 300) || null,
     to: safeStr(pickHeader(headers, "To"), 300) || null,
     subject: safeStr(pickHeader(headers, "Subject"), 300) || "(no subject)",
     date: safeStr(pickHeader(headers, "Date"), 120) || null,
     messageId: safeStr(pickHeader(headers, "Message-Id"), 300) || null,
-    references: safeStr(pickHeader(headers, "References"), 600) || null,
+    references: safeStr(pickHeader(headers, "References"), 1000) || null,
     inReplyTo: safeStr(pickHeader(headers, "In-Reply-To"), 300) || null,
     snippet: safeStr(msg.snippet || "", 500),
-    body_text: safeStr(textPlain || "", 200000), // keep large
+    body_text: safeStr(textPlain || "", 200000),
+    internalDate: msg.internalDate ? Number(msg.internalDate) : null,
   };
 }
 
@@ -378,13 +494,15 @@ async function opSend({ userId, to, subject, body, threadId = null }) {
     requestBody: { raw, ...(threadId ? { threadId } : {}) },
   });
 
-  return { id: sent?.data?.id || null, threadId: sent?.data?.threadId || threadId || null };
+  return {
+    id: sent?.data?.id || null,
+    threadId: sent?.data?.threadId || threadId || null,
+  };
 }
 
 async function opReply({ userId, id, body }) {
   const { gmail } = await getAuthedGmailClient(userId);
 
-  // Pull metadata we need to reply properly
   const original = await gmail.users.messages.get({
     userId: "me",
     id,
@@ -403,7 +521,7 @@ async function opReply({ userId, id, body }) {
   const subject = /^re:/i.test(subject0) ? subject0 : `Re: ${subject0}`;
 
   const messageId = safeStr(pickHeader(headers, "Message-Id") || "", 300) || null;
-  const references0 = safeStr(pickHeader(headers, "References") || "", 600) || null;
+  const references0 = safeStr(pickHeader(headers, "References") || "", 1000) || null;
 
   const references = references0
     ? `${references0} ${messageId || ""}`.trim()
@@ -422,7 +540,10 @@ async function opReply({ userId, id, body }) {
     requestBody: { raw, threadId: msg.threadId },
   });
 
-  return { id: sent?.data?.id || null, threadId: sent?.data?.threadId || msg.threadId || null };
+  return {
+    id: sent?.data?.id || null,
+    threadId: sent?.data?.threadId || msg.threadId || null,
+  };
 }
 
 /* ===================== ROUTES ===================== */
@@ -447,16 +568,14 @@ router.get("/", (_, res) => {
   });
 });
 
-// GET /gmail/auth?user_id=...&mode=app?
 router.get("/auth", (req, res) => {
   const userId = String(req.query.user_id || "").trim();
-  const mode = String(req.query.mode || "").trim(); // "app" or ""
+  const mode = String(req.query.mode || "").trim();
   if (!userId) return res.status(400).send("Missing user_id");
   const extra = mode ? `&mode=${encodeURIComponent(mode)}` : "";
   return res.redirect(`/gmail/auth-url?user_id=${encodeURIComponent(userId)}${extra}`);
 });
 
-// GET /gmail/status?user_id=...
 router.get("/status", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -475,11 +594,10 @@ router.get("/status", async (req, res) => {
   }
 });
 
-// GET /gmail/auth-url?user_id=...&mode=app?
 router.get("/auth-url", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
-    const mode = String(req.query.mode || "").trim(); // "app" for iOS auto-close
+    const mode = String(req.query.mode || "").trim();
     if (!userId) return res.status(400).json({ error: "Missing user_id" });
 
     const oauth2 = makeOAuthClient();
@@ -488,7 +606,7 @@ router.get("/auth-url", async (req, res) => {
       user_id: userId,
       mode: mode || "",
       nonce: crypto.randomBytes(12).toString("hex"),
-      exp: Date.now() + 10 * 60 * 1000, // 10 min
+      exp: Date.now() + 10 * 60 * 1000,
     });
 
     const url = oauth2.generateAuthUrl({
@@ -507,7 +625,6 @@ router.get("/auth-url", async (req, res) => {
   }
 });
 
-// Browser success page: GET /gmail/connected?user_id=...&email=...
 router.get("/connected", (req, res) => {
   const email = String(req.query.email || "");
   const userId = String(req.query.user_id || "");
@@ -521,11 +638,9 @@ router.get("/connected", (req, res) => {
       <body style="font-family: -apple-system, system-ui; padding: 28px; line-height: 1.4;">
         <h1 style="margin:0 0 12px 0;">✅ Gmail Connected</h1>
         <p style="margin:0 0 18px 0;">${email ? `Connected as <b>${email}</b>.` : "Connection saved."}</p>
-
         <p style="margin:0 0 10px 0; opacity:.75;">
           If you’re on iPhone, go back to Loravo. If Loravo didn’t open automatically, tap the button below.
         </p>
-
         <a href="loravo://connected?provider=gmail&user_id=${encodeURIComponent(userId)}&email=${encodeURIComponent(email)}"
            style="display:inline-block; padding:12px 16px; border-radius:12px; background:#111; color:#fff; text-decoration:none;">
           Open Loravo
@@ -535,7 +650,6 @@ router.get("/connected", (req, res) => {
   `);
 });
 
-// OAuth callback: GET /gmail/oauth2callback?code=...&state=...
 router.get("/oauth2callback", async (req, res) => {
   try {
     const code = String(req.query.code || "").trim();
@@ -546,7 +660,7 @@ router.get("/oauth2callback", async (req, res) => {
     if (!state?.user_id) return res.status(400).send("Invalid state (expired or tampered)");
 
     const userId = String(state.user_id);
-    const mode = String(state.mode || "").trim(); // "app" -> deep link
+    const mode = String(state.mode || "").trim();
 
     const oauth2 = makeOAuthClient();
     const { tokens } = await oauth2.getToken(code);
@@ -578,7 +692,6 @@ router.get("/oauth2callback", async (req, res) => {
 
 /* ===================== DISCONNECT ===================== */
 
-// POST /gmail/disconnect  { user_id }
 router.post("/disconnect", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -590,7 +703,6 @@ router.post("/disconnect", async (req, res) => {
   }
 });
 
-// GET /gmail/disconnect?user_id=...
 router.get("/disconnect", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -604,7 +716,6 @@ router.get("/disconnect", async (req, res) => {
 
 /* ===================== API (POST) ===================== */
 
-// POST /gmail/list  body: { user_id, q?, maxResults? }
 router.post("/list", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -620,7 +731,6 @@ router.post("/list", async (req, res) => {
   }
 });
 
-// POST /gmail/read  body: { user_id, id }
 router.post("/read", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -635,7 +745,6 @@ router.post("/read", async (req, res) => {
   }
 });
 
-// POST /gmail/send  body: { user_id, to, subject, body, threadId? }
 router.post("/send", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -655,7 +764,6 @@ router.post("/send", async (req, res) => {
   }
 });
 
-// POST /gmail/reply  body: { user_id, id, body }
 router.post("/reply", async (req, res) => {
   try {
     const userId = String(req.body?.user_id || "").trim();
@@ -675,7 +783,6 @@ router.post("/reply", async (req, res) => {
 
 /* ===================== EASY TEST ROUTES (GET) ===================== */
 
-// GET /gmail/list?user_id=...&q=...&maxResults=...
 router.get("/list", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -691,7 +798,6 @@ router.get("/list", async (req, res) => {
   }
 });
 
-// GET /gmail/read?user_id=...&id=...
 router.get("/read", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -706,7 +812,6 @@ router.get("/read", async (req, res) => {
   }
 });
 
-// GET /gmail/send?user_id=...&to=...&subject=...&body=...
 router.get("/send", async (req, res) => {
   try {
     const userId = String(req.query.user_id || "").trim();
@@ -732,14 +837,13 @@ async function svcGetConnectedProviders({ userId }) {
   return rec?.tokens ? ["gmail"] : [];
 }
 
-// ✅ LXT expects: id, subject, from, snippet (and optional date/threadId)
 async function svcList({ userId, q = "newer_than:7d", max = 10, disable_orderby = false }) {
-  // disable_orderby exists for compatibility; Gmail API already returns recent-ish.
   return await opList({
     userId,
     q: String(q || "newer_than:7d"),
     maxResults: Math.min(Number(max || 10), 25),
     labelIds: ["INBOX"],
+    includeBody: false,
   });
 }
 
@@ -749,6 +853,8 @@ async function svcGetBody({ userId, messageId }) {
     id: r.id,
     threadId: r.threadId,
     from: r.from,
+    from_name: r.from_name,
+    from_email: r.from_email,
     to: r.to,
     subject: r.subject,
     date: r.date,
@@ -769,10 +875,18 @@ async function svcReplyById({ userId, messageId, body }) {
 }
 
 async function svcReplyLatest({ userId, body }) {
-  // ✅ reliably pick latest INBOX item
-  const items = await svcList({ userId, q: "newer_than:30d", max: 1 });
+  const items = await opList({
+    userId,
+    q: "newer_than:30d",
+    maxResults: 10,
+    labelIds: ["INBOX"],
+    includeBody: false,
+  });
+
   if (!items.length) throw new Error("No recent emails to reply to.");
-  return await svcReplyById({ userId, messageId: items[0].id, body });
+
+  const latest = items.sort((a, b) => Number(b.internalDate || 0) - Number(a.internalDate || 0))[0];
+  return await svcReplyById({ userId, messageId: latest.id, body });
 }
 
 module.exports = {
