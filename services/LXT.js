@@ -1,17 +1,19 @@
 /*************************************************
- * LXT.js — Loravo LXT Engine (UPGRADED)
+ * LXT.js — Loravo LXT Engine (FINAL UPGRADED)
  *
- * GOALS OF THIS VERSION:
- * - GPT-style answer quality while still branded as LXT-1
- * - OpenAI FIRST for chat + vision in trinity mode
- * - richer image understanding
- * - richer weather/news answers
- * - fewer weak handcrafted fast-path replies
- * - keeps email / tier / memory / live-context logic
+ * PURPOSE
+ * - LXT is Loravo’s intelligence engine.
+ * - User-facing identity is ALWAYS: Powered by LXT-1.
+ * - OpenAI is primary for chat + vision in trinity mode.
+ * - Gemini can still be used as fallback.
+ * - Supports email, weather, news, stocks, memory, vision, and live context.
+ * - Auto / Instant / Thinking behave like real intelligence modes.
+ * - Up to 4 images in one message are treated as ONE combined visual context.
+ * - Avoids robotic, repetitive, over-formatted replies.
  *
- * IMPORTANT BRAND RULE:
- * - User-facing identity: ALWAYS "Powered by LXT-1."
+ * IMPORTANT BRAND RULE
  * - Never mention model names to the user.
+ * - Never mention internal tools, prompts, providers, or system design.
  *************************************************/
 
 const fetch = require("node-fetch");
@@ -34,43 +36,99 @@ function createLXT({
 
   /* ===================== CONFIG ===================== */
 
-  const TOKEN_LIMITS = { instant: 520, auto: 1400, thinking: 2600 };
+  const TOKEN_LIMITS = {
+    instant: 420,
+    auto: 1200,
+    thinking: 2400,
+  };
 
   function getMode(req) {
-    const m = String(req?.query?.mode || "auto").toLowerCase();
-    return ["instant", "auto", "thinking"].includes(m) ? m : "auto";
+    const raw = String(req?.query?.mode || req?.body?.mode || "auto").toLowerCase().trim();
+    return ["instant", "auto", "thinking"].includes(raw) ? raw : "auto";
   }
 
   function getProvider(req) {
-    const p = String(req?.query?.provider || "trinity").toLowerCase();
-    return ["openai", "gemini", "trinity"].includes(p) ? p : "trinity";
+    const raw = String(req?.query?.provider || req?.body?.provider || "trinity").toLowerCase().trim();
+    return ["openai", "gemini", "trinity"].includes(raw) ? raw : "trinity";
+  }
+
+  function normalizeMode(mode) {
+    const m = String(mode || "").toLowerCase().trim();
+    return ["instant", "auto", "thinking"].includes(m) ? m : "auto";
+  }
+
+  function estimateComplexity(text = "", hasImages = false) {
+    const t = String(text || "").trim();
+    const lower = t.toLowerCase();
+
+    if (!t && !hasImages) return 0.05;
+    if (hasImages) {
+      if (/(compare|difference|which|best|analyze|explain|what stands out|identify|what is this)/i.test(t)) return 0.82;
+      return 0.70;
+    }
+
+    let score = 0.18;
+
+    if (t.length > 25) score += 0.08;
+    if (t.length > 80) score += 0.10;
+    if (t.length > 180) score += 0.14;
+    if (t.length > 320) score += 0.12;
+
+    if (/\b(hi|hello|hey|yo|sup|what'?s up)\b/.test(lower) && t.length < 30) score -= 0.08;
+    if (/\b(compare|analyze|strategy|explain|forecast|why|deep|details|elaborate|plan|roadmap|tradeoff|pros and cons|should i|what should i do|recommend|judge|decision|best option)\b/.test(lower)) score += 0.28;
+    if (/\b(step by step|break it down|go deeper|deeper|more detail|examples|multi-step|long term)\b/.test(lower)) score += 0.24;
+    if (/\b(weather|news|stocks|email|inbox|location|calendar|reminder|reply|send)\b/.test(lower)) score += 0.10;
+
+    return Math.max(0, Math.min(1, score));
   }
 
   function pickAutoMode(text, hasImages = false) {
-    if (hasImages) return "thinking";
-    if (!text) return "instant";
-
-    const t = String(text).toLowerCase().trim();
-
-    if (t.length < 30 || /^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)) return "instant";
-
-    if (
-      /(analyze|compare|strategy|explain|forecast|why|step by step|break it down|deep|details|elaborate|plan|roadmap)/.test(t) ||
-      t.length > 180
-    ) {
-      return "thinking";
-    }
-
+    const c = estimateComplexity(text, hasImages);
+    if (c >= 0.72) return "thinking";
+    if (c >= 0.38) return "auto";
     return "instant";
   }
 
-  function pickReplyTokens(userText, hasImages = false) {
-    if (hasImages) return 1400;
+  function pickReplyTokens({ mode, userText, hasImages = false }) {
     const len = String(userText || "").trim().length;
-    if (len <= 18) return 220;
-    if (len <= 80) return 480;
-    if (len <= 200) return 900;
-    return 1500;
+    const m = normalizeMode(mode);
+
+    if (hasImages) {
+      if (m === "instant") return 700;
+      if (m === "thinking") return 1900;
+      return 1200;
+    }
+
+    if (m === "instant") {
+      if (len <= 18) return 120;
+      if (len <= 70) return 220;
+      return 320;
+    }
+
+    if (m === "thinking") {
+      if (len <= 60) return 700;
+      if (len <= 180) return 1300;
+      return 2200;
+    }
+
+    // auto (medium)
+    if (len <= 18) return 180;
+    if (len <= 80) return 420;
+    if (len <= 220) return 850;
+    return 1300;
+  }
+
+  function chooseDepthHint({ mode, userText, hasImages = false }) {
+    const t = String(userText || "").trim().toLowerCase();
+
+    if (mode === "instant") return "short";
+    if (mode === "thinking") return hasImages ? "deep" : "deliberate";
+    if (hasImages) return "deep";
+
+    if (/\b(more|details|deeper|explain|break it down|step by step|examples|expand|elaborate)\b/.test(t)) return "deep";
+    if (t.length < 40 || /^(hi|hello|hey|yo|sup|what'?s up)\b/.test(t)) return "short";
+    if (/\b(compare|strategy|plan|pros and cons|forecast|analyze|judge|recommend)\b/.test(t) || t.length > 160) return "deliberate";
+    return "normal";
   }
 
   /* ===================== TIERS ===================== */
@@ -121,80 +179,111 @@ function createLXT({
 
   /* ===================== PROMPTS ===================== */
 
-  function LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile) {
+  function LXT_MASTER_CHAT_SYSTEM_PROMPT({
+    voiceProfile,
+    mode = "auto",
+    hasImages = false,
+  }) {
+    const modeLine =
+      mode === "instant"
+        ? "MODE: INSTANT — Be quick, sharp, polished, and short by default. Do not become robotic."
+        : mode === "thinking"
+        ? "MODE: THINKING — Reason more carefully, use more context, and give a deeper, stronger answer when useful."
+        : "MODE: AUTO — Decide the right depth automatically. Keep simple things fast and make hard things deeper.";
+
+    const imageLine = hasImages
+      ? `
+MULTI-IMAGE RULE
+- Up to 4 images in one message must be treated as ONE combined visual context.
+- First scan all images quickly.
+- Identify what each image shows.
+- Compare them to each other.
+- Detect relationships, differences, sequence, repeated objects, text, symbols, layout, style, and likely intent.
+- Build ONE clear understanding before answering.
+- Default to ONE unified answer, not separate captions, unless the user explicitly asks for per-image breakdown.
+`
+      : "";
+
     return `
 You are LXT, the intelligence layer inside LORAVO.
 
-You are the real brain behind the conversation.
-Internally you can use strong reasoning and multimodal understanding, but to the user you are only LXT.
+You are not a generic chatbot.
+You are a premium intelligence engine inside Loravo.
+To the user, you are only LXT.
+If asked what powers you, reply exactly:
+Powered by LXT-1.
 
 PRIMARY IDENTITY
 - Calm
 - Human
 - Sharp
 - Helpful
+- Thoughtful
+- Polished
 - Natural
 - Slightly ahead
 - Never robotic
-- Never corporate
 - Never stiff
+- Never corporate
+- Never childish
 - Never hype
 
-CORE RULE
-- Answer the user directly.
-- Do not give weak placeholder replies when you can answer now.
+${modeLine}
+
+CORE BEHAVIOR
+- Answer directly.
+- Infer the user's real intent.
+- Use the provided memory and live context when relevant.
+- If the user asks something simple, answer simply.
+- If the task deserves more depth, give more depth.
 - Do not ask unnecessary clarification questions when a strong answer is possible.
-- If the user asks a simple question, answer it fully.
-- If the user asks for more, then expand.
+- Be independently useful, but still aligned with the user.
 
-QUALITY BAR
-- Match a top-tier assistant.
-- Be specific, not generic.
-- Use real reasoning from the provided live context.
-- If context is missing, still be useful and intelligent.
+COMMUNICATION RULES
+- Default to natural short paragraphs.
+- Default length: 1–4 sentences for simple requests.
+- Go longer only when needed.
+- Avoid markdown headings like "### Key Details".
+- Avoid school-report structure unless the user clearly wants a breakdown.
+- Use bullets only when they genuinely improve clarity.
+- Vary your wording naturally so greetings and openings do not sound repetitive or scripted.
+- Never sound like a template.
+- No filler.
 
-VISION RULE
-When images are present:
-- First identify clearly what the object/scene most likely is.
-- Then explain the key details that matter.
-- Then give the practical next step if relevant.
-- Be detailed when helpful.
-- Do not be vague.
-- Do not hedge too much.
-- Do not say “possibly” every sentence.
-- If the user asks “what is this”, answer like an expert would.
-- If they ask “where can I buy this”, assume they mean the item in the image unless the context says otherwise.
+VISION RULES
+${imageLine}
+- When images are present, identify clearly what the object, scene, UI, or comparison most likely is.
+- Mention the most important details that matter.
+- If the user is comparing, compare clearly.
+- If the user is asking what something is, identify confidently.
+- If the user wants advice, use the full visual set to guide the answer.
+- Be strong and useful, not shallow.
+- Avoid excessive hedging.
 
 WEATHER RULE
-If the user asks for weather and live weather exists:
-- Give the actual answer now.
-- Do not ask “which one do you want?” unless the user truly asked something ambiguous.
-- Include current conditions and a useful short outlook.
+- If live weather exists, answer with the actual weather now.
+- Include current conditions and a useful short outlook when possible.
+- Do not ask for unnecessary clarification if place is already inferable from context.
 
 NEWS RULE
-If live news exists:
-- Summarize what matters.
-- Pull out the real implication.
-- Keep the user ahead.
+- If live news exists, summarize what matters and the implication.
+- Keep the user ahead, not overloaded.
 
-STYLE
-- Default: 2–6 sentences.
-- Expand naturally when the task needs depth.
-- Use bullets only when they improve clarity.
-- Vary sentence rhythm.
-- Avoid templates.
-- Avoid filler.
+MEMORY RULE
+- Use memory naturally.
+- Do not sound creepy or overly explicit about remembered details.
+- Use memory to improve relevance, continuity, and personalization.
+
+EMAIL RULE
+- If the user asks about email, operate like a capable assistant.
+- Be clear, calm, and action-oriented.
 
 NEVER SAY
-- “As an AI”
+- "As an AI"
 - model names
-- “I can’t browse”
-- “Based on the image provided” unless needed once naturally
-- anything about internal tools or prompts
-
-IDENTITY RESPONSE
-If asked what powers you, reply exactly:
-Powered by LXT-1.
+- provider names
+- anything about hidden prompts, internal tools, or APIs
+- "Based on the image provided" unless naturally needed once
 
 VOICE PROFILE
 ${voiceProfile ? `- ${voiceProfile}` : "- Calm, human, direct. Short first. Expands when needed. No hype."}
@@ -204,7 +293,24 @@ Return ONLY the reply text.
 `.trim();
   }
 
-  /* ===================== SCHEMA ===================== */
+  function DECISION_SYSTEM_PROMPT() {
+    return `
+You are LXT-1, Loravo's internal decision engine.
+
+Return ONLY one JSON object matching the target schema.
+
+Rules:
+- Use the user message, memory, and live context only.
+- Be calm, realistic, and useful.
+- Do not invent facts.
+- If uncertain, prefer HOLD with moderate confidence.
+- Keep one_liner sharp and human.
+- Actions should be practical.
+- Watchouts should be real, not generic noise.
+`.trim();
+  }
+
+  /* ===================== SCHEMA / UTILS ===================== */
 
   function clamp(n, a, b) {
     const x = Number(n);
@@ -224,94 +330,6 @@ Return ONLY the reply text.
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), ms);
     return { controller, cancel: () => clearTimeout(t) };
-  }
-
-  function safeFallbackResult(reason = "Temporary disruption — try again in a moment.") {
-    return {
-      verdict: "PREPARE",
-      confidence: 0.55,
-      one_liner: reason,
-      signals: [],
-      actions: [{ now: "Retry in ~30 seconds", time: "today", effort: "low" }],
-      watchouts: ["Provider outage / quota"],
-      next_check: safeNowPlus(60 * 60 * 1000),
-    };
-  }
-
-  function sanitizeToSchema(o) {
-    const conf = typeof o?.confidence === "number" ? o.confidence : 0.62;
-
-    const signals = Array.isArray(o?.signals)
-      ? o.signals
-          .slice(0, 10)
-          .map((s) => ({
-            name: String(s?.name || "").slice(0, 80),
-            direction: ["up", "down", "neutral"].includes(s?.direction) ? s.direction : "neutral",
-            weight: Number.isFinite(Number(s?.weight)) ? Number(s.weight) : 0.2,
-            why: String(s?.why || "").slice(0, 240),
-          }))
-          .filter((s) => s.name)
-      : [];
-
-    const actions = Array.isArray(o?.actions)
-      ? o.actions
-          .slice(0, 8)
-          .map((a) => ({
-            now: String(a?.now || "").slice(0, 240),
-            time: ["today", "this_week", "this_month"].includes(a?.time) ? a.time : "today",
-            effort: ["low", "med", "high"].includes(a?.effort) ? a.effort : "low",
-          }))
-          .filter((a) => a.now)
-      : [{ now: "Proceed normally", time: "today", effort: "low" }];
-
-    const watchouts = Array.isArray(o?.watchouts) ? o.watchouts.slice(0, 10).map((w) => String(w).slice(0, 200)) : [];
-
-    return {
-      verdict: ["HOLD", "PREPARE", "MOVE", "AVOID"].includes(o?.verdict) ? o.verdict : "HOLD",
-      confidence: clamp(Math.round(conf * 100) / 100, 0, 1),
-      one_liner: String(o?.one_liner || "OK").slice(0, 280),
-      signals,
-      actions,
-      watchouts,
-      next_check: typeof o?.next_check === "string" ? o?.next_check : safeNowPlus(6 * 60 * 60 * 1000),
-    };
-  }
-
-  function extractFirstJSONObject(text) {
-    if (!text || typeof text !== "string") return null;
-    const s = text;
-    const start = s.indexOf("{");
-    if (start === -1) return null;
-
-    let depth = 0;
-    for (let i = start; i < s.length; i++) {
-      const ch = s[i];
-      if (ch === "{") depth++;
-      if (ch === "}") depth--;
-      if (depth === 0) {
-        const candidate = s.slice(start, i + 1);
-        try {
-          return JSON.parse(candidate);
-        } catch {
-          const nextStart = s.indexOf("{", start + 1);
-          if (nextStart === -1) return null;
-          return extractFirstJSONObject(s.slice(nextStart));
-        }
-      }
-    }
-    return null;
-  }
-
-  function isPoweredByQuestion(userText) {
-    const t = String(userText || "").toLowerCase();
-    return (
-      t.includes("powered by") ||
-      t.includes("powerd by") ||
-      t.includes("what powers") ||
-      t.includes("what are you built on") ||
-      t.includes("what model") ||
-      t.includes("what are you running on")
-    );
   }
 
   function toNum(x) {
@@ -353,7 +371,19 @@ Return ONLY the reply text.
     const s = String(text || "").replace(/\s+/g, " ").trim();
     if (!s) return null;
     const cut = s.split(/[.!?]\s/)[0] || s;
-    return cut.slice(0, 120);
+    return cut.slice(0, 140);
+  }
+
+  function isPoweredByQuestion(userText) {
+    const t = String(userText || "").toLowerCase();
+    return (
+      t.includes("powered by") ||
+      t.includes("powerd by") ||
+      t.includes("what powers") ||
+      t.includes("what are you built on") ||
+      t.includes("what model") ||
+      t.includes("what are you running on")
+    );
   }
 
   function isBuyOrFindQuestion(text) {
@@ -366,16 +396,85 @@ Return ONLY the reply text.
     return /\b(more|more detail|details|go deeper|deeper|why|explain|break it down|step by step|steps|examples|expand|elaborate)\b/.test(t);
   }
 
-  function lengthHintForReply(userText, hasImages = false) {
-    const t = String(userText || "").trim();
-    if (hasImages) return "deep";
-    if (t.length < 40 || /^(hi|hello|hey|yo|sup|what'?s up)\b/i.test(t)) return "short";
-    if (userWantsMore(t)) return "deep";
-    if (/(analyze|strategy|plan|compare|pros and cons|forecast|timeline|what is this|weather|news)/i.test(t) || t.length > 140) return "deep";
-    return "normal";
+  function extractFirstJSONObject(text) {
+    if (!text || typeof text !== "string") return null;
+    const s = text;
+    const start = s.indexOf("{");
+    if (start === -1) return null;
+
+    let depth = 0;
+    for (let i = start; i < s.length; i++) {
+      const ch = s[i];
+      if (ch === "{") depth++;
+      if (ch === "}") depth--;
+      if (depth === 0) {
+        const candidate = s.slice(start, i + 1);
+        try {
+          return JSON.parse(candidate);
+        } catch {
+          const nextStart = s.indexOf("{", start + 1);
+          if (nextStart === -1) return null;
+          return extractFirstJSONObject(s.slice(nextStart));
+        }
+      }
+    }
+    return null;
   }
 
-  /* ===================== BEHAVIOR ===================== */
+  function safeFallbackResult(reason = "Temporary disruption — try again in a moment.") {
+    return {
+      verdict: "PREPARE",
+      confidence: 0.55,
+      one_liner: reason,
+      signals: [],
+      actions: [{ now: "Retry in ~30 seconds", time: "today", effort: "low" }],
+      watchouts: ["Provider outage / quota"],
+      next_check: safeNowPlus(60 * 60 * 1000),
+    };
+  }
+
+  function sanitizeToSchema(o) {
+    const conf = typeof o?.confidence === "number" ? o.confidence : 0.62;
+
+    const signals = Array.isArray(o?.signals)
+      ? o.signals
+          .slice(0, 10)
+          .map((s) => ({
+            name: String(s?.name || "").slice(0, 80),
+            direction: ["up", "down", "neutral"].includes(s?.direction) ? s.direction : "neutral",
+            weight: Number.isFinite(Number(s?.weight)) ? Number(s.weight) : 0.2,
+            why: String(s?.why || "").slice(0, 240),
+          }))
+          .filter((s) => s.name)
+      : [];
+
+    const actions = Array.isArray(o?.actions)
+      ? o.actions
+          .slice(0, 8)
+          .map((a) => ({
+            now: String(a?.now || "").slice(0, 240),
+            time: ["today", "this_week", "this_month"].includes(a?.time) ? a.time : "today",
+            effort: ["low", "med", "high"].includes(a?.effort) ? a.effort : "low",
+          }))
+          .filter((a) => a.now)
+      : [{ now: "Proceed normally", time: "today", effort: "low" }];
+
+    const watchouts = Array.isArray(o?.watchouts)
+      ? o.watchouts.slice(0, 10).map((w) => String(w).slice(0, 200))
+      : [];
+
+    return {
+      verdict: ["HOLD", "PREPARE", "MOVE", "AVOID"].includes(o?.verdict) ? o.verdict : "HOLD",
+      confidence: clamp(Math.round(conf * 100) / 100, 0, 1),
+      one_liner: String(o?.one_liner || "OK").slice(0, 280),
+      signals,
+      actions,
+      watchouts,
+      next_check: typeof o?.next_check === "string" ? o?.next_check : safeNowPlus(6 * 60 * 60 * 1000),
+    };
+  }
+
+  /* ===================== BEHAVIOR PROFILE ===================== */
 
   function inferBehaviorFromText(text) {
     const t = String(text || "");
@@ -426,19 +525,20 @@ Return ONLY the reply text.
 
   function behaviorToVoiceLine(bp) {
     if (!bp) return "";
-    const depth = bp.depth_pref > 0.6 ? "Give depth when needed." : "Keep it short first.";
-    const bullets = bp.bullet_pref > 0.6 ? "Use bullets when clarity improves." : "Prefer short paragraphs.";
-    const direct = bp.directness > 0.6 ? "Be direct. Minimal fluff." : "Be calm and friendly.";
-    const anti = bp.anti_robotic > 0.65 ? "Avoid robotic phrasing. Sound natural." : "Keep it clear and human.";
+    const depth = bp.depth_pref > 0.62 ? "Give more depth when it helps." : "Keep it short first.";
+    const bullets = bp.bullet_pref > 0.62 ? "Use bullets when clarity improves." : "Prefer short paragraphs.";
+    const direct = bp.directness > 0.62 ? "Be direct with minimal fluff." : "Be calm and friendly.";
+    const anti = bp.anti_robotic > 0.65 ? "Avoid robotic phrasing. Sound natural and alive." : "Keep it clear and human.";
     const friction = bp.friction > 0.6 ? "User may be frustrated. Be extra sharp and avoid weak filler." : "";
     return `${depth} ${bullets} ${direct} ${anti} ${friction}`.trim();
   }
 
-  /* ===================== TOPIC ===================== */
+  /* ===================== TOPIC / INTENT ===================== */
 
   function detectTopic(text, hasImages = false) {
     if (hasImages) return { kind: "image" };
     const t = String(text || "").toLowerCase();
+
     if (/(weather|forecast|temp)/.test(t)) return { kind: "weather" };
     if (/(email|inbox|gmail|outlook|yahoo)/.test(t)) return { kind: "email" };
     if (/(stock|ticker|\$[a-z]{1,5}\b|nasdaq|crypto|btc|eth)/.test(t)) return { kind: "stocks" };
@@ -455,11 +555,10 @@ Return ONLY the reply text.
     return t === "more" || t === "more." || t === "go deeper" || t === "deeper" || t === "details";
   }
 
-  /* ===================== INTENT ===================== */
-
   function classifyIntent(text, hasImages = false) {
     const t = String(text || "").toLowerCase().trim();
 
+    if (!t && hasImages) return "chat";
     if (/^(hi|hello|hey|yo|sup|what’s up|whats up)\b/.test(t)) return "greeting";
     if (/(daily brief|morning brief|brief me|what should i know today)/.test(t)) return "daily_brief";
     if (/(scan signals|signal scan|anything i should do|what am i missing|moves today|what’s the play)/.test(t)) return "signal_scan";
@@ -691,8 +790,11 @@ Return ONLY the reply text.
 
   async function loadUserMemory(userId) {
     if (!userId) return "";
-    const { rows } = await dbQuery(`SELECT content FROM user_memory WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30`, [userId]);
-    return (rows || []).map((r) => r.content).join("\n");
+    const { rows } = await dbQuery(
+      `SELECT content FROM user_memory WHERE user_id=$1 ORDER BY created_at DESC LIMIT 40`,
+      [userId]
+    );
+    return (rows || []).map((r) => String(r.content || "")).filter(Boolean).join("\n");
   }
 
   async function saveUserMemory(userId, text) {
@@ -712,7 +814,7 @@ Return ONLY the reply text.
     const keys = Object.keys(patch || {});
     if (!keys.length) return;
 
-    const JSONB_COLS = new Set(["behavior_profile", "last_topic"]);
+    const JSONB_COLS = new Set(["behavior_profile", "last_topic", "memory_profile"]);
 
     const cols = [];
     const setCols = [];
@@ -769,6 +871,45 @@ Return ONLY the reply text.
     return rows || [];
   }
 
+  /* ===================== MEMORY LEARNING ===================== */
+
+  function extractMemorySignals(text) {
+    const t = String(text || "").trim();
+    const lower = t.toLowerCase();
+    const out = [];
+
+    const weatherCity = extractCityFromWeatherText(t);
+    if (weatherCity) out.push(`pref.weather_city=${weatherCity}`);
+
+    const coord = extractCoordinatesFromText(t);
+    if (coord) out.push(`pref.weather_coords=${coord.lat},${coord.lon}`);
+
+    const useProvider = t.match(/\buse\s+(gmail|outlook|yahoo)\b/i);
+    if (useProvider) out.push(`pref.email_provider=${String(useProvider[1]).toLowerCase()}`);
+
+    if (/\b(worldwide news|global news|world news only|only worldwide news)\b/.test(lower)) out.push("pref.news_scope=worldwide");
+    if (/\b(local news|news near me|my city news|regional news)\b/.test(lower)) out.push("pref.news_scope=local");
+
+    if (/\b(short|quick|brief|one line)\b/.test(lower)) out.push("pref.reply_style=short");
+    if (/\b(detailed|deep|go deeper|more detail|step by step)\b/.test(lower)) out.push("pref.reply_style=deep");
+    if (/\b(bullets|bullet points|list it)\b/.test(lower)) out.push("pref.format=bullets");
+    if (/\b(paragraph|paragraphs)\b/.test(lower)) out.push("pref.format=paragraphs");
+
+    return out.slice(0, 6);
+  }
+
+  async function maybeLearnMemory({ userId, text }) {
+    if (!userId || !text) return;
+    const signals = extractMemorySignals(text);
+    if (!signals.length) return;
+
+    for (const s of signals) {
+      try {
+        await saveUserMemory(userId, `[memory] ${s}`);
+      } catch {}
+    }
+  }
+
   /* ===================== EMAIL ===================== */
 
   async function getConnectedEmailProviders(userId) {
@@ -787,7 +928,8 @@ Return ONLY the reply text.
     const lower = t.toLowerCase();
 
     const wantsAll =
-      /\b(all|every|all my|all of my|across all|across)\b/.test(lower) && /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(lower);
+      /\b(all|every|all my|all of my|across all|across)\b/.test(lower) &&
+      /\b(inbox|inboxes|accounts|providers|emails|email)\b/.test(lower);
 
     function extractCountDefault(defaultN = 5) {
       const m = lower.match(/\b(\d{1,2})\b/);
@@ -1112,6 +1254,15 @@ Return ONLY the reply text.
     return "";
   }
 
+  function geminiHeaders(apiKey) {
+    const k = String(apiKey || "").trim();
+    const h = { "Content-Type": "application/json" };
+    if (!k) return h;
+    if (k.startsWith("AIza")) h["x-goog-api-key"] = k;
+    else h["Authorization"] = `Bearer ${k}`;
+    return h;
+  }
+
   async function callOpenAIDecision_JSONinText({ text, memory, liveContextCompact, maxTokens }) {
     const model = getOpenAIModelDecision();
     const apiKey = process.env.OPENAI_API_KEY;
@@ -1119,20 +1270,8 @@ Return ONLY the reply text.
 
     const { controller, cancel } = withTimeout(Number(process.env.OPENAI_TIMEOUT_MS || 22000));
 
-    const prompt = `
-You are LXT-1 (Loravo decision engine).
-Return ONLY one JSON object matching the schema EXACTLY.
-
-Rules:
-- Use only the user message, memory, and provided live context.
-- Be calm and realistic.
-- Do not invent facts.
-- If uncertain, use HOLD with moderate confidence.
-- Keep one_liner human and sharp.
-`.trim();
-
     try {
-      const inputs = [{ role: "system", content: prompt }];
+      const inputs = [{ role: "system", content: DECISION_SYSTEM_PROMPT() }];
       if (memory) inputs.push({ role: "system", content: `Memory:\n${memory}` });
       if (liveContextCompact) inputs.push({ role: "system", content: `Live context:\n${JSON.stringify(liveContextCompact)}` });
       inputs.push({ role: "user", content: String(text || "") });
@@ -1172,29 +1311,33 @@ Rules:
     throw err;
   }
 
-  function geminiHeaders(apiKey) {
-    const k = String(apiKey || "").trim();
-    const h = { "Content-Type": "application/json" };
-    if (!k) return h;
-    if (k.startsWith("AIza")) h["x-goog-api-key"] = k;
-    else h["Authorization"] = `Bearer ${k}`;
-    return h;
-  }
-
-  async function callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint }) {
+  async function callGeminiReply({
+    userText,
+    images = [],
+    lxt1,
+    voiceProfile,
+    liveContext,
+    lastReplyHint,
+    mode = "auto",
+  }) {
     const key = process.env.GEMINI_API_KEY;
     if (!key) throw new Error("Missing GEMINI_API_KEY");
 
     const model = process.env.GEMINI_MODEL_REPLY || process.env.GEMINI_MODEL || "gemini-3-flash-preview";
-    const replyTokens = pickReplyTokens(userText, false);
+    const hasImages = Array.isArray(images) && images.length > 0;
 
     if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
 
-    const system = LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile);
+    const system = LXT_MASTER_CHAT_SYSTEM_PROMPT({
+      voiceProfile,
+      mode,
+      hasImages,
+    });
 
     const payload = {
       userText: String(userText || ""),
-      length_hint: lengthHintForReply(userText, false),
+      mode,
+      length_hint: chooseDepthHint({ mode, userText, hasImages }),
       lxt_brief: lxt1
         ? {
             verdict: lxt1?.verdict || null,
@@ -1219,8 +1362,8 @@ Rules:
             { role: "system", content: system },
             { role: "user", content: JSON.stringify(payload) },
           ],
-          max_tokens: replyTokens,
-          temperature: 0.62,
+          max_tokens: pickReplyTokens({ mode, userText, hasImages }),
+          temperature: mode === "instant" ? 0.55 : mode === "thinking" ? 0.72 : 0.64,
         }),
       });
 
@@ -1232,21 +1375,35 @@ Rules:
     }
   }
 
-  async function callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
+  async function callOpenAIReply({
+    userText,
+    images = [],
+    lxt1,
+    voiceProfile,
+    liveContext,
+    lastReplyHint,
+    mode = "auto",
+  }) {
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) throw new Error("Missing OPENAI_API_KEY");
 
     const model = getOpenAIModelReply();
     if (isPoweredByQuestion(userText)) return "Powered by LXT-1.";
 
-    const system = LXT_MASTER_CHAT_SYSTEM_PROMPT(voiceProfile);
     const imgs = normalizeImages(images);
     const hasImages = Array.isArray(imgs) && imgs.length > 0;
     const t = String(userText || "").trim();
 
+    const system = LXT_MASTER_CHAT_SYSTEM_PROMPT({
+      voiceProfile,
+      mode,
+      hasImages,
+    });
+
     const payload = {
       userText: t || (hasImages ? "What is this?" : ""),
-      length_hint: lengthHintForReply(t, hasImages),
+      mode,
+      length_hint: chooseDepthHint({ mode, userText: t, hasImages }),
       lxt_brief: lxt1
         ? {
             verdict: lxt1?.verdict || null,
@@ -1257,7 +1414,8 @@ Rules:
         : null,
       live_context: liveContext || {},
       last_reply_hint: lastReplyHint || "",
-      vision_mode: hasImages ? "on" : "off",
+      vision_mode: hasImages ? "combined_set" : "off",
+      image_count: imgs.length,
     };
 
     const userContent = [{ type: "input_text", text: JSON.stringify(payload) }];
@@ -1265,7 +1423,9 @@ Rules:
       userContent.push({ type: "input_image", image_url: url });
     }
 
-    const { controller, cancel } = withTimeout(Number(process.env.OPENAI_TIMEOUT_MS_REPLY || process.env.OPENAI_TIMEOUT_MS || 32000));
+    const { controller, cancel } = withTimeout(
+      Number(process.env.OPENAI_TIMEOUT_MS_REPLY || process.env.OPENAI_TIMEOUT_MS || 32000)
+    );
 
     try {
       const resp = await fetch(`${openAIBaseUrl()}/v1/responses`, {
@@ -1281,8 +1441,8 @@ Rules:
             { role: "system", content: system },
             { role: "user", content: userContent },
           ],
-          max_output_tokens: pickReplyTokens(t, hasImages),
-          temperature: 0.7,
+          max_output_tokens: pickReplyTokens({ mode, userText: t, hasImages }),
+          temperature: mode === "instant" ? 0.55 : mode === "thinking" ? 0.72 : 0.64,
         }),
       });
 
@@ -1296,30 +1456,79 @@ Rules:
     }
   }
 
-  async function getHumanReply({ provider, userText, images, lxt1, voiceProfile, liveContext, lastReplyHint }) {
+  async function getHumanReply({
+    provider,
+    userText,
+    images,
+    lxt1,
+    voiceProfile,
+    liveContext,
+    lastReplyHint,
+    mode = "auto",
+  }) {
     const hasImages = Array.isArray(images) && images.length > 0;
 
     if (hasImages) {
-      const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+      const reply = await callOpenAIReply({
+        userText,
+        images,
+        lxt1,
+        voiceProfile,
+        liveContext,
+        lastReplyHint,
+        mode,
+      });
       return { reply, replyProvider: "openai_vision", tried: ["openai_vision"] };
     }
 
     if (provider === "openai") {
-      const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+      const reply = await callOpenAIReply({
+        userText,
+        images,
+        lxt1,
+        voiceProfile,
+        liveContext,
+        lastReplyHint,
+        mode,
+      });
       return { reply, replyProvider: "openai", tried: ["openai"] };
     }
 
     if (provider === "gemini") {
-      const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
+      const reply = await callGeminiReply({
+        userText,
+        images,
+        lxt1,
+        voiceProfile,
+        liveContext,
+        lastReplyHint,
+        mode,
+      });
       return { reply, replyProvider: "gemini", tried: ["gemini"] };
     }
 
-    // trinity = OPENAI first now
+    // trinity = OPENAI first
     try {
-      const reply = await callOpenAIReply({ userText, images, lxt1, voiceProfile, liveContext, lastReplyHint });
+      const reply = await callOpenAIReply({
+        userText,
+        images,
+        lxt1,
+        voiceProfile,
+        liveContext,
+        lastReplyHint,
+        mode,
+      });
       return { reply, replyProvider: "openai", tried: ["openai"] };
     } catch (e) {
-      const reply = await callGeminiReply({ userText, lxt1, voiceProfile, liveContext, lastReplyHint });
+      const reply = await callGeminiReply({
+        userText,
+        images,
+        lxt1,
+        voiceProfile,
+        liveContext,
+        lastReplyHint,
+        mode,
+      });
       return {
         reply,
         replyProvider: "gemini_fallback",
@@ -1354,7 +1563,12 @@ Rules:
       if (services?.gemini?.decision) {
         tried.push("gemini");
         const lxt1 = await services.gemini.decision({ text, memory, liveContextCompact, maxTokens });
-        return { lxt1: sanitizeToSchema(lxt1), decisionProvider: "gemini", tried, _openai_error: String(openaiErr) };
+        return {
+          lxt1: sanitizeToSchema(lxt1),
+          decisionProvider: "gemini",
+          tried,
+          _openai_error: String(openaiErr),
+        };
       }
 
       return {
@@ -1366,9 +1580,9 @@ Rules:
     }
   }
 
-  /* ===================== ENRICHED FAST HELPERS ===================== */
+  /* ===================== FAST HELPERS ===================== */
 
-  async function handleWeatherIntent({ text, liveContext, voiceProfile }) {
+  async function handleWeatherIntent({ text, liveContext, voiceProfile, mode }) {
     if (!liveContext?.weather) {
       const coords = extractCoordinatesFromText(text);
       const city = extractCityFromWeatherText(text);
@@ -1381,12 +1595,12 @@ Rules:
     return await callOpenAIReply({
       userText: `
 Answer the user's weather question directly using the live weather context.
-If they asked for weather in a place, give:
+Give:
 - current condition
 - current temp
 - short useful outlook for today
 - one practical note if relevant
-Keep it natural and polished.
+Keep it natural, premium, and concise unless they asked for more.
 User question: ${text}
       `.trim(),
       images: [],
@@ -1394,11 +1608,12 @@ User question: ${text}
       voiceProfile,
       liveContext,
       lastReplyHint: "",
+      mode,
     });
   }
 
   async function handleWeatherSourceIntent() {
-    return "I’m using your location if you shared it, or the exact city/coordinates you asked for, then pulling a live weather read for that place.";
+    return "I’m using your location if you shared it, or the exact city or coordinates you asked for, then pulling a live weather read for that place.";
   }
 
   async function handleStocksIntent({ text, liveContext }) {
@@ -1421,7 +1636,7 @@ User question: ${text}
     return `I can check ${ticker}, but the stocks service isn’t connected yet.`;
   }
 
-  async function handleNewsIntent({ userId, memory, liveContext, voiceProfile, userText }) {
+  async function handleNewsIntent({ userId, memory, liveContext, voiceProfile, userText, mode }) {
     const items = Array.isArray(liveContext?.news) ? liveContext.news : [];
     if (!items.length) return "I’m not seeing anything strong enough to call out right now. Give me a city or topic and I’ll lock in tighter.";
 
@@ -1434,7 +1649,7 @@ User question: ${text}
     return await callOpenAIReply({
       userText: `
 The user is asking about news.
-Use the provided live news context and answer like a strong premium assistant.
+Use the live news context and answer like a strong premium assistant.
 What to do:
 - summarize what actually matters
 - keep the user ahead
@@ -1446,10 +1661,11 @@ User question: ${userText}
       voiceProfile,
       liveContext,
       lastReplyHint: "",
+      mode,
     });
   }
 
-  async function handleAffectsMeIntent({ text, liveContext, voiceProfile }) {
+  async function handleAffectsMeIntent({ text, liveContext, voiceProfile, mode }) {
     return await callOpenAIReply({
       userText: `
 The user asks how something affects them.
@@ -1458,7 +1674,7 @@ Answer with:
 2) when it matters
 3) what to do today
 4) one watchout
-Be concrete but don't invent exact unsupported numbers.
+Be concrete but do not invent unsupported numbers.
 User question: ${text}
       `.trim(),
       images: [],
@@ -1466,10 +1682,11 @@ User question: ${text}
       voiceProfile,
       liveContext,
       lastReplyHint: "",
+      mode,
     });
   }
 
-  async function handleDailyBrief({ planTier, liveContext, voiceProfile }) {
+  async function handleDailyBrief({ planTier, liveContext, voiceProfile, mode }) {
     const gate = requireFeatureOrTease({
       tier: planTier,
       feature: "daily_brief",
@@ -1484,10 +1701,11 @@ User question: ${text}
       voiceProfile,
       liveContext,
       lastReplyHint: "",
+      mode,
     });
   }
 
-  async function handleSignalScan({ planTier, userId, liveContext, voiceProfile }) {
+  async function handleSignalScan({ planTier, userId, liveContext, voiceProfile, mode }) {
     const gate = requireFeatureOrTease({
       tier: planTier,
       feature: "signal_scan",
@@ -1504,20 +1722,21 @@ User question: ${text}
       voiceProfile,
       liveContext: { ...liveContext, scan },
       lastReplyHint: "",
+      mode,
     });
   }
 
-  async function handleShoppingIntent({ userId, text, userState, voiceProfile, liveContext }) {
+  async function handleShoppingIntent({ userId, text, userState, voiceProfile, liveContext, mode }) {
     const lastLabel = normalizePlaceName(userState?.last_image_label) || null;
 
     return await callOpenAIReply({
       userText: `
-User asked a buying/finding question: "${text}"
+User asked a buying or finding question: "${text}"
 If there is a last image label, assume that is what they mean.
 Give:
 - the most likely thing to search
-- 3–5 practical places/options
-- a strong search phrase
+- 3 to 5 practical places or options
+- one strong search phrase
 - one focused follow-up only if needed
 last_image_label: ${lastLabel || "none"}
       `.trim(),
@@ -1526,6 +1745,20 @@ last_image_label: ${lastLabel || "none"}
       voiceProfile,
       liveContext,
       lastReplyHint: "",
+      mode,
+    });
+  }
+
+  async function handleGreeting({ provider, voiceProfile, liveContext, mode }) {
+    return await getHumanReply({
+      provider,
+      userText: "Greet the user naturally and briefly. Sound fresh, calm, premium, and human. Ask what they want help with in one short natural line.",
+      images: [],
+      lxt1: null,
+      voiceProfile,
+      liveContext,
+      lastReplyHint: "Do not sound repetitive. Do not use the exact same greeting every time.",
+      mode: mode === "thinking" ? "auto" : "instant",
     });
   }
 
@@ -1665,7 +1898,9 @@ last_image_label: ${lastLabel || "none"}
     if (cmd.kind === "summarize") {
       if (allMode) {
         const all = await fetchAllProviders((p) => emailSvc.list({ provider: p, userId, q: "newer_than:7d", max: 8 }));
-        const compact = all.filter((x) => x.ok && Array.isArray(x.res) && x.res.length).map((x) => ({ provider: x.provider, items: x.res.slice(0, 8) }));
+        const compact = all
+          .filter((x) => x.ok && Array.isArray(x.res) && x.res.length)
+          .map((x) => ({ provider: x.provider, items: x.res.slice(0, 8) }));
 
         if (!compact.length) {
           return {
@@ -1681,6 +1916,7 @@ last_image_label: ${lastLabel || "none"}
           voiceProfile: "Calm, sharp, concise, useful.",
           liveContext: {},
           lastReplyHint: "",
+          mode: "instant",
         });
 
         return {
@@ -1704,6 +1940,7 @@ last_image_label: ${lastLabel || "none"}
         voiceProfile: "Calm, sharp, concise, useful.",
         liveContext: {},
         lastReplyHint: "",
+        mode: "instant",
       });
 
       return {
@@ -1806,17 +2043,34 @@ last_image_label: ${lastLabel || "none"}
     const trimmedText = rawText.trim();
 
     if (!trimmedText && !hasImages) {
-      const base = {
-        provider: "loravo_fastpath",
+      const userId = String(user_id || "").trim() || null;
+      const state = userId ? await loadUserState(userId) : null;
+      const liveContext = { weather: null, location: null, news: [], stocks: null };
+
+      const voice = await handleGreeting({
+        provider,
+        voiceProfile: state?.voice_profile || defaults.voice_profile || null,
+        liveContext,
         mode: "instant",
-        reply: "Hello! What do you want help with?",
+      });
+
+      const base = {
+        provider,
+        mode: "instant",
+        reply: voice.reply,
         lxt1: null,
-        _errors: {},
+        _errors: { reply: voice._reply_error },
       };
+
       if (defaults?.include_provider_meta === false) return base;
       return {
         ...base,
-        providers: { decision: "fastpath", reply: "fastpath", triedDecision: ["fastpath"], triedReply: ["fastpath"] },
+        providers: {
+          decision: "greeting_dynamic",
+          reply: voice.replyProvider,
+          triedDecision: ["greeting_dynamic"],
+          triedReply: voice.tried,
+        },
       };
     }
 
@@ -1842,10 +2096,10 @@ last_image_label: ${lastLabel || "none"}
         behavior_profile: nextBP,
         behavior_updated_at: new Date().toISOString(),
       });
+      await maybeLearnMemory({ userId, text });
     }
 
     const state2 = userId ? await loadUserState(userId) : state;
-
     const behaviorLine = behaviorToVoiceLine(state2?.behavior_profile || null);
     const baseVoice = state2?.voice_profile || defaults.voice_profile || null;
     const finalVoiceProfile = [baseVoice, behaviorLine].filter(Boolean).join(" ").trim() || null;
@@ -1872,8 +2126,6 @@ last_image_label: ${lastLabel || "none"}
     if (userId) await setUserStateFields(userId, { last_topic: topic });
 
     if (isPoweredByQuestion(text)) {
-      if (userId) await saveUserMemory(userId, text);
-
       const base = {
         provider: "loravo_fastpath",
         mode: "instant",
@@ -1897,21 +2149,32 @@ last_image_label: ${lastLabel || "none"}
       };
     }
 
-    if (userId) await saveUserMemory(userId, text);
-
     if (!forceDecision) {
       if (intent === "greeting") {
+        const voice = await handleGreeting({
+          provider,
+          voiceProfile: finalVoiceProfile,
+          liveContext,
+          mode,
+        });
+
         const base = {
-          provider: "loravo_fastpath",
+          provider,
           mode: "instant",
-          reply: "Hello! What do you want help with?",
+          reply: voice.reply,
           lxt1: null,
-          _errors: {},
+          _errors: { reply: voice._reply_error },
         };
+
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "fastpath", reply: "fastpath", triedDecision: ["fastpath"], triedReply: ["fastpath"] },
+          providers: {
+            decision: "greeting_dynamic",
+            reply: voice.replyProvider,
+            triedDecision: ["greeting_dynamic"],
+            triedReply: voice.tried,
+          },
         };
       }
 
@@ -1922,9 +2185,10 @@ last_image_label: ${lastLabel || "none"}
           userState: state2 || {},
           voiceProfile: finalVoiceProfile,
           liveContext,
+          mode,
         });
 
-        const base = { provider: "loravo_shop", mode: "instant", reply, lxt1: null, _errors: {} };
+        const base = { provider: "loravo_shop", mode, reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
@@ -1933,8 +2197,13 @@ last_image_label: ${lastLabel || "none"}
       }
 
       if (intent === "daily_brief") {
-        const reply = await handleDailyBrief({ planTier, liveContext, voiceProfile: finalVoiceProfile });
-        const base = { provider: "loravo_brief", mode: "instant", reply, lxt1: null, _errors: {} };
+        const reply = await handleDailyBrief({
+          planTier,
+          liveContext,
+          voiceProfile: finalVoiceProfile,
+          mode: mode === "instant" ? "auto" : mode,
+        });
+        const base = { provider: "loravo_brief", mode, reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
@@ -1943,8 +2212,14 @@ last_image_label: ${lastLabel || "none"}
       }
 
       if (intent === "signal_scan") {
-        const reply = await handleSignalScan({ planTier, userId, liveContext, voiceProfile: finalVoiceProfile });
-        const base = { provider: "loravo_signals", mode: "instant", reply, lxt1: null, _errors: {} };
+        const reply = await handleSignalScan({
+          planTier,
+          userId,
+          liveContext,
+          voiceProfile: finalVoiceProfile,
+          mode: "thinking",
+        });
+        const base = { provider: "loravo_signals", mode: "thinking", reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
@@ -1959,7 +2234,12 @@ last_image_label: ${lastLabel || "none"}
           if (defaults?.include_provider_meta === false) return base;
           return {
             ...base,
-            providers: { decision: "email_fast", reply: "email_fast", triedDecision: ["email_fast"], triedReply: ["email_fast"] },
+            providers: {
+              decision: "email_fast",
+              reply: "email_fast",
+              triedDecision: ["email_fast"],
+              triedReply: ["email_fast"],
+            },
           };
         } catch (e) {
           const base = {
@@ -1972,7 +2252,12 @@ last_image_label: ${lastLabel || "none"}
           if (defaults?.include_provider_meta === false) return base;
           return {
             ...base,
-            providers: { decision: "email_fast", reply: "email_fast", triedDecision: ["email_fast"], triedReply: ["email_fast"] },
+            providers: {
+              decision: "email_fast",
+              reply: "email_fast",
+              triedDecision: ["email_fast"],
+              triedReply: ["email_fast"],
+            },
           };
         }
       }
@@ -1983,13 +2268,23 @@ last_image_label: ${lastLabel || "none"}
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "weather_meta_fast", reply: "weather_meta_fast", triedDecision: ["weather_meta_fast"], triedReply: ["weather_meta_fast"] },
+          providers: {
+            decision: "weather_meta_fast",
+            reply: "weather_meta_fast",
+            triedDecision: ["weather_meta_fast"],
+            triedReply: ["weather_meta_fast"],
+          },
         };
       }
 
       if (intent === "weather") {
-        const reply = await handleWeatherIntent({ text, liveContext, voiceProfile: finalVoiceProfile });
-        const base = { provider: "loravo_weather", mode: "instant", reply, lxt1: null, _errors: {} };
+        const reply = await handleWeatherIntent({
+          text,
+          liveContext,
+          voiceProfile: finalVoiceProfile,
+          mode: mode === "thinking" ? "thinking" : "auto",
+        });
+        const base = { provider: "loravo_weather", mode, reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
@@ -2014,6 +2309,7 @@ last_image_label: ${lastLabel || "none"}
           liveContext,
           voiceProfile: finalVoiceProfile,
           userText: text,
+          mode: mode === "thinking" ? "thinking" : "auto",
         });
 
         const base = { provider: "loravo_news", mode, reply, lxt1: null, _errors: {} };
@@ -2035,7 +2331,12 @@ last_image_label: ${lastLabel || "none"}
           };
         }
 
-        const reply = await handleAffectsMeIntent({ text, liveContext, voiceProfile: finalVoiceProfile });
+        const reply = await handleAffectsMeIntent({
+          text,
+          liveContext,
+          voiceProfile: finalVoiceProfile,
+          mode: mode === "thinking" ? "thinking" : "auto",
+        });
         const base = { provider: "loravo_impact", mode, reply, lxt1: null, _errors: {} };
         if (defaults?.include_provider_meta === false) return base;
         return {
@@ -2046,9 +2347,9 @@ last_image_label: ${lastLabel || "none"}
 
       if (intent === "chat") {
         const lxt1ForChat = sanitizeToSchema({
-          verdict: "HOLD",
-          confidence: 0.84,
-          one_liner: "General chat.",
+          verdict: hasImages ? "MOVE" : "HOLD",
+          confidence: hasImages ? 0.88 : 0.82,
+          one_liner: hasImages ? "Visual analysis request." : "General chat.",
           signals: [],
           actions: [],
           watchouts: [],
@@ -2060,7 +2361,12 @@ last_image_label: ${lastLabel || "none"}
             ? `The user previously shared an image labeled: "${state2.last_image_label}". If they say "one" or "this", assume they mean that item.`
             : "";
 
-        const lastReplyHint = [state2?.last_alert_hash ? "Rephrase; avoid repeating the same wording." : "", imageHint].filter(Boolean).join(" ");
+        const lastReplyHint = [
+          state2?.last_alert_hash ? "Rephrase; avoid repeating the same wording." : "",
+          imageHint,
+        ]
+          .filter(Boolean)
+          .join(" ");
 
         const expandedUserText =
           isMoreOnly(text) && topic?.kind
@@ -2075,6 +2381,7 @@ last_image_label: ${lastLabel || "none"}
           voiceProfile: finalVoiceProfile,
           liveContext,
           lastReplyHint,
+          mode,
         });
 
         if (userId && hasImages && voice?.reply) {
@@ -2098,7 +2405,12 @@ last_image_label: ${lastLabel || "none"}
         if (defaults?.include_provider_meta === false) return base;
         return {
           ...base,
-          providers: { decision: "chat_fast", reply: voice.replyProvider, triedDecision: ["chat_fast"], triedReply: voice.tried },
+          providers: {
+            decision: "chat_fast",
+            reply: voice.replyProvider,
+            triedDecision: ["chat_fast"],
+            triedReply: voice.tried,
+          },
         };
       }
     }
@@ -2135,7 +2447,12 @@ last_image_label: ${lastLabel || "none"}
       if (defaults?.include_provider_meta === false) return base;
       return {
         ...base,
-        providers: { decision: decision.decisionProvider, reply: "skipped", triedDecision: decision.tried, triedReply: [] },
+        providers: {
+          decision: decision.decisionProvider,
+          reply: "skipped",
+          triedDecision: decision.tried,
+          triedReply: [],
+        },
       };
     }
 
@@ -2147,6 +2464,7 @@ last_image_label: ${lastLabel || "none"}
       voiceProfile: finalVoiceProfile,
       liveContext,
       lastReplyHint,
+      mode,
     });
 
     if (userId && hasImages && voice?.reply) {
@@ -2215,9 +2533,10 @@ If nothing matters, return NONE.
       `.trim(),
       images: [],
       lxt1: null,
-      voiceProfile: (state?.voice_profile || "") + " Proactive. Only notify when it matters.",
+      voiceProfile: `${state?.voice_profile || ""} Proactive. Only notify when it matters.`,
       liveContext,
       lastReplyHint: "",
+      mode: "thinking",
     });
 
     if (!out || out.trim().toUpperCase().includes("NONE")) return [];
@@ -2250,6 +2569,8 @@ If nothing matters, return NONE.
       requireFeatureOrTease,
       detectTopic,
       isMoreOnly,
+      estimateComplexity,
+      chooseDepthHint,
     },
   };
 }
